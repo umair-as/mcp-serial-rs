@@ -1,0 +1,7 @@
+/target
+
+# Hardware-specific working copy — commit devices.toml.example instead.
+devices.toml
+
+# Agent scratch markers (codex, etc.)
+.codex

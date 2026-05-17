@@ -1,0 +1,55 @@
+# mcp-serial-rs device profiles
+#
+# The MCP server matches connected serial ports against these profiles
+# using the USB serial string (stable across reconnects and reboots).
+# Matching enriches serial.list_ports output and allows serial.open
+# to accept a device name instead of a raw port path.
+#
+# To find your values:
+#   udevadm info -q property /dev/ttyUSB0 | grep ID_SERIAL=
+#   tio -l
+#
+# Fields:
+#   match_serial  — USB serial string (primary match key)
+#   match_vid     — USB vendor ID (optional secondary filter)
+#   match_pid     — USB product ID (optional secondary filter)
+#   baud          — default baud rate for serial.open
+#   description   — human-readable label returned in list_ports
+#   probe         — regex pattern expected after opening (for future serial.identify)
+#   tags          — freeform labels for filtering and documentation
+
+[devices.esp32c6]
+match_serial = "485732f0d027ee119e0c14d8f49e3369"
+match_vid    = 0x10C4
+match_pid    = 0xEA60
+baud         = 115200
+description  = "ESP32-C6 Zephyr DFU target (CP2102N)"
+probe        = "uart:~\\$"
+tags         = ["zephyr", "dfu", "esp32c6"]
+
+[devices.imx93-evk]
+match_serial = "0001"
+match_vid    = 0x10C4
+match_pid    = 0xEA60
+baud         = 115200
+description  = "i.MX93 EVK debug UART (CP2102 clone)"
+probe        = "login:|#|\\$"
+tags         = ["linux", "imx93", "nxp"]
+# NOTE: serial "0001" is a known CP2102 clone issue — all counterfeits
+# report the same value. If a second CP2102 clone is connected, this
+# match becomes ambiguous. Disambiguate via by-path or physical topology.
+
+[devices.rpi5]
+match_serial = "575C016219"
+match_vid    = 0x1A86
+baud         = 115200
+description  = "Raspberry Pi 5 debug UART (WCH CH340)"
+probe        = "login:|#|\\$"
+tags         = ["linux", "rpi5", "gateway"]
+
+[devices.pico2w]
+match_serial = "E6647C740341AA30"
+baud         = 115200
+description  = "RPi Pico 2W via Debug Probe (CMSIS-DAP)"
+probe        = "uart:~\\$"
+tags         = ["zephyr", "ble", "pico2w"]
