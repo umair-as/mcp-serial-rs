@@ -189,7 +189,7 @@ MCP_SERIAL_DEVICES env var → path to devices.toml (default: ./devices.toml)
 
 ## Phase 2 tasks (do not start until Phase 1 is reviewed)
 
-- **Task P2-1**: `serial.exec` — compound write + read_until with `ok` flag
+- **Task P2-1** ✅ DONE — `serial.exec` (compound write + read_until with `ok` flag). Dispatch-layer composition in `src/tools.rs`; no manager changes. Params `{session_id, command, expect, timeout_ms}` → `{output, ok}`. Timeout clamps to `MAX_TIMEOUT_MS`, command clamps to `MAX_WRITE_CHUNK`.
 - **Task P2-2**: `serial.reset_esp32` — DTR/RTS toggle strategies (hard reset, bootloader entry)
 - **Task P2-3**: `serial.capture_start` / `serial.capture_stop` — tee session data to a log file
 - **Task P2-4**: Claude Code MCP client config (`~/.claude/mcp.json` entry for this server)

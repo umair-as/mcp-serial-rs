@@ -81,7 +81,7 @@ fn three_message_handshake() {
     assert_eq!(list["jsonrpc"], "2.0");
     assert_eq!(list["id"], 2);
     let tools = list["result"].as_array().expect("array");
-    assert_eq!(tools.len(), 6);
+    assert_eq!(tools.len(), 7);
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     for expected in [
         "serial.list_ports",
@@ -89,6 +89,7 @@ fn three_message_handshake() {
         "serial.write",
         "serial.read",
         "serial.read_until",
+        "serial.exec",
         "serial.close",
     ] {
         assert!(names.contains(&expected), "missing {expected}");

@@ -64,6 +64,7 @@ pub async fn dispatch<B: SerialBackend>(state: &State<B>, req: Request) -> Optio
             "serial.write" => handle_write(state, req.params).await,
             "serial.read" => handle_read(state, req.params).await,
             "serial.read_until" => handle_read_until(state, req.params).await,
+            "serial.exec" => handle_exec(state, req.params).await,
             other => Err(protocol::Error::new(
                 protocol::METHOD_NOT_FOUND,
                 format!("method '{other}' not implemented"),
@@ -160,6 +161,21 @@ fn tools_list() -> Value {
             }
         },
         {
+            "name": "serial.exec",
+            "description": "Write a command to the session, then read until the expect regex matches or timeout. Returns {output, ok}.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["session_id", "command", "expect"],
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "command": { "type": "string", "description": "UTF-8 bytes to write; caller controls any trailing newline" },
+                    "expect": { "type": "string", "description": "Rust regex pattern matched against the accumulating read buffer" },
+                    "timeout_ms": { "type": "integer", "minimum": 0, "default": 5000 }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
             "name": "serial.close",
             "description": "Close the session and release the port.",
             "inputSchema": {
@@ -219,6 +235,16 @@ struct ReadParams {
 struct ReadUntilParams {
     session_id: String,
     pattern: String,
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecParams {
+    session_id: String,
+    command: String,
+    expect: String,
     #[serde(default = "default_timeout_ms")]
     timeout_ms: u64,
 }
@@ -381,6 +407,59 @@ async fn handle_read_until<B: SerialBackend>(
     }))
 }
 
+async fn handle_exec<B: SerialBackend>(
+    state: &State<B>,
+    params: Value,
+) -> Result<Value, protocol::Error> {
+    let p: ExecParams = parse_params(params)?;
+    if p.command.len() > config::MAX_WRITE_CHUNK {
+        return Err(protocol::Error::new(
+            protocol::INVALID_PARAMS,
+            format!(
+                "'command' is {} bytes; max per write is {}",
+                p.command.len(),
+                config::MAX_WRITE_CHUNK
+            ),
+        ));
+    }
+    // Pre-validate `expect` BEFORE writing — read_until's regex compile happens
+    // post-write, so without this guard an exec with bad regex would mutate the
+    // device (or remote shell) and only then surface InvalidParam.
+    if p.expect.is_empty() {
+        return Err(serial_error_to_protocol(SerialError::InvalidParam {
+            name: "expect".into(),
+            reason: "must not be empty".into(),
+        }));
+    }
+    if let Err(e) = regex::Regex::new(&p.expect) {
+        return Err(serial_error_to_protocol(SerialError::InvalidParam {
+            name: "expect".into(),
+            reason: format!("invalid regex: {e}"),
+        }));
+    }
+    let timeout_ms = p.timeout_ms.min(config::MAX_TIMEOUT_MS);
+
+    // Write first; on failure, surface immediately rather than swallowing
+    // into a timed-out read_until. The session-state check is duplicated
+    // across the two calls but is cheap, and keeps composition honest —
+    // a concurrent close between write and read_until is reported, not hidden.
+    state
+        .sessions
+        .write(&p.session_id, p.command.as_bytes())
+        .await
+        .map_err(serial_error_to_protocol)?;
+
+    let (data, matched) = state
+        .sessions
+        .read_until(&p.session_id, &p.expect, timeout_ms)
+        .await
+        .map_err(serial_error_to_protocol)?;
+    Ok(json!({
+        "output": String::from_utf8_lossy(&data),
+        "ok": matched,
+    }))
+}
+
 fn serial_error_to_protocol(err: SerialError) -> protocol::Error {
     err.into()
 }
@@ -393,6 +472,9 @@ mod tests {
 
     use crate::serial::manager::TokioSerialBackend;
     use serde_json::json;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::PoisonError;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     fn req(method: &str, id: Option<Value>) -> Request {
         Request {
@@ -428,6 +510,43 @@ mod tests {
         }
     }
 
+    /// Backend that returns a real `DuplexStream` so tests can drive the
+    /// "device" side. Each open stashes the device half on a shared vec;
+    /// `take_device` pops the most-recently-opened half.
+    #[derive(Clone)]
+    struct DuplexBackend {
+        sides: StdArc<StdMutex<Vec<DuplexStream>>>,
+    }
+
+    impl DuplexBackend {
+        fn new() -> Self {
+            Self {
+                sides: StdArc::new(StdMutex::new(Vec::new())),
+            }
+        }
+
+        fn take_device(&self) -> DuplexStream {
+            self.sides
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop()
+                .expect("no device side available")
+        }
+    }
+
+    impl crate::serial::SerialBackend for DuplexBackend {
+        type Port = DuplexStream;
+
+        async fn open(&self, _port: &str, _baud: u32) -> Result<DuplexStream, SerialError> {
+            let (manager_side, device_side) = tokio::io::duplex(4096);
+            self.sides
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(device_side);
+            Ok(manager_side)
+        }
+    }
+
     #[tokio::test]
     async fn initialize_returns_name_version_capabilities() {
         let s = mock_state();
@@ -449,13 +568,14 @@ mod tests {
         let result = resp.result.expect("result present");
         let arr = result.as_array().expect("array");
         let names: Vec<&str> = arr.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names.len(), 6);
+        assert_eq!(names.len(), 7);
         for expected in [
             "serial.list_ports",
             "serial.open",
             "serial.write",
             "serial.read",
             "serial.read_until",
+            "serial.exec",
             "serial.close",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
@@ -674,6 +794,251 @@ mod tests {
         let resp = dispatch(&s, r).await.expect("response");
         let err = resp.error.expect("error");
         assert_eq!(err.code, -32003);
+    }
+
+    // --- serial.exec --- //
+
+    #[tokio::test]
+    async fn serial_exec_with_missing_expect_returns_invalid_params() {
+        let s = mock_state();
+        let mut r = req("serial.exec", Some(json!(30)));
+        r.params = json!({ "session_id": "abc", "command": "help\n" });
+        let resp = dispatch(&s, r).await.expect("response");
+        let err = resp.error.expect("error");
+        assert_eq!(err.code, protocol::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn serial_exec_with_missing_command_returns_invalid_params() {
+        let s = mock_state();
+        let mut r = req("serial.exec", Some(json!(31)));
+        r.params = json!({ "session_id": "abc", "expect": "prompt> " });
+        let resp = dispatch(&s, r).await.expect("response");
+        let err = resp.error.expect("error");
+        assert_eq!(err.code, protocol::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn serial_exec_with_extra_field_returns_invalid_params() {
+        let s = mock_state();
+        let mut r = req("serial.exec", Some(json!(32)));
+        r.params = json!({
+            "session_id": "abc",
+            "command": "help\n",
+            "expect": "prompt> ",
+            "rogue": 1,
+        });
+        let resp = dispatch(&s, r).await.expect("response");
+        let err = resp.error.expect("error");
+        assert_eq!(err.code, protocol::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn serial_exec_oversized_command_returns_invalid_params() {
+        let s = mock_state();
+        let mut r = req("serial.exec", Some(json!(33)));
+        r.params = json!({
+            "session_id": "abc",
+            "command": "x".repeat(config::MAX_WRITE_CHUNK + 1),
+            "expect": "prompt> ",
+        });
+        let resp = dispatch(&s, r).await.expect("response");
+        let err = resp.error.expect("error");
+        assert_eq!(err.code, protocol::INVALID_PARAMS);
+        assert!(err.message.contains("max per write"));
+    }
+
+    #[tokio::test]
+    async fn serial_exec_unknown_session_returns_session_not_found_code() {
+        let s = mock_state();
+        let mut r = req("serial.exec", Some(json!(34)));
+        r.params = json!({
+            "session_id": "deadbeefdeadbeef",
+            "command": "help\n",
+            "expect": "prompt> ",
+            "timeout_ms": 5,
+        });
+        let resp = dispatch(&s, r).await.expect("response");
+        let err = resp.error.expect("error");
+        assert_eq!(err.code, -32003);
+    }
+
+    #[tokio::test]
+    async fn serial_exec_writes_command_and_returns_matched_output() {
+        // End-to-end: open via dispatch on a duplex backend, spawn a task on
+        // the device side that drains the command and writes a prompt, then
+        // dispatch serial.exec and assert {output, ok} reflect read_until's
+        // matched buffer.
+        let backend = DuplexBackend::new();
+        let s = State {
+            sessions: Arc::new(SessionManager::with_seed(backend.clone(), 0xCAFE)),
+            profiles: Arc::new(vec![]),
+        };
+
+        let mut open_req = req("serial.open", Some(json!(40)));
+        open_req.params = json!({ "port": "/dev/ttyUSB0", "baud": 115200, "timeout_ms": 1000 });
+        let open_resp = dispatch(&s, open_req).await.expect("response");
+        let session_id = open_resp
+            .result
+            .expect("open result")
+            .get("session_id")
+            .and_then(Value::as_str)
+            .expect("session_id string")
+            .to_string();
+
+        let mut device = backend.take_device();
+        let device_task = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            let n = device.read(&mut buf).await.unwrap();
+            let received = buf[..n].to_vec();
+            device.write_all(b"hello world\nprompt> ").await.unwrap();
+            // Hold the device side open until the manager-side read finishes,
+            // otherwise an early EOF could race the match.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            received
+        });
+
+        let mut exec_req = req("serial.exec", Some(json!(41)));
+        exec_req.params = json!({
+            "session_id": session_id,
+            "command": "help\n",
+            "expect": "prompt> ",
+            "timeout_ms": 2000,
+        });
+        let exec_resp = dispatch(&s, exec_req).await.expect("response");
+        let result = exec_resp.result.expect("exec result");
+        assert_eq!(result["ok"], true, "matched flag should be true: {result}");
+        let output = result["output"].as_str().expect("output string");
+        assert!(
+            output.contains("prompt> "),
+            "output should contain the expect pattern: {output:?}"
+        );
+
+        let received = device_task.await.unwrap();
+        assert_eq!(&received, b"help\n", "device should receive the verbatim command");
+    }
+
+    #[tokio::test]
+    async fn serial_exec_invalid_regex_rejects_before_writing_command() {
+        // Bad expect must NOT mutate device state — pre-validate before write.
+        let backend = DuplexBackend::new();
+        let s = State {
+            sessions: Arc::new(SessionManager::with_seed(backend.clone(), 0xCAFE)),
+            profiles: Arc::new(vec![]),
+        };
+
+        let mut open_req = req("serial.open", Some(json!(50)));
+        open_req.params = json!({ "port": "/dev/ttyUSB0", "baud": 115200, "timeout_ms": 1000 });
+        let open_resp = dispatch(&s, open_req).await.expect("response");
+        let session_id = open_resp
+            .result
+            .expect("open result")
+            .get("session_id")
+            .and_then(Value::as_str)
+            .expect("session_id string")
+            .to_string();
+
+        let mut device = backend.take_device();
+
+        let mut exec_req = req("serial.exec", Some(json!(51)));
+        exec_req.params = json!({
+            "session_id": session_id,
+            "command": "DESTRUCTIVE_OP\n",
+            "expect": "(",          // unbalanced — regex compile error
+            "timeout_ms": 200,
+        });
+        let exec_resp = dispatch(&s, exec_req).await.expect("response");
+        let err = exec_resp.error.expect("error");
+        assert_eq!(err.code, -32008, "InvalidParam code");
+        assert_eq!(err.data.as_ref().unwrap()["name"], "expect");
+
+        // Critical assertion: the device must not have received the command.
+        // A short timed read on the device side should yield 0 bytes.
+        let mut buf = [0u8; 64];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            device.read(&mut buf),
+        )
+        .await;
+        match read {
+            Err(_) => { /* timeout — expected, nothing was written */ }
+            Ok(Ok(0)) => { /* EOF — also fine, nothing written */ }
+            Ok(Ok(n)) => panic!(
+                "device received {n} bytes despite invalid regex: {:?}",
+                String::from_utf8_lossy(&buf[..n])
+            ),
+            Ok(Err(e)) => panic!("device read errored: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn serial_exec_empty_expect_rejects_before_writing_command() {
+        let backend = DuplexBackend::new();
+        let s = State {
+            sessions: Arc::new(SessionManager::with_seed(backend.clone(), 0xCAFE)),
+            profiles: Arc::new(vec![]),
+        };
+
+        let mut open_req = req("serial.open", Some(json!(52)));
+        open_req.params = json!({ "port": "/dev/ttyUSB0", "baud": 115200, "timeout_ms": 1000 });
+        let open_resp = dispatch(&s, open_req).await.expect("response");
+        let session_id = open_resp
+            .result
+            .expect("open result")["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let mut device = backend.take_device();
+
+        let mut exec_req = req("serial.exec", Some(json!(53)));
+        exec_req.params = json!({
+            "session_id": session_id,
+            "command": "DESTRUCTIVE_OP\n",
+            "expect": "",
+        });
+        let exec_resp = dispatch(&s, exec_req).await.expect("response");
+        let err = exec_resp.error.expect("error");
+        assert_eq!(err.code, -32008);
+        assert_eq!(err.data.as_ref().unwrap()["name"], "expect");
+
+        let mut buf = [0u8; 64];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            device.read(&mut buf),
+        )
+        .await;
+        assert!(
+            matches!(read, Err(_) | Ok(Ok(0))),
+            "device must not receive command on empty expect"
+        );
+    }
+
+    #[tokio::test]
+    async fn id_less_serial_exec_is_suppressed_before_side_effects() {
+        // Same guarantee as serial.open — id-less serial.* must not run the
+        // write half of the compound. Uses CountingBackend to detect any
+        // backend touch (open here, which is the proxy for "did we route
+        // into the manager at all").
+        let opens = StdArc::new(AtomicUsize::new(0));
+        let s = State {
+            sessions: Arc::new(SessionManager::with_seed(
+                CountingBackend {
+                    opens: opens.clone(),
+                },
+                0xCAFE,
+            )),
+            profiles: Arc::new(vec![]),
+        };
+        let mut r = req("serial.exec", None);
+        r.params = json!({
+            "session_id": "deadbeefdeadbeef",
+            "command": "help\n",
+            "expect": "prompt> ",
+        });
+        assert!(dispatch(&s, r).await.is_none());
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+        assert_eq!(s.sessions.session_count(), 0);
     }
 
     #[tokio::test]

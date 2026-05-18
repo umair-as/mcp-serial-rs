@@ -63,6 +63,7 @@ returns:
 | `serial.write` | `{session_id, data}` (≤ 4 KiB) | `{bytes_written}` |
 | `serial.read` | `{session_id, max_bytes?, timeout_ms?}` | `{data}` (UTF-8 lossy) |
 | `serial.read_until` | `{session_id, pattern, timeout_ms?}` | `{data, matched}` (`matched=false` on timeout or EOF) |
+| `serial.exec` | `{session_id, command, expect, timeout_ms?}` | `{output, ok}` (compound write + read_until) |
 | `serial.close` | `{session_id}` | `{ok}` |
 
 `serial.open` accepts either a literal `port` path or a `device` profile name
@@ -139,7 +140,7 @@ async and concurrent across sessions.
 ## Tests
 
 ```sh
-cargo test                          # 77 unit + 8 integration
+cargo test                          # 86 unit + 8 integration
 cargo test --test loopback          # PTY round-trip — needs `socat`
 ```
 
@@ -155,14 +156,13 @@ Architecture diagrams live in `docs/mcp-serial-architecture.md`.
 Phase 1 (this MVP) is complete:
 
 - `initialize`, `tools/list`, `notifications/initialized` lifecycle.
-- All six `serial.*` MVP tools.
+- All six `serial.*` MVP tools, plus `serial.exec` (P2-1).
 - Device profiles and named-device open.
 - Allowlist + timeout clamping + session cap.
 - PTY-loopback integration test.
 
-Phase 2 (deferred, see `TASKS.md`):
+Phase 2 (remaining, see `TASKS.md`):
 
-- `serial.exec` — compound `write + read_until` with an `ok` flag.
 - `serial.reset_esp32` — DTR/RTS toggle for hard reset / bootloader entry.
 - `serial.capture_start` / `serial.capture_stop` — tee session bytes to a log file.
 - Client config (`~/.claude/mcp.json` entry).

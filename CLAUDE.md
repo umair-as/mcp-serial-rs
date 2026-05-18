@@ -72,11 +72,19 @@ Create exactly this structure. Do not flatten modules or invent new ones.
 | `serial.write` | `{session_id, data}` | `{bytes_written}` |
 | `serial.read` | `{session_id, max_bytes, timeout_ms}` | `{data}` |
 | `serial.read_until` | `{session_id, pattern, timeout_ms}` | `{data, matched}` |
+| `serial.exec` | `{session_id, command, expect, timeout_ms}` | `{output, ok}` |
 | `serial.close` | `{session_id}` | `{ok}` |
+
+`serial.exec` is a pure composition of `serial.write` then `serial.read_until`. The
+caller's `command` bytes are written verbatim (no implicit newline); `timeout_ms`
+applies to the read-until phase only and is clamped to `MAX_TIMEOUT_MS`. `output`
+is the same accumulated buffer `serial.read_until` would have returned — i.e.
+all bytes read up to and including the chunk that first satisfied the match (so
+trailing bytes past the match point can appear), or whatever was read so far on
+timeout / EOF. `ok` mirrors `read_until`'s `matched`.
 
 ### Phase 2 (deferred — do not implement until told)
 
-- `serial.exec` — compound write+read_until
 - `serial.reset_esp32` — DTR/RTS toggle strategies
 - `serial.capture_start` / `serial.capture_stop` — log to file
 
