@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 
 use mcp_serial_rs::config;
 use mcp_serial_rs::protocol::{self, Response};
+use mcp_serial_rs::serial::journal::JournalWriter;
 use mcp_serial_rs::serial::manager::{SessionManager, TokioSerialBackend};
 use mcp_serial_rs::tools::{self, State};
 
@@ -45,9 +46,16 @@ async fn main() -> std::io::Result<()> {
         }
     };
 
+    // Open the audit journal. Failure is non-fatal: the server runs in
+    // degraded mode (no journaling) so a missing /tmp or permissions
+    // problem never blocks tool dispatch. Reason logged inside try_open_arc.
+    let journal_path = config::journal_path();
+    let journal = JournalWriter::try_open_arc(&journal_path).await;
+
     let state = State::new(
         Arc::new(SessionManager::new(TokioSerialBackend)),
         Arc::new(profiles),
+        journal,
     );
 
     let stdin = tokio::io::stdin();

@@ -52,7 +52,8 @@ mcp-serial-rs/
 │   │   ├── mod.rs
 │   │   ├── manager.rs ← SessionManager: HashMap<SessionId, Session>
 │   │   ├── session.rs ← per-port async state, reader task, ring buffer
-│   │   └── parser.rs  ← line/prompt matching, read_until logic
+│   │   ├── parser.rs  ← line/prompt matching, read_until logic
+│   │   └── journal.rs ← always-on JSONL traffic journal (call + result)
 │   ├── config.rs      ← port allowlist, limits, defaults
 │   └── errors.rs      ← SerialError enum, impl Into<JsonRpcError>
 └── tests/
@@ -127,6 +128,7 @@ pub const MAX_TIMEOUT_MS: u64 = 30_000;
 |---|---|---|
 | `MCP_SERIAL_ALLOWLIST` | Comma-separated glob patterns. When set, replaces `PORT_ALLOWLIST` entirely. Used by integration tests under `/tmp/...` and on hosts with non-standard device paths. | unset → compiled-in list |
 | `MCP_SERIAL_DEVICES` | Path to a TOML file mapping stable USB serial strings to device profiles (see `devices.toml`). Missing file is not an error — profiles are optional. | `./devices.toml` |
+| `MCP_SERIAL_JOURNAL` | Append-only JSONL traffic journal. Every MCP tool call appends a `call` row and (when a result is produced) a `result` row. Always-on auditing — not opt-in — but unwritable paths degrade to a `tracing::warn` and continue without journaling rather than failing to start. | `/tmp/mcp-serial-journal.jsonl` |
 | `RUST_LOG` | `tracing-subscriber` env filter. | `mcp_serial_rs=info` |
 
 **Device profiles** (loaded once at startup):

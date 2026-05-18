@@ -15,21 +15,39 @@ use crate::config::{self, DeviceProfile};
 use crate::errors::SerialError;
 use crate::protocol::{self, Request, Response};
 use crate::serial::SerialBackend;
+use crate::serial::journal::{JournalEntry, JournalWriter};
 use crate::serial::manager::SessionManager;
 
 const SERVER_NAME: &str = "mcp-serial-rs";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Per-process state passed to every handler. Cloning a `State` clones two
-/// `Arc`s — cheap, safe to share across tokio tasks.
+/// Max chars retained from any `data` / `command` / `output` field when it
+/// is summarised into the journal. Keeps the JSONL line-oriented and
+/// tail-able even for full-buffer reads. Char-bounded (not byte-bounded)
+/// so the slice always lands on a UTF-8 boundary.
+const JOURNAL_HEAD_CHARS: usize = 128;
+
+/// Per-process state passed to every handler. Cloning a `State` clones up
+/// to three `Arc`s — cheap, safe to share across tokio tasks.
 pub struct State<B: SerialBackend> {
     pub sessions: Arc<SessionManager<B>>,
     pub profiles: Arc<Vec<DeviceProfile>>,
+    /// Audit log; `None` means degraded mode (journal open failed at
+    /// startup). All dispatch-level logging is gated on this being `Some`.
+    pub journal: Option<Arc<JournalWriter>>,
 }
 
 impl<B: SerialBackend> State<B> {
-    pub fn new(sessions: Arc<SessionManager<B>>, profiles: Arc<Vec<DeviceProfile>>) -> Self {
-        Self { sessions, profiles }
+    pub fn new(
+        sessions: Arc<SessionManager<B>>,
+        profiles: Arc<Vec<DeviceProfile>>,
+        journal: Option<Arc<JournalWriter>>,
+    ) -> Self {
+        Self {
+            sessions,
+            profiles,
+            journal,
+        }
     }
 }
 
@@ -38,6 +56,12 @@ impl<B: SerialBackend> State<B> {
 #[instrument(skip(state, req), fields(method = %req.method))]
 pub async fn dispatch<B: SerialBackend>(state: &State<B>, req: Request) -> Option<Response> {
     let id = req.id.clone();
+
+    // Log the call before any short-circuit. By spec, *every* MCP tool call
+    // is journaled even when we suppress the response (notifications,
+    // id-less `serial.*`). Curated summaries trim large `data` / `command`
+    // payloads so the line stays small.
+    journal_call(state, &req).await;
 
     if req.method == "notifications/initialized" {
         return None;
@@ -58,19 +82,21 @@ pub async fn dispatch<B: SerialBackend>(state: &State<B>, req: Request) -> Optio
         match req.method.as_str() {
             "initialize" => Ok(initialize()),
             "tools/list" => Ok(tools_list()),
-            "serial.list_ports" => handle_list_ports(state, req.params),
-            "serial.open" => handle_open(state, req.params).await,
-            "serial.close" => handle_close(state, req.params),
-            "serial.write" => handle_write(state, req.params).await,
-            "serial.read" => handle_read(state, req.params).await,
-            "serial.read_until" => handle_read_until(state, req.params).await,
-            "serial.exec" => handle_exec(state, req.params).await,
+            "serial.list_ports" => handle_list_ports(state, req.params.clone()),
+            "serial.open" => handle_open(state, req.params.clone()).await,
+            "serial.close" => handle_close(state, req.params.clone()),
+            "serial.write" => handle_write(state, req.params.clone()).await,
+            "serial.read" => handle_read(state, req.params.clone()).await,
+            "serial.read_until" => handle_read_until(state, req.params.clone()).await,
+            "serial.exec" => handle_exec(state, req.params.clone()).await,
             other => Err(protocol::Error::new(
                 protocol::METHOD_NOT_FOUND,
                 format!("method '{other}' not implemented"),
             )),
         }
     };
+
+    journal_result(state, &req, &result).await;
 
     // Notifications (no `id`) get no reply by JSON-RPC 2.0 — the method's
     // side effects (if any) still ran, we just suppress the response object.
@@ -80,6 +106,139 @@ pub async fn dispatch<B: SerialBackend>(state: &State<B>, req: Request) -> Optio
         Ok(value) => Response::success(response_id, value),
         Err(err) => Response::failure(response_id, err),
     })
+}
+
+async fn journal_call<B: SerialBackend>(state: &State<B>, req: &Request) {
+    let Some(j) = state.journal.as_ref() else {
+        return;
+    };
+    let entry = JournalEntry::new(
+        session_id_for_call(&req.params),
+        req.method.clone(),
+        JournalEntry::DIR_CALL,
+        call_summary(&req.method, &req.params, req.id.as_ref()),
+    );
+    j.log(&entry).await;
+}
+
+async fn journal_result<B: SerialBackend>(
+    state: &State<B>,
+    req: &Request,
+    result: &Result<Value, protocol::Error>,
+) {
+    let Some(j) = state.journal.as_ref() else {
+        return;
+    };
+    let entry = JournalEntry::new(
+        session_id_for_result(&req.method, &req.params, result),
+        req.method.clone(),
+        JournalEntry::DIR_RESULT,
+        result_summary(&req.method, result),
+    );
+    j.log(&entry).await;
+}
+
+fn session_id_for_call(params: &Value) -> String {
+    params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .unwrap_or_else(|| JournalEntry::NO_SESSION.into())
+}
+
+/// Result-phase session id: for `serial.open`, the id is born in the
+/// result payload — surface it there so call / result rows correlate the
+/// moment the session exists.
+fn session_id_for_result(
+    method: &str,
+    params: &Value,
+    result: &Result<Value, protocol::Error>,
+) -> String {
+    if method == "serial.open" {
+        if let Ok(v) = result {
+            if let Some(sid) = v.get("session_id").and_then(Value::as_str) {
+                return sid.to_string();
+            }
+        }
+    }
+    session_id_for_call(params)
+}
+
+fn head(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(|s| s.chars().take(JOURNAL_HEAD_CHARS).collect())
+        .unwrap_or_default()
+}
+
+fn byte_len(value: &Value, key: &str) -> usize {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::len)
+        .unwrap_or(0)
+}
+
+fn call_summary(method: &str, params: &Value, id: Option<&Value>) -> Value {
+    let id_v = id.cloned().unwrap_or(Value::Null);
+    match method {
+        "serial.write" => json!({
+            "id": id_v,
+            "session_id": params.get("session_id"),
+            "bytes": byte_len(params, "data"),
+            "head": head(params, "data"),
+        }),
+        "serial.exec" => json!({
+            "id": id_v,
+            "session_id": params.get("session_id"),
+            "command_bytes": byte_len(params, "command"),
+            "command_head": head(params, "command"),
+            "expect": params.get("expect"),
+            "timeout_ms": params.get("timeout_ms"),
+        }),
+        // For methods without large fields, the raw params are already
+        // compact — pass them through so the call entry stays useful.
+        _ => json!({ "id": id_v, "params": params }),
+    }
+}
+
+fn result_summary(method: &str, result: &Result<Value, protocol::Error>) -> Value {
+    match result {
+        Err(e) => json!({
+            "ok": false,
+            "error_code": e.code,
+            "error_message": e.message,
+        }),
+        Ok(v) => match method {
+            "serial.read" => json!({
+                "ok": true,
+                "bytes": byte_len(v, "data"),
+                "head": head(v, "data"),
+            }),
+            "serial.read_until" => json!({
+                "ok": true,
+                "bytes": byte_len(v, "data"),
+                "head": head(v, "data"),
+                "matched": v.get("matched"),
+            }),
+            "serial.exec" => json!({
+                "ok": true,
+                "output_bytes": byte_len(v, "output"),
+                "output_head": head(v, "output"),
+                "exec_ok": v.get("ok"),
+            }),
+            "tools/list" => json!({
+                "ok": true,
+                "tool_count": v.as_array().map(Vec::len).unwrap_or(0),
+            }),
+            "serial.list_ports" => json!({
+                "ok": true,
+                "port_count": v.as_array().map(Vec::len).unwrap_or(0),
+            }),
+            _ => json!({ "ok": true, "result": v }),
+        },
+    }
 }
 
 fn initialize() -> Value {
@@ -494,6 +653,7 @@ mod tests {
         State {
             sessions: Arc::new(SessionManager::with_seed(TokioSerialBackend, 0xCAFE)),
             profiles: Arc::new(profiles),
+            journal: None,
         }
     }
 
@@ -621,6 +781,7 @@ mod tests {
                 0xCAFE,
             )),
             profiles: Arc::new(vec![]),
+            journal: None,
         };
         let mut r = req("serial.open", None);
         r.params = json!({ "port": "/dev/ttyUSB0", "baud": 115200, "timeout_ms": 1000 });
@@ -873,6 +1034,7 @@ mod tests {
         let s = State {
             sessions: Arc::new(SessionManager::with_seed(backend.clone(), 0xCAFE)),
             profiles: Arc::new(vec![]),
+            journal: None,
         };
 
         let mut open_req = req("serial.open", Some(json!(40)));
@@ -925,6 +1087,7 @@ mod tests {
         let s = State {
             sessions: Arc::new(SessionManager::with_seed(backend.clone(), 0xCAFE)),
             profiles: Arc::new(vec![]),
+            journal: None,
         };
 
         let mut open_req = req("serial.open", Some(json!(50)));
@@ -977,6 +1140,7 @@ mod tests {
         let s = State {
             sessions: Arc::new(SessionManager::with_seed(backend.clone(), 0xCAFE)),
             profiles: Arc::new(vec![]),
+            journal: None,
         };
 
         let mut open_req = req("serial.open", Some(json!(52)));
@@ -1029,6 +1193,7 @@ mod tests {
                 0xCAFE,
             )),
             profiles: Arc::new(vec![]),
+            journal: None,
         };
         let mut r = req("serial.exec", None);
         r.params = json!({
@@ -1049,5 +1214,180 @@ mod tests {
         let resp = dispatch(&s, r).await.expect("response");
         let err = resp.error.expect("error");
         assert_eq!(err.code, -32003);
+    }
+
+    // --- journal integration --- //
+
+    #[tokio::test]
+    async fn dispatch_with_journal_none_still_responds() {
+        // Degraded mode regression: every existing test runs with
+        // journal=None, but make the guarantee explicit with a single
+        // end-to-end pass that verifies a normal dispatch path returns
+        // a response with no journaling side effect.
+        let s = mock_state();
+        assert!(s.journal.is_none());
+        let resp = dispatch(&s, req("initialize", Some(json!(100))))
+            .await
+            .expect("response");
+        assert!(resp.result.is_some(), "must respond normally in degraded mode");
+    }
+
+    #[tokio::test]
+    async fn open_write_close_produces_six_journal_entries() {
+        // Spec target: an open + write + close sequence emits call+result
+        // for each of the three tools, in dispatch order, with correlatable
+        // session ids.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let writer = crate::serial::journal::JournalWriter::open(tmp.path())
+            .await
+            .unwrap();
+        let backend = DuplexBackend::new();
+        let s = State {
+            sessions: Arc::new(SessionManager::with_seed(backend.clone(), 0xCAFE)),
+            profiles: Arc::new(vec![]),
+            journal: Some(Arc::new(writer)),
+        };
+
+        // 1. open
+        let mut open_req = req("serial.open", Some(json!(1)));
+        open_req.params = json!({ "port": "/dev/ttyUSB0", "baud": 115200, "timeout_ms": 1000 });
+        let open_resp = dispatch(&s, open_req).await.expect("response");
+        let session_id = open_resp
+            .result
+            .expect("open result")["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Drain the device side so the duplex doesn't backpressure-block
+        // the write under test.
+        let mut device = backend.take_device();
+        let drain = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                device.read(&mut buf),
+            )
+            .await;
+        });
+
+        // 2. write
+        let mut write_req = req("serial.write", Some(json!(2)));
+        write_req.params = json!({ "session_id": session_id, "data": "hello\n" });
+        let write_resp = dispatch(&s, write_req).await.expect("response");
+        assert!(write_resp.result.is_some());
+        let _ = drain.await;
+
+        // 3. close
+        let mut close_req = req("serial.close", Some(json!(3)));
+        close_req.params = json!({ "session_id": session_id });
+        let close_resp = dispatch(&s, close_req).await.expect("response");
+        assert!(close_resp.result.is_some());
+
+        // Drop the State so the journal Arc drops the BufWriter and any
+        // buffered tail is flushed before we read the file. (log() flushes
+        // after every line, but dropping is the belt+suspenders move.)
+        drop(s);
+
+        let contents = std::fs::read_to_string(tmp.path()).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(
+            lines.len(),
+            6,
+            "expected exactly 6 entries (3 call + 3 result), got:\n{contents}"
+        );
+
+        let entries: Vec<JournalEntry> = lines
+            .iter()
+            .map(|l| serde_json::from_str::<JournalEntry>(l).expect("valid JSONL"))
+            .collect();
+
+        let expected = [
+            ("serial.open", "call"),
+            ("serial.open", "result"),
+            ("serial.write", "call"),
+            ("serial.write", "result"),
+            ("serial.close", "call"),
+            ("serial.close", "result"),
+        ];
+        for (i, (tool, dir)) in expected.iter().enumerate() {
+            assert_eq!(entries[i].tool, *tool, "row {i} tool");
+            assert_eq!(entries[i].direction, *dir, "row {i} direction");
+            assert!(
+                !entries[i].ts.is_empty() && entries[i].ts.ends_with('Z'),
+                "row {i} ts: {}",
+                entries[i].ts
+            );
+        }
+        // serial.open's call entry has no session_id yet (sentinel);
+        // every entry after must carry the real session_id.
+        assert_eq!(entries[0].session_id, JournalEntry::NO_SESSION);
+        assert_eq!(entries[1].session_id, session_id);
+        assert_eq!(entries[2].session_id, session_id);
+        assert_eq!(entries[3].session_id, session_id);
+        assert_eq!(entries[4].session_id, session_id);
+        assert_eq!(entries[5].session_id, session_id);
+
+        // serial.write summary must record byte count and a head, not the
+        // entire payload — the contract for big-data tools.
+        let write_call_summary = &entries[2].summary;
+        assert_eq!(write_call_summary["bytes"], 6, "len(\"hello\\n\")");
+        assert_eq!(write_call_summary["head"], "hello\n");
+    }
+
+    #[tokio::test]
+    async fn journal_write_summary_truncates_oversized_data() {
+        // A long write payload must not blow up the journal line.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let writer = crate::serial::journal::JournalWriter::open(tmp.path())
+            .await
+            .unwrap();
+        let backend = DuplexBackend::new();
+        let s = State {
+            sessions: Arc::new(SessionManager::with_seed(backend.clone(), 0xCAFE)),
+            profiles: Arc::new(vec![]),
+            journal: Some(Arc::new(writer)),
+        };
+
+        let mut open_req = req("serial.open", Some(json!(1)));
+        open_req.params = json!({ "port": "/dev/ttyUSB0", "baud": 115200, "timeout_ms": 1000 });
+        let open_resp = dispatch(&s, open_req).await.expect("response");
+        let session_id = open_resp
+            .result
+            .expect("open result")["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let mut device = backend.take_device();
+        let drain = tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                device.read(&mut buf),
+            )
+            .await;
+        });
+
+        let payload = "A".repeat(1024);
+        let mut write_req = req("serial.write", Some(json!(2)));
+        write_req.params = json!({ "session_id": session_id, "data": payload });
+        dispatch(&s, write_req).await.expect("response");
+        let _ = drain.await;
+
+        drop(s);
+        let contents = std::fs::read_to_string(tmp.path()).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        // open call + result + write call + result = 4 entries.
+        assert_eq!(lines.len(), 4);
+        let write_call: JournalEntry = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(write_call.tool, "serial.write");
+        assert_eq!(write_call.direction, "call");
+        let head = write_call.summary["head"].as_str().unwrap();
+        assert_eq!(
+            head.chars().count(),
+            128,
+            "head must clamp to JOURNAL_HEAD_CHARS"
+        );
+        assert_eq!(write_call.summary["bytes"], 1024);
     }
 }

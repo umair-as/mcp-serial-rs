@@ -6,6 +6,7 @@
 //! The [`SerialBackend`] trait lets us substitute a mock port implementation
 //! during testing — real serial ports cannot be opened in CI.
 
+pub mod journal;
 pub mod manager;
 pub mod parser;
 pub mod session;
