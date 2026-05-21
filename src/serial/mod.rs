@@ -53,10 +53,9 @@ impl From<SerialPortInfo> for PortDescriptor {
 /// filters in the profile also agree. Profiles without `vid` / `pid` filters
 /// match purely on the serial string.
 pub fn profile_matches_port(profile: &DeviceProfile, port: &PortDescriptor) -> bool {
-    // `Option::is_none_or` is 1.82+ — we target MSRV 1.75, so use `map_or`.
     port.serial.as_deref() == Some(profile.match_serial.as_str())
-        && profile.match_vid.map_or(true, |v| Some(v) == port.vid)
-        && profile.match_pid.map_or(true, |v| Some(v) == port.pid)
+        && profile.match_vid.is_none_or(|v| Some(v) == port.vid)
+        && profile.match_pid.is_none_or(|v| Some(v) == port.pid)
 }
 
 /// Annotate each port with the first matching profile's `name` and

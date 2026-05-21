@@ -18,8 +18,10 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-MSRV 1.75. Edition 2021. No new runtime deps beyond what `Cargo.toml`
-declares; see `CLAUDE.md §2`.
+MSRV 1.85. Edition 2021. The 1.85 floor is required by `rmcp` 1.7
+(which is built with edition 2024). See `CLAUDE.md §2` for the
+dependency rationale and `docs/rmcp-migration-spec.md` for the
+in-progress migration off the hand-rolled JSON-RPC layer.
 
 ## Quick start
 
