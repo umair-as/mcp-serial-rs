@@ -18,13 +18,15 @@ use std::sync::Arc;
 
 use rmcp::{
     ErrorData as McpError, ServerHandler,
-    handler::server::router::tool::ToolRouter,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
 };
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
-use crate::config::DeviceProfile;
+use crate::config::{self, DeviceProfile};
 use crate::serial::SerialBackend;
 use crate::serial::journal::JournalWriter;
 use crate::serial::manager::SessionManager;
@@ -100,6 +102,92 @@ impl<B: SerialBackend> McpServer<B> {
         let value = serde_json::json!({ "ports": ports });
         Ok(CallToolResult::structured(value))
     }
+
+    /// Open a serial session. Either `port` (literal device path) or
+    /// `device` (named profile from `devices.toml`) must be supplied —
+    /// not both, not neither. `baud` defaults to the profile's baud when
+    /// resolving by `device`, otherwise to [`config::DEFAULT_BAUD`].
+    /// `timeout_ms` is clamped to [`config::MAX_TIMEOUT_MS`].
+    ///
+    /// Returns structured `{"session_id": "<16-char-hex>"}`. The XOR /
+    /// presence rule is enforced at runtime; we deliberately do NOT
+    /// encode it in the generated input schema (see module docs and
+    /// spec §Migration Sequence step 7 instructions).
+    #[tool(
+        name = "serial.open",
+        description = "Open a serial session by literal port path or named device profile."
+    )]
+    #[instrument(skip(self, params), fields(port = ?params.0.port, device = ?params.0.device, baud = ?params.0.baud))]
+    pub async fn open(
+        &self,
+        params: Parameters<OpenParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Parameters(p) = params;
+
+        // Tool-contract validation: surface as SerialError::InvalidParam so
+        // the pinned -32008 code reaches the client (spec §Error Semantics
+        // "Error-code compatibility"). Do NOT use `McpError::invalid_params`
+        // here — that maps to -32602 and is reserved for JSON-RPC envelope
+        // / params-deserialization failures.
+        let (port_path, baud) = match (p.port, p.device) {
+            (Some(_), Some(_)) => {
+                return Err(crate::errors::SerialError::InvalidParam {
+                    name: "port/device".into(),
+                    reason: "specify 'device' or 'port', not both".into(),
+                }
+                .into());
+            }
+            (None, None) => {
+                return Err(crate::errors::SerialError::InvalidParam {
+                    name: "port/device".into(),
+                    reason: "missing required parameter: 'port' or 'device'".into(),
+                }
+                .into());
+            }
+            (Some(port), None) => (port, p.baud.unwrap_or(config::DEFAULT_BAUD)),
+            (None, Some(device_name)) => {
+                let (path, profile_baud) =
+                    crate::serial::resolve_device(&device_name, &self.profiles)?;
+                (path, p.baud.unwrap_or(profile_baud))
+            }
+        };
+
+        let timeout_ms = p
+            .timeout_ms
+            .unwrap_or(config::DEFAULT_TIMEOUT_MS)
+            .min(config::MAX_TIMEOUT_MS);
+
+        let session_id = self.sessions.open(&port_path, baud, timeout_ms).await?;
+        Ok(CallToolResult::structured(
+            serde_json::json!({ "session_id": session_id }),
+        ))
+    }
+}
+
+/// Input for `serial.open`. Mirrors the legacy `OpenParams` shape so the
+/// public contract is preserved. The XOR between `port` and `device` is
+/// validated at runtime, not via schema, per spec §Migration Sequence
+/// step 7 ("Runtime validation is the contract").
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OpenParams {
+    /// Literal device path (e.g. `/dev/ttyUSB0`). Mutually exclusive
+    /// with `device`.
+    #[serde(default)]
+    pub port: Option<String>,
+    /// Named device profile from `devices.toml`. Mutually exclusive
+    /// with `port`.
+    #[serde(default)]
+    pub device: Option<String>,
+    /// Override the baud rate. Defaults to the profile baud (device
+    /// path) or `config::DEFAULT_BAUD` (port path).
+    #[serde(default)]
+    pub baud: Option<u32>,
+    /// Per-session default operation timeout in milliseconds. Clamped
+    /// to `config::MAX_TIMEOUT_MS`. Falls back to
+    /// `config::DEFAULT_TIMEOUT_MS` when absent.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 #[tool_handler(router = self.tool_router)]

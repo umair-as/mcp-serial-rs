@@ -92,6 +92,35 @@ pub fn list_ports(profiles: &[DeviceProfile]) -> Result<Vec<PortDescriptor>, Ser
     Ok(descriptors)
 }
 
+/// Resolve a device-profile name to `(port_path, default_baud)`. Looks up
+/// the profile by name first — unknown names short-circuit before any
+/// host-side port enumeration. Returns [`SerialError::DeviceNotFound`]
+/// when the profile is unknown or no currently-plugged allowlisted port
+/// matches the profile's `match_serial` / `match_vid` / `match_pid`.
+pub fn resolve_device(
+    device_name: &str,
+    profiles: &[DeviceProfile],
+) -> Result<(String, u32), SerialError> {
+    let profile = profiles
+        .iter()
+        .find(|p| p.name == device_name)
+        .ok_or_else(|| SerialError::DeviceNotFound {
+            device: device_name.to_string(),
+        })?;
+    let raw = tokio_serial::available_ports().map_err(|e| SerialError::Io {
+        message: format!("available_ports: {e}"),
+    })?;
+    let ports = filter_allowlisted(raw);
+    let port_path = ports
+        .iter()
+        .find(|port| profile_matches_port(profile, port))
+        .map(|port| port.port.clone())
+        .ok_or_else(|| SerialError::DeviceNotFound {
+            device: device_name.to_string(),
+        })?;
+    Ok((port_path, profile.baud))
+}
+
 /// Pluggable opener for the underlying serial transport.
 ///
 /// The associated [`SerialBackend::Port`] type is the concrete handle the

@@ -455,7 +455,8 @@ async fn handle_open<B: SerialBackend>(
         }
         (Some(port), None) => (port, p.baud.unwrap_or(config::DEFAULT_BAUD)),
         (None, Some(device_name)) => {
-            let (path, profile_baud) = resolve_device(&device_name, &state.profiles)?;
+            let (path, profile_baud) = crate::serial::resolve_device(&device_name, &state.profiles)
+                .map_err(serial_error_to_protocol)?;
             (path, p.baud.unwrap_or(profile_baud))
         }
     };
@@ -467,36 +468,6 @@ async fn handle_open<B: SerialBackend>(
         .await
         .map_err(serial_error_to_protocol)?;
     Ok(json!({ "session_id": session_id }))
-}
-
-/// Resolve a device-profile name to (port_path, default_baud). Profile name
-/// lookup is checked first — unknown names short-circuit before touching
-/// `available_ports`, so the error path stays cheap and testable.
-fn resolve_device(
-    device_name: &str,
-    profiles: &[DeviceProfile],
-) -> Result<(String, u32), protocol::Error> {
-    let profile = profiles.iter().find(|p| p.name == device_name).ok_or_else(|| {
-        serial_error_to_protocol(SerialError::DeviceNotFound {
-            device: device_name.to_string(),
-        })
-    })?;
-    let raw = tokio_serial::available_ports().map_err(|e| {
-        serial_error_to_protocol(SerialError::Io {
-            message: format!("available_ports: {e}"),
-        })
-    })?;
-    let ports = crate::serial::filter_allowlisted(raw);
-    let port_path = ports
-        .iter()
-        .find(|port| crate::serial::profile_matches_port(profile, port))
-        .map(|port| port.port.clone())
-        .ok_or_else(|| {
-            serial_error_to_protocol(SerialError::DeviceNotFound {
-                device: device_name.to_string(),
-            })
-        })?;
-    Ok((port_path, profile.baud))
 }
 
 fn handle_close<B: SerialBackend>(
