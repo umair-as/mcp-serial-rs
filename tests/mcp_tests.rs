@@ -537,6 +537,7 @@ async fn tools_list_advertises_all_ported_tools() {
         "serial.read",
         "serial.read_until",
         "serial.exec",
+        "serial.close",
     ] {
         assert!(
             tools.iter().any(|t| t["name"] == name),
@@ -1059,5 +1060,133 @@ async fn exec_unknown_session_returns_session_not_found() {
     assert_eq!(
         resp["error"]["data"]["session_id"].as_str(),
         Some("deadbeefdeadbeef"),
+    );
+}
+
+// ---- serial.close --------------------------------------------------------
+
+#[tokio::test]
+async fn close_happy_path_returns_ok_true() {
+    let (server, session_id, _device) = server_with_open_session().await;
+    let resp = handshake_then_call(
+        server,
+        "serial.close",
+        json!({"session_id": session_id}),
+    )
+    .await;
+    let result = resp.get("result").expect("tools/call result");
+    assert_ne!(result.get("isError"), Some(&json!(true)));
+    assert_eq!(result["structuredContent"]["ok"], json!(true));
+}
+
+#[tokio::test]
+async fn close_unknown_session_returns_session_not_found() {
+    let resp = handshake_then_call(
+        stub_server(vec![]),
+        "serial.close",
+        json!({"session_id": "0000000000000000"}),
+    )
+    .await;
+    assert_eq!(rpc_error_code(&resp), -32003);
+    assert_eq!(
+        resp["error"]["data"]["session_id"].as_str(),
+        Some("0000000000000000"),
+    );
+}
+
+#[tokio::test]
+async fn close_releases_session_and_subsequent_read_returns_session_not_found() {
+    let (server, session_id, _device) = server_with_open_session().await;
+
+    // close → then attempt a read on the same id in one roundtrip.
+    // The follow-up read must hit -32003: the session is removed from
+    // the map and writes/reads on a removed id are SessionNotFound.
+    let responses = roundtrip(
+        server,
+        &[
+            init_request(),
+            initialized_notification(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "serial.close", "arguments": {"session_id": session_id}},
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "serial.read",
+                    "arguments": {"session_id": session_id, "max_bytes": 16, "timeout_ms": 100},
+                },
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "serial.write",
+                    "arguments": {"session_id": session_id, "data": "x"},
+                },
+            }),
+        ],
+    )
+    .await;
+    assert_eq!(responses.len(), 4, "init + close + read + write = 4 responses");
+
+    let close_resp = &responses[1];
+    assert_eq!(
+        close_resp["result"]["structuredContent"]["ok"],
+        json!(true),
+        "close itself must succeed; got {close_resp}",
+    );
+
+    let read_resp = &responses[2];
+    assert_eq!(
+        rpc_error_code(read_resp),
+        -32003,
+        "read on a closed session must be SessionNotFound; got {read_resp}",
+    );
+
+    let write_resp = &responses[3];
+    assert_eq!(
+        rpc_error_code(write_resp),
+        -32003,
+        "write on a closed session must be SessionNotFound; got {write_resp}",
+    );
+}
+
+#[tokio::test]
+async fn double_close_returns_session_not_found() {
+    let (server, session_id, _device) = server_with_open_session().await;
+    let responses = roundtrip(
+        server,
+        &[
+            init_request(),
+            initialized_notification(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "serial.close", "arguments": {"session_id": session_id}},
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "serial.close", "arguments": {"session_id": session_id}},
+            }),
+        ],
+    )
+    .await;
+    assert_eq!(
+        responses[1]["result"]["structuredContent"]["ok"],
+        json!(true),
+    );
+    assert_eq!(
+        rpc_error_code(&responses[2]),
+        -32003,
+        "second close on the same id must be SessionNotFound, not a different code",
     );
 }

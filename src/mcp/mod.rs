@@ -358,6 +358,25 @@ impl<B: SerialBackend> McpServer<B> {
             "ok": matched,
         })))
     }
+
+    /// Close a session and release its port. Removes the session from
+    /// the manager's map; subsequent reads/writes on the same id return
+    /// [`crate::errors::SerialError::SessionNotFound`] (-32003).
+    ///
+    /// Returns structured `{"ok": true}` on success.
+    #[tool(
+        name = "serial.close",
+        description = "Close a serial session and release its port."
+    )]
+    #[instrument(skip(self, params), fields(session_id = %params.0.session_id))]
+    pub async fn close(
+        &self,
+        params: Parameters<CloseParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Parameters(p) = params;
+        self.sessions.close(&p.session_id)?;
+        Ok(CallToolResult::structured(serde_json::json!({ "ok": true })))
+    }
 }
 
 /// Default `max_bytes` for `serial.read` when the caller omits the field.
@@ -428,6 +447,15 @@ pub struct ReadUntilParams {
     /// Defaults to `config::DEFAULT_TIMEOUT_MS` when absent.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+}
+
+/// Input for `serial.close`. Just the session id — closing is
+/// idempotent only with respect to "already-removed sessions" (those
+/// produce SessionNotFound, the same code an unknown id would).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CloseParams {
+    pub session_id: String,
 }
 
 /// Input for `serial.exec`. `command` is written verbatim (no implicit
