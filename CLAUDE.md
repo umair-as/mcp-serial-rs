@@ -179,6 +179,12 @@ pub const MAX_TIMEOUT_MS: u64 = 30_000;
 
 **Device profiles** (loaded once at startup):
 
+- Device profiles (`devices.toml`) are optional convenience support for
+  pinned local environments, not the primary workflow. Do not promote them as
+  a headline feature in README/docs. The primary workflow is:
+  `serial.list_ports` → choose an allowlisted port → `serial.open` with
+  `port`. Preserve existing profile support and tests, but do not expand
+  profile coverage or let profile behavior drive the rmcp migration design.
 - Each profile keyed by a short name (`esp32c6`, `imx93-evk`, …) with fields `match_serial`, `match_vid?`, `match_pid?`, `baud`, `description`, `probe?`, `tags`.
 - `serial.list_ports` enriches matched ports with `device` (profile name) and `description` (from profile).
 - `serial.open` accepts `{device}` as an alternative to `{port}` — the profile's `baud` is used as the default. `DeviceNotFound` error if the profile is unknown or no currently-plugged port matches it.
