@@ -90,6 +90,18 @@ impl From<SerialError> for protocol::Error {
     }
 }
 
+impl From<SerialError> for rmcp::ErrorData {
+    /// Preserve the project's pinned JSON-RPC error codes (`-32001` …
+    /// `-32009`) and structured `data` payload when adapting to rmcp's
+    /// error type. Using a typed `From` keeps the rmcp handlers from
+    /// drifting to `internal_error` for domain failures.
+    fn from(err: SerialError) -> Self {
+        let code = rmcp::model::ErrorCode(err.code());
+        let data = err.data();
+        rmcp::ErrorData::new(code, err.to_string(), Some(data))
+    }
+}
+
 impl From<std::io::Error> for SerialError {
     fn from(err: std::io::Error) -> Self {
         SerialError::Io {
@@ -150,5 +162,20 @@ mod tests {
         let p: protocol::Error = err.into();
         assert_eq!(p.code, -32001);
         assert!(p.data.is_some());
+    }
+
+    #[test]
+    fn maps_to_rmcp_error_with_pinned_code_and_data() {
+        // Regression guard: rmcp adapters must preserve the project's
+        // pinned codes, NOT collapse to -32603 internal_error.
+        let err = SerialError::Io {
+            message: "open: no such file".into(),
+        };
+        let r: rmcp::ErrorData = err.into();
+        assert_eq!(r.code, rmcp::model::ErrorCode(-32006));
+        assert_eq!(
+            r.data.as_ref().and_then(|d| d.get("message")).and_then(|v| v.as_str()),
+            Some("open: no such file"),
+        );
     }
 }

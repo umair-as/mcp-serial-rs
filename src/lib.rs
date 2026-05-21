@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod errors;
+pub mod mcp;
 pub mod protocol;
 pub mod serial;
 pub mod tools;
