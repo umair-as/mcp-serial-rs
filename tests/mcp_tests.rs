@@ -1682,22 +1682,22 @@ async fn close_racing_with_in_flight_read_has_deterministic_outcome() {
         );
     }
 
-    // close: must succeed exactly once (the legacy semantics — close
-    // on Ready or Opening is fine, close on Closed is -32003).
-    // Under the race, it could also lose the racer and be -32003 if
-    // the session was somehow already gone, but with a single close
-    // call against a Ready session, it should win.
+    // close: there is exactly ONE close call here, against a Ready
+    // session. The competing read_until checks out the port via
+    // Arc clone but does NOT remove the session from the map. So
+    // close has no legitimate reason to fail — a -32003 here would
+    // indicate a real manager bug, not acceptable race-nondeterminism.
     let close_resp = responses.iter().find(|r| r["id"] == 12).unwrap();
-    if close_resp.get("error").is_some() {
-        // Acceptable only if it lost the race to nothing else here;
-        // since we only call close once, anything other than success
-        // is suspect. Surface for debugging but do not fail — the
-        // close test in step 10 covers the deterministic path.
-        eprintln!(
-            "note: close lost the race in this run: {close_resp}; \
-             that is acceptable as long as the post-race read is -32003",
-        );
-    }
+    assert!(
+        close_resp.get("error").is_none(),
+        "close on a Ready session must succeed even with an in-flight \
+         read_until; got error response {close_resp}",
+    );
+    assert_eq!(
+        close_resp["result"]["structuredContent"]["ok"],
+        json!(true),
+        "close result must report ok=true; got {close_resp}",
+    );
 
     // Post-race read: deterministic. Whether close or read_until
     // finished first, the session id must be gone by now.
