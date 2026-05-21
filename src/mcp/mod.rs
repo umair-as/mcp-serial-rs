@@ -274,6 +274,90 @@ impl<B: SerialBackend> McpServer<B> {
             "matched": matched,
         })))
     }
+
+    /// Compound write + read_until. Writes `command` verbatim (caller
+    /// controls bytes — no implicit newline, spec §Non-Goals) then
+    /// reads until `expect` matches or `timeout_ms` elapses.
+    ///
+    /// Validation runs **before** the write, so a bad request never
+    /// mutates device state (spec §Error Semantics / §Migration
+    /// Sequence step 9):
+    ///
+    /// 1. `command` size ≤ [`config::MAX_WRITE_CHUNK`]
+    /// 2. `expect` non-empty
+    /// 3. `expect` is a valid regex
+    ///
+    /// Returns structured `{"output": String, "ok": bool}`. `ok=false`
+    /// on timeout (with partial output) is normal completion — NOT a
+    /// JSON-RPC error.
+    #[tool(
+        name = "serial.exec",
+        description = "Write a command and read until an `expect` regex matches or timeout elapses. Validation happens before write."
+    )]
+    #[instrument(skip(self, params), fields(session_id = %params.0.session_id, cmd_len = params.0.command.len()))]
+    pub async fn exec(
+        &self,
+        params: Parameters<ExecParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Parameters(p) = params;
+
+        // Step 1: size cap on command — surfaces the pinned -32008,
+        // not the legacy -32602.
+        if p.command.len() > config::MAX_WRITE_CHUNK {
+            return Err(crate::errors::SerialError::InvalidParam {
+                name: "command".into(),
+                reason: format!(
+                    "'command' is {} bytes; max per write is {}",
+                    p.command.len(),
+                    config::MAX_WRITE_CHUNK
+                ),
+            }
+            .into());
+        }
+
+        // Step 2 + 3: validate `expect` BEFORE writing — read_until's
+        // own regex compile happens *after* the write would have
+        // occurred, so without this guard a bad pattern would mutate
+        // the device (e.g. a remote shell) and only then surface
+        // InvalidParam. The check duplicates parser logic deliberately;
+        // we cannot afford the write side-effect.
+        if p.expect.is_empty() {
+            return Err(crate::errors::SerialError::InvalidParam {
+                name: "expect".into(),
+                reason: "must not be empty".into(),
+            }
+            .into());
+        }
+        if let Err(e) = regex::Regex::new(&p.expect) {
+            return Err(crate::errors::SerialError::InvalidParam {
+                name: "expect".into(),
+                reason: format!("invalid regex: {e}"),
+            }
+            .into());
+        }
+
+        let timeout_ms = p
+            .timeout_ms
+            .unwrap_or(config::DEFAULT_TIMEOUT_MS)
+            .min(config::MAX_TIMEOUT_MS);
+
+        // Write first; on write failure, surface immediately rather
+        // than swallowing into a timed-out read_until. The session-
+        // state check is duplicated across the two manager calls but
+        // is cheap, and keeps composition honest — a concurrent close
+        // between write and read_until is reported, not hidden.
+        self.sessions
+            .write(&p.session_id, p.command.as_bytes())
+            .await?;
+        let (data, matched) = self
+            .sessions
+            .read_until(&p.session_id, &p.expect, timeout_ms)
+            .await?;
+        Ok(CallToolResult::structured(serde_json::json!({
+            "output": String::from_utf8_lossy(&data),
+            "ok": matched,
+        })))
+    }
 }
 
 /// Default `max_bytes` for `serial.read` when the caller omits the field.
@@ -342,6 +426,22 @@ pub struct ReadUntilParams {
     pub pattern: String,
     /// Read deadline in milliseconds. Clamped to `config::MAX_TIMEOUT_MS`.
     /// Defaults to `config::DEFAULT_TIMEOUT_MS` when absent.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+/// Input for `serial.exec`. `command` is written verbatim (no implicit
+/// newline). `expect` is a non-empty regex compiled BEFORE the write so
+/// invalid input never mutates device state.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExecParams {
+    pub session_id: String,
+    pub command: String,
+    pub expect: String,
+    /// Read deadline in milliseconds, applied to the `read_until`
+    /// phase. Clamped to `config::MAX_TIMEOUT_MS`. Defaults to
+    /// `config::DEFAULT_TIMEOUT_MS` when absent.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
 }

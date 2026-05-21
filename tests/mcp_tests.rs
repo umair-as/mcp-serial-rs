@@ -515,9 +515,9 @@ fn stub_setup(
 }
 
 #[tokio::test]
-async fn tools_list_now_advertises_all_five_tools() {
-    // Acceptance criterion from the step-8 spec: write/read/read_until
-    // join list_ports and open under their dotted names.
+async fn tools_list_advertises_all_ported_tools() {
+    // Acceptance criterion: every tool that has been migrated joins the
+    // list under its dotted name. Updated each step as more tools port.
     let responses = roundtrip(
         tokio_server(),
         &[
@@ -536,6 +536,7 @@ async fn tools_list_now_advertises_all_five_tools() {
         "serial.write",
         "serial.read",
         "serial.read_until",
+        "serial.exec",
     ] {
         assert!(
             tools.iter().any(|t| t["name"] == name),
@@ -800,4 +801,263 @@ async fn read_until_empty_pattern_returns_invalid_param() {
     .await;
     assert_eq!(rpc_error_code(&resp), -32008);
     assert_eq!(resp["error"]["data"]["name"].as_str(), Some("pattern"));
+}
+
+// ---- serial.exec ---------------------------------------------------------
+//
+// `serial.exec` composes `write` then `read_until`. The behavioural
+// guard the spec pins down is "validation BEFORE write" — bad expect
+// regex / empty expect / oversized command MUST NOT mutate device
+// state. Several tests use the same "pre-fill device side, fail exec,
+// then follow up with serial.read on the same session" pattern that
+// step 8 introduced.
+
+#[tokio::test]
+async fn exec_happy_path_writes_command_verbatim_and_returns_ok_true() {
+    let (server, session_id, mut device) = server_with_open_session().await;
+
+    // Pre-stage the response the manager will read after writing the
+    // command. The duplex is bidirectional; bytes written here arrive
+    // on the manager side's read.
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    device
+        .write_all(b"banner\nOK done\n")
+        .await
+        .expect("device pre-write");
+    device.flush().await.expect("flush");
+
+    // Drive the exec call via the wire. The command does NOT end in
+    // `\n` — exec must NOT append one (spec §Non-Goals).
+    let command = "run-thing";
+    let resp = handshake_then_call(
+        server,
+        "serial.exec",
+        json!({
+            "session_id": session_id,
+            "command": command,
+            "expect": "OK",
+            "timeout_ms": 2000,
+        }),
+    )
+    .await;
+
+    let result = resp.get("result").expect("tools/call result");
+    assert_ne!(result.get("isError"), Some(&json!(true)));
+    let structured = &result["structuredContent"];
+    assert_eq!(structured["ok"], json!(true), "expect matched → ok=true");
+    let output = structured["output"].as_str().expect("output string");
+    assert!(
+        output.contains("OK"),
+        "output should include the matched marker, got {output:?}",
+    );
+
+    // Now read from the device side — these are the bytes the manager
+    // wrote during the write phase. Must equal `command` verbatim with
+    // NO trailing newline.
+    let mut buf = vec![0u8; command.len()];
+    timeout(Duration::from_secs(2), device.read_exact(&mut buf))
+        .await
+        .expect("device read timeout")
+        .expect("device read");
+    assert_eq!(
+        buf,
+        command.as_bytes(),
+        "exec must write `command` verbatim with no implicit newline",
+    );
+}
+
+#[tokio::test]
+async fn exec_oversized_command_returns_invalid_param_without_writing() {
+    let (server, session_id, mut device) = server_with_open_session().await;
+    // Pre-fill device side; a follow-up read must still see these
+    // bytes intact, proving the failed exec did not consume them.
+    use tokio::io::AsyncWriteExt as _;
+    device.write_all(b"untouched\n").await.expect("device write");
+    device.flush().await.expect("flush");
+
+    let oversize = "x".repeat(config::MAX_WRITE_CHUNK + 1);
+    let responses = roundtrip(
+        server,
+        &[
+            init_request(),
+            initialized_notification(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "serial.exec",
+                    "arguments": {
+                        "session_id": session_id,
+                        "command": oversize,
+                        "expect": "OK",
+                        "timeout_ms": 1000,
+                    },
+                },
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "serial.read",
+                    "arguments": {"session_id": session_id, "max_bytes": 64, "timeout_ms": 500},
+                },
+            }),
+        ],
+    )
+    .await;
+
+    let exec_resp = &responses[1];
+    assert_eq!(rpc_error_code(exec_resp), -32008);
+    assert_eq!(exec_resp["error"]["data"]["name"].as_str(), Some("command"));
+
+    let read_data = responses[2]["result"]["structuredContent"]["data"]
+        .as_str()
+        .expect("follow-up read data");
+    assert!(
+        read_data.contains("untouched"),
+        "pre-written bytes must survive a rejected exec; got {read_data:?}",
+    );
+    drop(device);
+}
+
+#[tokio::test]
+async fn exec_empty_expect_returns_invalid_param() {
+    let (server, session_id, _device) = server_with_open_session().await;
+    let resp = handshake_then_call(
+        server,
+        "serial.exec",
+        json!({
+            "session_id": session_id,
+            "command": "cmd",
+            "expect": "",
+            "timeout_ms": 1000,
+        }),
+    )
+    .await;
+    assert_eq!(rpc_error_code(&resp), -32008);
+    assert_eq!(resp["error"]["data"]["name"].as_str(), Some("expect"));
+}
+
+#[tokio::test]
+async fn exec_invalid_regex_expect_returns_invalid_param_without_writing() {
+    let (server, session_id, mut device) = server_with_open_session().await;
+    use tokio::io::AsyncWriteExt as _;
+    device.write_all(b"still-there\n").await.expect("device write");
+    device.flush().await.expect("flush");
+
+    // Single roundtrip: bad-expect exec, then serial.read to prove
+    // no command bytes leaked through.
+    let responses = roundtrip(
+        server,
+        &[
+            init_request(),
+            initialized_notification(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "serial.exec",
+                    "arguments": {
+                        "session_id": session_id,
+                        "command": "MUST_NOT_REACH_DEVICE",
+                        "expect": "[unclosed",
+                        "timeout_ms": 1000,
+                    },
+                },
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "serial.read",
+                    "arguments": {"session_id": session_id, "max_bytes": 256, "timeout_ms": 500},
+                },
+            }),
+        ],
+    )
+    .await;
+
+    let exec_resp = &responses[1];
+    assert_eq!(rpc_error_code(exec_resp), -32008);
+    assert_eq!(exec_resp["error"]["data"]["name"].as_str(), Some("expect"));
+
+    let read_data = responses[2]["result"]["structuredContent"]["data"]
+        .as_str()
+        .expect("follow-up read data");
+    assert!(
+        read_data.contains("still-there"),
+        "pre-written bytes must survive a rejected exec; got {read_data:?}",
+    );
+    // Most importantly: the command we sent must NOT appear on the
+    // manager-side read stream — proving the write did not occur.
+    assert!(
+        !read_data.contains("MUST_NOT_REACH_DEVICE"),
+        "exec must validate `expect` BEFORE writing; command bytes leaked: {read_data:?}",
+    );
+
+    // Independent check from the device side: nothing should have
+    // arrived there either.
+    use tokio::io::AsyncReadExt as _;
+    let mut buf = [0u8; 32];
+    let n = timeout(Duration::from_millis(100), device.read(&mut buf))
+        .await
+        .map(|r| r.unwrap_or(0))
+        .unwrap_or(0);
+    assert_eq!(
+        n, 0,
+        "device side received {n} bytes after a rejected exec: {:?}",
+        &buf[..n],
+    );
+}
+
+#[tokio::test]
+async fn exec_timeout_returns_partial_output_ok_false_not_error() {
+    let (server, session_id, _device) = server_with_open_session().await;
+
+    // Device side never writes the expect pattern — exec must time out
+    // and return a *successful* tool result with ok=false (spec
+    // §Error Semantics: partial output is normal completion).
+    let resp = handshake_then_call(
+        server,
+        "serial.exec",
+        json!({
+            "session_id": session_id,
+            "command": "ping",
+            "expect": "NEVER_THIS_PATTERN",
+            "timeout_ms": 100,
+        }),
+    )
+    .await;
+    let result = resp.get("result").unwrap_or_else(|| {
+        panic!("timeout must return a tool result, not a JSON-RPC error; got {resp}")
+    });
+    assert_ne!(result.get("isError"), Some(&json!(true)));
+    assert!(resp.get("error").is_none(), "timeout must not be a JSON-RPC error");
+    let structured = &result["structuredContent"];
+    assert_eq!(structured["ok"], json!(false));
+    assert!(structured["output"].is_string());
+}
+
+#[tokio::test]
+async fn exec_unknown_session_returns_session_not_found() {
+    let resp = handshake_then_call(
+        stub_server(vec![]),
+        "serial.exec",
+        json!({
+            "session_id": "deadbeefdeadbeef",
+            "command": "cmd",
+            "expect": "OK",
+            "timeout_ms": 100,
+        }),
+    )
+    .await;
+    assert_eq!(rpc_error_code(&resp), -32003);
+    assert_eq!(
+        resp["error"]["data"]["session_id"].as_str(),
+        Some("deadbeefdeadbeef"),
+    );
 }
