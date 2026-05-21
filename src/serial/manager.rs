@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `SessionManager`: owns the `HashMap<SessionId, Session>` and enforces the
 //! `MAX_SESSIONS` cap from `config.rs`. See CLAUDE.md §5.
 //!

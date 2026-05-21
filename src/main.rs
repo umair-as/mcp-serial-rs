@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! mcp-serial-rs entry point.
 //!
 //! Bootstraps the tokio runtime, initialises `tracing` (to stderr only —

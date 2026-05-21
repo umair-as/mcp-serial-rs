@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! MCP method dispatch.
 //!
 //! Routes a parsed JSON-RPC [`Request`] to its handler. Lifecycle methods

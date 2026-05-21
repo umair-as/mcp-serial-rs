@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! rmcp adapter layer (migration step 3).
 //!
 //! Parallel MCP server built on the `rmcp` SDK. The hand-rolled JSON-RPC

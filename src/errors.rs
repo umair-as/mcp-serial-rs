@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Typed errors for the serial library, with one-to-one mapping to JSON-RPC
 //! error codes. See CLAUDE.md §1 ("thiserror, not anyhow") and §7.
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Compile-time configuration constants and runtime device profiles.
 //! See CLAUDE.md §6.
 //!

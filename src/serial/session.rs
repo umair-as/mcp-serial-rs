@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Per-port `Session`: state machine (`Opening → Ready → Closing → Closed`,
 //! CLAUDE.md §5) and the owned port handle.
 //!

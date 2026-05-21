@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! In-process integration tests for the rmcp adapter layer.
 //!
 //! These tests drive `crate::mcp::McpServer` over an in-memory

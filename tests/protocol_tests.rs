@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Integration tests for the JSON-RPC 2.0 wire layer.
 //!
 //! Spawns the compiled binary as a subprocess, feeds JSON-RPC lines on stdin,

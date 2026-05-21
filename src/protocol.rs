@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! JSON-RPC 2.0 wire types for the mcp-serial-rs stdio transport.
 //!
 //! See CLAUDE.md §7 for the on-the-wire contract. One JSON object per line on

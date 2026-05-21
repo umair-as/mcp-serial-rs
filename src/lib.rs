@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! mcp-serial-rs library crate.
 //!
 //! The binary in `src/main.rs` is a thin tokio bootstrap over the modules

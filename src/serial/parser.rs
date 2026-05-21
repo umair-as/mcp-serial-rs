@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `PatternMatcher`: regex-driven `read_until` accumulator for line / prompt
 //! detection.
 //!

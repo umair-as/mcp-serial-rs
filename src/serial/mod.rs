@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Serial transport layer: session lifecycle, port I/O, and pattern parsing.
 //!
 //! See CLAUDE.md §3 for the submodule split (do not flatten) and §5 for the

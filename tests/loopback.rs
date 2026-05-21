@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! End-to-end loopback integration test.
 //!
 //! Uses `socat` to create a PTY pair with predictable symlinks under `/tmp`.
