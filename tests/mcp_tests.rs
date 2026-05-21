@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::time::timeout;
 
-use mcp_serial_rs::config::DeviceProfile;
+use mcp_serial_rs::config::{self, DeviceProfile};
 use mcp_serial_rs::errors::SerialError;
 use mcp_serial_rs::mcp::McpServer;
 use mcp_serial_rs::serial::SerialBackend;
@@ -46,20 +46,34 @@ fn tokio_server() -> McpServer<TokioSerialBackend> {
 }
 
 /// Inline stub backend: accepts any port/baud and returns one half of a
-/// duplex pair. The "device" half is dropped immediately — the open
-/// tests do not exercise read/write traffic. Kept local to this file
-/// because the `MockBackend` in `src/serial/manager.rs` is hidden behind
-/// `#[cfg(test)]` and intentionally not part of the public surface.
+/// duplex pair. The "device" half is stashed on a shared vec so read/
+/// read_until tests can pop it and drive bytes from the device side. The
+/// open-error path is also wired (`fail.store(true)`). Kept local to
+/// this file because `src/serial/manager.rs::MockBackend` is hidden
+/// behind `#[cfg(test)]` and intentionally not part of the public
+/// surface.
 #[derive(Clone)]
 struct StubBackend {
     fail: Arc<AtomicBool>,
+    devices: Arc<std::sync::Mutex<Vec<DuplexStream>>>,
 }
 
 impl StubBackend {
     fn new() -> Self {
         Self {
             fail: Arc::new(AtomicBool::new(false)),
+            devices: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Pop the most recently opened device-side half. Tests drive this
+    /// end (e.g. writing bytes the manager will see on its `read`).
+    fn take_device(&self) -> DuplexStream {
+        self.devices
+            .lock()
+            .expect("stub devices mutex poisoned")
+            .pop()
+            .expect("no device side available — was a session opened first?")
     }
 }
 
@@ -72,16 +86,30 @@ impl SerialBackend for StubBackend {
                 message: "stub backend forced failure".into(),
             });
         }
-        let (manager_side, _device_side) = tokio::io::duplex(4096);
+        let (manager_side, device_side) = tokio::io::duplex(4096);
+        self.devices
+            .lock()
+            .expect("stub devices mutex poisoned")
+            .push(device_side);
         Ok(manager_side)
     }
 }
 
 /// Build an `McpServer` backed by [`StubBackend`] with the supplied
-/// device profiles. Used by every `serial.open` test path.
+/// device profiles. Returns the server and a handle to the backend so
+/// read/read_until tests can pop the device side after `serial.open`.
+fn stub_server_with_backend(
+    profiles: Vec<DeviceProfile>,
+) -> (McpServer<StubBackend>, StubBackend) {
+    let backend = StubBackend::new();
+    let sessions = Arc::new(SessionManager::new(backend.clone()));
+    let server = McpServer::new(sessions, Arc::new(profiles), None);
+    (server, backend)
+}
+
+/// Convenience for tests that do not need a handle to the backend.
 fn stub_server(profiles: Vec<DeviceProfile>) -> McpServer<StubBackend> {
-    let sessions = Arc::new(SessionManager::new(StubBackend::new()));
-    McpServer::new(sessions, Arc::new(profiles), None)
+    stub_server_with_backend(profiles).0
 }
 
 /// Drive the rmcp server over a duplex pipe, send a sequence of MCP
@@ -443,4 +471,333 @@ async fn open_by_device_resolves_through_profile_succeeds() {
         .and_then(Value::as_str)
         .expect("session_id field");
     assert_eq!(session_id.len(), 16);
+}
+
+// ---- serial.write / serial.read / serial.read_until ----------------------
+//
+// These tests open a session **out of band** by calling `SessionManager::open`
+// directly, so the test retains a handle to the device side of the duplex
+// pair (needed for `serial.read` to have anything to consume). The rmcp
+// wire still drives the `write` / `read` / `read_until` calls under test;
+// only the session setup bypasses it. The step-7 tests cover `serial.open`
+// on the wire.
+
+/// Shared setup: build a stub-backed server, open one session out-of-band
+/// on `/dev/ttyUSB0` (matches default allowlist), pop its device-side
+/// half. Returns the server, the session_id, and the device side so the
+/// test can read what the manager wrote / write bytes the manager will
+/// see on `serial.read`.
+async fn server_with_open_session() -> (McpServer<StubBackend>, String, DuplexStream) {
+    let (server, sessions, backend) = stub_setup(vec![]);
+    let session_id = sessions
+        .open("/dev/ttyUSB0", 115_200, 5_000)
+        .await
+        .expect("open out-of-band");
+    let device = backend.take_device();
+    (server, session_id, device)
+}
+
+/// Test-only triple: server, the `Arc<SessionManager>` shared with the
+/// server, and the backend (also shared). Lets the test pre-open
+/// sessions and access the device side. Kept here, not exposed from the
+/// library.
+fn stub_setup(
+    profiles: Vec<DeviceProfile>,
+) -> (
+    McpServer<StubBackend>,
+    Arc<SessionManager<StubBackend>>,
+    StubBackend,
+) {
+    let backend = StubBackend::new();
+    let sessions = Arc::new(SessionManager::new(backend.clone()));
+    let server = McpServer::new(sessions.clone(), Arc::new(profiles), None);
+    (server, sessions, backend)
+}
+
+#[tokio::test]
+async fn tools_list_now_advertises_all_five_tools() {
+    // Acceptance criterion from the step-8 spec: write/read/read_until
+    // join list_ports and open under their dotted names.
+    let responses = roundtrip(
+        tokio_server(),
+        &[
+            init_request(),
+            initialized_notification(),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        ],
+    )
+    .await;
+    let tools = responses[1]["result"]["tools"]
+        .as_array()
+        .expect("tools array");
+    for name in [
+        "serial.list_ports",
+        "serial.open",
+        "serial.write",
+        "serial.read",
+        "serial.read_until",
+    ] {
+        assert!(
+            tools.iter().any(|t| t["name"] == name),
+            "tools/list must contain `{name}`; got {tools:?}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn write_happy_path_returns_bytes_written() {
+    let (server, session_id, mut device) = server_with_open_session().await;
+    let payload = "hello\n";
+
+    let resp = handshake_then_call(
+        server,
+        "serial.write",
+        json!({"session_id": session_id, "data": payload}),
+    )
+    .await;
+    let result = resp.get("result").expect("tools/call result");
+    assert_ne!(result.get("isError"), Some(&json!(true)));
+    assert_eq!(
+        result["structuredContent"]["bytes_written"]
+            .as_u64()
+            .expect("bytes_written u64"),
+        payload.len() as u64,
+    );
+
+    // Sanity check the bytes actually crossed the duplex.
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; payload.len()];
+    timeout(Duration::from_secs(2), device.read_exact(&mut buf))
+        .await
+        .expect("read timeout")
+        .expect("read");
+    assert_eq!(buf, payload.as_bytes());
+}
+
+#[tokio::test]
+async fn write_oversized_returns_invalid_param() {
+    let (server, session_id, _device) = server_with_open_session().await;
+    let oversize = "x".repeat(config::MAX_WRITE_CHUNK + 1);
+
+    let resp = handshake_then_call(
+        server,
+        "serial.write",
+        json!({"session_id": session_id, "data": oversize}),
+    )
+    .await;
+    assert_eq!(
+        rpc_error_code(&resp),
+        -32008,
+        "oversized writes must surface as the pinned InvalidParam code; got {resp}",
+    );
+    assert_eq!(
+        resp["error"]["data"]["name"].as_str(),
+        Some("data"),
+        "structured error.data.name must point at the offending field",
+    );
+}
+
+#[tokio::test]
+async fn write_unknown_session_returns_session_not_found() {
+    let resp = handshake_then_call(
+        stub_server(vec![]),
+        "serial.write",
+        json!({"session_id": "0000000000000000", "data": "x"}),
+    )
+    .await;
+    assert_eq!(rpc_error_code(&resp), -32003);
+    assert_eq!(
+        resp["error"]["data"]["session_id"].as_str(),
+        Some("0000000000000000"),
+    );
+}
+
+#[tokio::test]
+async fn read_returns_device_side_bytes_as_utf8_lossy() {
+    let (server, session_id, mut device) = server_with_open_session().await;
+
+    // Push bytes from the device side; the rmcp `serial.read` call must
+    // see them.
+    use tokio::io::AsyncWriteExt as _;
+    device
+        .write_all(b"hello-from-device\n")
+        .await
+        .expect("device write");
+    device.flush().await.expect("flush");
+
+    let resp = handshake_then_call(
+        server,
+        "serial.read",
+        json!({"session_id": session_id, "max_bytes": 64, "timeout_ms": 500}),
+    )
+    .await;
+    let result = resp.get("result").expect("tools/call result");
+    assert_ne!(result.get("isError"), Some(&json!(true)));
+    let data = result["structuredContent"]["data"]
+        .as_str()
+        .expect("data must be a UTF-8 string");
+    assert!(
+        data.contains("hello-from-device"),
+        "expected device bytes in `data`, got: {data:?}",
+    );
+}
+
+#[tokio::test]
+async fn read_unknown_session_returns_session_not_found() {
+    let resp = handshake_then_call(
+        stub_server(vec![]),
+        "serial.read",
+        json!({"session_id": "ffffffffffffffff"}),
+    )
+    .await;
+    assert_eq!(rpc_error_code(&resp), -32003);
+}
+
+#[tokio::test]
+async fn read_until_matches_across_chunks() {
+    let (server, session_id, mut device) = server_with_open_session().await;
+
+    // Feed bytes in pieces so the matcher must accumulate across chunks.
+    use tokio::io::AsyncWriteExt as _;
+    tokio::spawn(async move {
+        device.write_all(b"noise ").await.ok();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        device.write_all(b"hello WORLD-").await.ok();
+        device.flush().await.ok();
+    });
+
+    let resp = handshake_then_call(
+        server,
+        "serial.read_until",
+        json!({"session_id": session_id, "pattern": "WORLD", "timeout_ms": 2000}),
+    )
+    .await;
+    let result = resp.get("result").expect("tools/call result");
+    assert_ne!(result.get("isError"), Some(&json!(true)));
+    let structured = &result["structuredContent"];
+    assert_eq!(structured["matched"], json!(true));
+    let data = structured["data"].as_str().expect("data string");
+    assert!(data.contains("WORLD"), "data should contain match: {data:?}");
+}
+
+#[tokio::test]
+async fn read_until_timeout_returns_partial_with_matched_false_not_error() {
+    let (server, session_id, _device) = server_with_open_session().await;
+
+    // Device side held but never writes the pattern bytes; deadline
+    // expires and the call must return a *successful* tool result with
+    // `matched=false`, not a JSON-RPC error.
+    let resp = handshake_then_call(
+        server,
+        "serial.read_until",
+        json!({"session_id": session_id, "pattern": "PROMPT>", "timeout_ms": 100}),
+    )
+    .await;
+    let result = resp.get("result").unwrap_or_else(|| {
+        panic!("timeout must return a tool result (partial data is normal completion), got {resp}")
+    });
+    assert_ne!(
+        result.get("isError"),
+        Some(&json!(true)),
+        "timeout must NOT set isError=true (spec §Error Semantics)",
+    );
+    assert!(resp.get("error").is_none(), "timeout must not be a JSON-RPC error");
+    let structured = &result["structuredContent"];
+    assert_eq!(structured["matched"], json!(false));
+    assert!(structured["data"].is_string());
+}
+
+#[tokio::test]
+async fn read_until_invalid_regex_returns_invalid_param_without_consuming_bytes() {
+    let (server, session_id, mut device) = server_with_open_session().await;
+
+    // Pre-fill the device side. If the handler bailed AFTER reading,
+    // these bytes would be consumed. If it bailed BEFORE reading (the
+    // contract), they remain readable via a follow-up `serial.read` on
+    // the same session.
+    use tokio::io::AsyncWriteExt as _;
+    device.write_all(b"untouched\n").await.expect("device write");
+    device.flush().await.expect("flush");
+
+    // Single roundtrip drives both calls on the same server / session:
+    // first the bad-regex `read_until`, then `serial.read` to prove the
+    // pre-written bytes are still buffered for the next consumer.
+    let responses = roundtrip(
+        server,
+        &[
+            init_request(),
+            initialized_notification(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "serial.read_until",
+                    "arguments": {
+                        "session_id": session_id,
+                        "pattern": "[unclosed",
+                        "timeout_ms": 1000,
+                    },
+                },
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "serial.read",
+                    "arguments": {
+                        "session_id": session_id,
+                        "max_bytes": 64,
+                        "timeout_ms": 500,
+                    },
+                },
+            }),
+        ],
+    )
+    .await;
+    assert_eq!(responses.len(), 3, "init + 2 tool calls = 3 responses");
+
+    // read_until response: -32008 InvalidParam, name = "pattern".
+    let read_until_resp = &responses[1];
+    assert_eq!(
+        rpc_error_code(read_until_resp),
+        -32008,
+        "invalid regex must surface as InvalidParam (-32008); got {read_until_resp}",
+    );
+    assert_eq!(
+        read_until_resp["error"]["data"]["name"].as_str(),
+        Some("pattern"),
+        "structured error.data.name must identify the offending field",
+    );
+
+    // read response: success, with the pre-written bytes intact —
+    // proves the rejected read_until did NOT consume serial data.
+    let read_resp = &responses[2];
+    let result = read_resp
+        .get("result")
+        .unwrap_or_else(|| panic!("follow-up serial.read must succeed; got {read_resp}"));
+    assert_ne!(result.get("isError"), Some(&json!(true)));
+    let data = result["structuredContent"]["data"]
+        .as_str()
+        .expect("data must be a UTF-8 string");
+    assert!(
+        data.contains("untouched"),
+        "pre-written bytes must still be readable after a rejected read_until; got {data:?}",
+    );
+
+    drop(device);
+}
+
+#[tokio::test]
+async fn read_until_empty_pattern_returns_invalid_param() {
+    let (server, session_id, _device) = server_with_open_session().await;
+    let resp = handshake_then_call(
+        server,
+        "serial.read_until",
+        json!({"session_id": session_id, "pattern": "", "timeout_ms": 100}),
+    )
+    .await;
+    assert_eq!(rpc_error_code(&resp), -32008);
+    assert_eq!(resp["error"]["data"]["name"].as_str(), Some("pattern"));
 }

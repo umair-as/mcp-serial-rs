@@ -164,7 +164,122 @@ impl<B: SerialBackend> McpServer<B> {
             serde_json::json!({ "session_id": session_id }),
         ))
     }
+
+    /// Write UTF-8 data to the session's port. Caller controls the bytes
+    /// — no implicit newline is appended (spec §Non-Goals).
+    ///
+    /// Sizes above [`config::MAX_WRITE_CHUNK`] are rejected with the
+    /// project's pinned `InvalidParam` code (-32008); a runtime
+    /// validation, not a domain failure, so the device sees zero bytes.
+    /// Returns structured `{"bytes_written": n}`.
+    #[tool(
+        name = "serial.write",
+        description = "Write UTF-8 bytes to an open serial session. No implicit newline."
+    )]
+    #[instrument(skip(self, params), fields(session_id = %params.0.session_id, len = params.0.data.len()))]
+    pub async fn write(
+        &self,
+        params: Parameters<WriteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Parameters(p) = params;
+
+        if p.data.len() > config::MAX_WRITE_CHUNK {
+            return Err(crate::errors::SerialError::InvalidParam {
+                name: "data".into(),
+                reason: format!(
+                    "'data' is {} bytes; max per write is {}",
+                    p.data.len(),
+                    config::MAX_WRITE_CHUNK
+                ),
+            }
+            .into());
+        }
+
+        let bytes = self
+            .sessions
+            .write(&p.session_id, p.data.as_bytes())
+            .await?;
+        Ok(CallToolResult::structured(
+            serde_json::json!({ "bytes_written": bytes }),
+        ))
+    }
+
+    /// Read up to `max_bytes` from the session's port, returning whatever
+    /// arrived before `timeout_ms`. Both fields are clamped to the
+    /// configured ceilings; out-of-range values are silently capped, not
+    /// rejected.
+    ///
+    /// Returns structured `{"data": String}`. Bytes are decoded with
+    /// UTF-8 lossy conversion — this is a console tool, not a binary
+    /// protocol bridge (spec §Non-Goals).
+    #[tool(
+        name = "serial.read",
+        description = "Read up to `max_bytes` bytes from a serial session, with timeout."
+    )]
+    #[instrument(skip(self, params), fields(session_id = %params.0.session_id))]
+    pub async fn read(
+        &self,
+        params: Parameters<ReadParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Parameters(p) = params;
+
+        let timeout_ms = p
+            .timeout_ms
+            .unwrap_or(config::DEFAULT_TIMEOUT_MS)
+            .min(config::MAX_TIMEOUT_MS);
+        let max_bytes = p
+            .max_bytes
+            .unwrap_or(DEFAULT_READ_MAX_BYTES)
+            .min(config::MAX_READ_BUFFER);
+
+        let data = self
+            .sessions
+            .read(&p.session_id, max_bytes, timeout_ms)
+            .await?;
+        Ok(CallToolResult::structured(serde_json::json!({
+            "data": String::from_utf8_lossy(&data),
+        })))
+    }
+
+    /// Read until `pattern` matches (regex) or `timeout_ms` elapses.
+    /// Partial output is **not** an error: timeout/EOF returns the
+    /// buffered data with `matched=false` (spec §Error Semantics —
+    /// "partial output is normal completion"). Invalid or empty regex
+    /// is rejected with `InvalidParam` (-32008) *before* any port read,
+    /// so the device stream is not consumed on bad input.
+    ///
+    /// Returns structured `{"data": String, "matched": bool}`.
+    #[tool(
+        name = "serial.read_until",
+        description = "Read until a regex pattern matches or timeout elapses; returns partial output with matched=false on timeout."
+    )]
+    #[instrument(skip(self, params), fields(session_id = %params.0.session_id))]
+    pub async fn read_until(
+        &self,
+        params: Parameters<ReadUntilParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Parameters(p) = params;
+
+        let timeout_ms = p
+            .timeout_ms
+            .unwrap_or(config::DEFAULT_TIMEOUT_MS)
+            .min(config::MAX_TIMEOUT_MS);
+
+        let (data, matched) = self
+            .sessions
+            .read_until(&p.session_id, &p.pattern, timeout_ms)
+            .await?;
+        Ok(CallToolResult::structured(serde_json::json!({
+            "data": String::from_utf8_lossy(&data),
+            "matched": matched,
+        })))
+    }
 }
+
+/// Default `max_bytes` for `serial.read` when the caller omits the field.
+/// Matches the legacy stack's default. Kept local to the rmcp adapter so
+/// the constant does not leak into the public domain config surface.
+const DEFAULT_READ_MAX_BYTES: usize = 4096;
 
 /// Input for `serial.open`. Mirrors the legacy `OpenParams` shape so the
 /// public contract is preserved. The XOR between `port` and `device` is
@@ -188,6 +303,45 @@ pub struct OpenParams {
     /// Per-session default operation timeout in milliseconds. Clamped
     /// to `config::MAX_TIMEOUT_MS`. Falls back to
     /// `config::DEFAULT_TIMEOUT_MS` when absent.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+/// Input for `serial.write`. `data` is UTF-8 text; binary protocols are
+/// out of scope (spec §Non-Goals).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WriteParams {
+    pub session_id: String,
+    pub data: String,
+}
+
+/// Input for `serial.read`. Both bounds are optional; the handler
+/// applies defaults and clamps to the configured ceilings.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReadParams {
+    pub session_id: String,
+    /// Soft cap on bytes returned. Clamped to `config::MAX_READ_BUFFER`.
+    /// Defaults to `DEFAULT_READ_MAX_BYTES` when absent.
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+    /// Read deadline in milliseconds. Clamped to `config::MAX_TIMEOUT_MS`.
+    /// Defaults to `config::DEFAULT_TIMEOUT_MS` when absent.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+/// Input for `serial.read_until`. `pattern` is a regex string compiled
+/// by the parser before any port read; invalid or empty patterns fail
+/// validation up-front.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReadUntilParams {
+    pub session_id: String,
+    pub pattern: String,
+    /// Read deadline in milliseconds. Clamped to `config::MAX_TIMEOUT_MS`.
+    /// Defaults to `config::DEFAULT_TIMEOUT_MS` when absent.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
 }
