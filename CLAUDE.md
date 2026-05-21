@@ -1,7 +1,16 @@
 # mcp-serial-rs — Claude Code Orientation
 
-> MCP tool server exposing serial-port access over JSON-RPC / stdio.
+> MCP tool server exposing serial-port access over stdio.
 > First consumer: ESP32-C6 Zephyr DFU application over `/dev/ttyUSB1`.
+
+**Active migration:** the project is moving its MCP transport from a
+hand-rolled JSON-RPC layer to the `rmcp` SDK. The plan, constraints,
+non-goals, and acceptance criteria are in
+[`docs/rmcp-migration-spec.md`](docs/rmcp-migration-spec.md). That
+document is the source of truth during the migration; this file is
+persistent orientation. When the two disagree, prefer the spec for
+in-flight migration questions and update this file at the next
+checkpoint.
 
 ---
 
@@ -9,16 +18,28 @@
 
 | Topic | Decision | Notes |
 |---|---|---|
-| Language | Rust, edition 2021, MSRV 1.75+ | |
+| Language | Rust | Edition 2021 retained (`rmcp` 1.7's edition 2024 is a dependency-side concern, not a consumer requirement). MSRV: Rust 1.85. |
 | Async runtime | **tokio** (multi-thread) | Everything is async; no blocking I/O on the stdio loop |
 | Serial crate | **tokio-serial 5.x** | NOT `serialport` (sync). Async read/write mandatory |
-| Error strategy | **thiserror** for library errors, map to MCP JSON-RPC error codes | NOT `anyhow` — we need typed error variants |
-| MCP transport | Hand-rolled JSON-RPC 2.0 over stdio | No external MCP SDK crate. ~200 LOC in `protocol.rs` |
-| Logging | **tracing** + **tracing-subscriber** (env-filter, fmt) | `RUST_LOG=mcp_serial=debug` |
+| Error strategy | **thiserror** for library errors, map to MCP error codes / structured tool results | NOT `anyhow` — we need typed error variants |
+| MCP transport | **`rmcp` SDK over stdio** (migration in progress) | Hand-rolled `protocol.rs` is being replaced. Both layers may coexist during migration; the old layer is removed only after parity tests pass per spec §Migration Sequence. |
+| Logging | **tracing** + **tracing-subscriber** (env-filter, fmt, stderr writer) | `rmcp::transport::stdio()` does NOT redirect logs — stderr writer setup stays mandatory. |
 | Pattern matching | **regex** crate for `read_until` and prompt detection | |
-| Serialisation | **serde** + **serde_json** | All tool params and results are typed structs |
+| Serialisation | **serde** + **serde_json**; `schemars` once rmcp is wired | All tool params and results are typed structs; rmcp generates input schemas from them and supports structured tool results (`structuredContent`). |
+
+- Error semantics: Protocol errors are for validation failures: bad params,
+  unknown session, disallowed port, malformed regex. Structured tool results are
+  for runtime outcomes: timeout with partial data, exec failure with partial
+  output. Runtime outcomes carry `ok: false` and partial data in the result, not
+  as JSON-RPC errors.
+- Capture architecture (future): single reader per session. Any future capture
+  implementation must fan data out from one reader task via
+  `tokio::sync::broadcast`; direct reads and capture subscribers consume from
+  the same stream. No competing readers on the port.
 
 ## 2  Crate manifest (Cargo.toml `[dependencies]`)
+
+Current pre-migration set:
 
 ```toml
 tokio = { version = "1", features = ["full"] }
@@ -32,62 +53,87 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 ```
 
+Added (or to be added) for the rmcp migration: `rmcp` and `schemars`. The
+spec pins the direction to `rmcp = "1.7"` plus `schemars = "1.0"` and raises
+the project MSRV to Rust 1.85 while retaining edition 2021. Do not add either
+crate without recording the MSRV/dependency decision here and in README.
+
 No other runtime dependencies without explicit approval.
 
 `[dev-dependencies]`: `tokio-test`, `assert_matches`, `tempfile` (for PTY loopback tests).
 
 ## 3  Module map
 
+Current pre-migration layout (still authoritative for serial domain modules):
+
 ```
 mcp-serial-rs/
 ├── Cargo.toml
 ├── CLAUDE.md          ← you are here
-├── TASKS.md           ← phased work plan
+├── docs/
+│   └── rmcp-migration-spec.md  ← active migration spec
 ├── src/
 │   ├── lib.rs         ← crate root; re-exports modules for integration tests
 │   ├── main.rs        ← tokio bootstrap, stdio read loop, dispatch
-│   ├── protocol.rs    ← JSON-RPC 2.0 request/response/error types
+│   ├── protocol.rs    ← legacy hand-rolled JSON-RPC; removed only after rmcp parity (spec §Migration Sequence step 14)
 │   ├── tools.rs       ← tool name → handler dispatch table
 │   ├── serial/
 │   │   ├── mod.rs
 │   │   ├── manager.rs ← SessionManager: HashMap<SessionId, Session>
 │   │   ├── session.rs ← per-port async state, reader task, ring buffer
 │   │   ├── parser.rs  ← line/prompt matching, read_until logic
-│   │   └── journal.rs ← always-on JSONL traffic journal (call + result)
+│   │   └── journal.rs ← JSONL journal module; narrowed to tool-call-only in migration step 11
 │   ├── config.rs      ← port allowlist, limits, defaults
-│   └── errors.rs      ← SerialError enum, impl Into<JsonRpcError>
+│   └── errors.rs      ← SerialError enum, error mapping
 └── tests/
     ├── protocol_tests.rs
     ├── parser_tests.rs
     └── session_tests.rs
 ```
 
-Create exactly this structure. Do not flatten modules or invent new ones.
+Architecture constraints during and after the migration (spec §Architecture
+Constraints): keep MCP protocol concerns separated from the serial domain.
+The serial manager / session / parser / journal modules continue to own
+their respective concerns. Any new rmcp-facing module (e.g. an rmcp server
+adapter) should not absorb serial-domain logic. Do not flatten the
+`serial/` submodule.
 
-## 4  MCP tool surface (MVP — Phase 1)
+## 4  MCP tool surface
+
+Tool names and field shapes are preserved across the migration (spec §Current
+Tool Contract, §Non-Goals).
 
 | Tool | Params | Returns |
 |---|---|---|
 | `serial.list_ports` | — | `[{port, vid, pid, serial, device, description}]` |
-| `serial.open` | `{port, baud, timeout_ms}` OR `{device, baud?, timeout_ms}` | `{session_id}` |
+| `serial.open` | `{port, baud?, timeout_ms?}` OR `{device, baud?, timeout_ms?}` | `{session_id}` |
 | `serial.write` | `{session_id, data}` | `{bytes_written}` |
-| `serial.read` | `{session_id, max_bytes, timeout_ms}` | `{data}` |
-| `serial.read_until` | `{session_id, pattern, timeout_ms}` | `{data, matched}` |
-| `serial.exec` | `{session_id, command, expect, timeout_ms}` | `{output, ok}` |
+| `serial.read` | `{session_id, max_bytes?, timeout_ms?}` | `{data}` |
+| `serial.read_until` | `{session_id, pattern, timeout_ms?}` | `{data, matched}` |
+| `serial.exec` | `{session_id, command, expect, timeout_ms?}` | `{output, ok}` |
 | `serial.close` | `{session_id}` | `{ok}` |
 
-`serial.exec` is a pure composition of `serial.write` then `serial.read_until`. The
-caller's `command` bytes are written verbatim (no implicit newline); `timeout_ms`
-applies to the read-until phase only and is clamped to `MAX_TIMEOUT_MS`. `output`
-is the same accumulated buffer `serial.read_until` would have returned — i.e.
-all bytes read up to and including the chunk that first satisfied the match (so
-trailing bytes past the match point can appear), or whatever was read so far on
-timeout / EOF. `ok` mirrors `read_until`'s `matched`.
+Behavioural notes preserved by the spec:
 
-### Phase 2 (deferred — do not implement until told)
+- Dotted tool names stay (no rename to `serial_open` etc.).
+- `data` fields are UTF-8 lossy strings; no `hex:` prefix; binary protocols
+  are not in scope.
+- `serial.exec` writes `command` verbatim — no implicit newline — and
+  validates `expect` (regex + non-empty) BEFORE writing, so an invalid
+  pattern cannot mutate device state and only then return InvalidParam.
+- `serial.exec` returns partial output with `ok=false` on timeout (same
+  buffer `serial.read_until` would have returned).
+- `serial.read_until` returns partial data with `matched=false` on timeout
+  or EOF — partial output is normal completion, not an error.
+
+Once `rmcp` is wired, tool results SHOULD use rmcp's structured tool
+results (`CallToolResult::structured`) for object outputs so clients read
+parsed fields without re-parsing a text blob. Field names remain identical.
+
+Deferred (not in this migration, see spec §Non-Goals):
 
 - `serial.reset_esp32` — DTR/RTS toggle strategies
-- `serial.capture_start` / `serial.capture_stop` — log to file
+- `serial.capture_start` / `serial.capture_stop` — tee mid-session bytes to a log file
 
 ## 5  Session state machine
 
@@ -128,7 +174,7 @@ pub const MAX_TIMEOUT_MS: u64 = 30_000;
 |---|---|---|
 | `MCP_SERIAL_ALLOWLIST` | Comma-separated glob patterns. When set, replaces `PORT_ALLOWLIST` entirely. Used by integration tests under `/tmp/...` and on hosts with non-standard device paths. | unset → compiled-in list |
 | `MCP_SERIAL_DEVICES` | Path to a TOML file mapping stable USB serial strings to device profiles (see `devices.toml`). Missing file is not an error — profiles are optional. | `./devices.toml` |
-| `MCP_SERIAL_JOURNAL` | Append-only JSONL traffic journal. Every MCP tool call appends a `call` row and (when a result is produced) a `result` row. Always-on auditing — not opt-in — but unwritable paths degrade to a `tracing::warn` and continue without journaling rather than failing to start. | `/tmp/mcp-serial-journal.jsonl` |
+| `MCP_SERIAL_JOURNAL` | Append-only JSONL journal path. Current hand-rolled dispatch journals MCP traffic; the rmcp migration narrows this to a tool-call journal where every MCP tool call appends a `call` row and, when a result is produced, a `result` row. Always-on auditing — not opt-in — but unwritable paths degrade to a `tracing::warn` and continue without journaling rather than failing to start. | `/tmp/mcp-serial-journal.jsonl` |
 | `RUST_LOG` | `tracing-subscriber` env filter. | `mcp_serial_rs=info` |
 
 **Device profiles** (loaded once at startup):
@@ -137,35 +183,26 @@ pub const MAX_TIMEOUT_MS: u64 = 30_000;
 - `serial.list_ports` enriches matched ports with `device` (profile name) and `description` (from profile).
 - `serial.open` accepts `{device}` as an alternative to `{port}` — the profile's `baud` is used as the default. `DeviceNotFound` error if the profile is unknown or no currently-plugged port matches it.
 
-## 7  JSON-RPC 2.0 contract
+## 7  MCP wire & framing
 
-### Request (stdin, one JSON object per line)
+The MCP framing on stdio is owned by `rmcp` once the migration lands.
+Initialize, `tools/list`, `tools/call`, and `notifications/initialized` are
+handled by the SDK; this project no longer hand-codes JSON-RPC envelopes
+after spec §Migration Sequence step 14 is complete.
 
-```json
-{"jsonrpc":"2.0","id":1,"method":"serial.open","params":{"port":"/dev/ttyUSB1","baud":115200}}
-```
+Invariants that survive the migration:
 
-### Success response (stdout)
-
-```json
-{"jsonrpc":"2.0","id":1,"result":{"session_id":"a3f7c012"}}
-```
-
-### Error response (stdout)
-
-```json
-{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"port not in allowlist","data":{"port":"/dev/ttyS0"}}}
-```
-
-### MCP lifecycle methods (must implement)
-
-| Method | Purpose |
-|---|---|
-| `initialize` | Return server name, version, tool list |
-| `tools/list` | Return tool schemas (JSON Schema for each tool's params) |
-| `notifications/initialized` | Client ack — no response needed |
-
-**Logging goes to stderr only.** stdout is exclusively the JSON-RPC channel.
+- **stdout is reserved for MCP messages only.** No `println!`, no debug
+  prints, no stray writes. `rmcp::transport::stdio()` returns
+  `(tokio::io::Stdin, tokio::io::Stdout)` and does not redirect anything —
+  the caller MUST configure `tracing-subscriber` with a stderr writer.
+- **Logs go to stderr only**, via `tracing` + `tracing-subscriber`. Driven
+  by `RUST_LOG`.
+- **rmcp dispatches requests concurrently** (`tokio::task::JoinSet` inside
+  the service loop). Two tool calls on the same connection can run in
+  parallel. The per-session port mutex in `serial/manager.rs` is therefore
+  load-bearing, not defensive — every concurrent-access invariant in spec
+  §Architecture Constraints applies.
 
 ## 8  Coding conventions
 
@@ -191,10 +228,27 @@ All three must pass before reporting task done.
 
 ## 10  Do NOT
 
-- Do not add `anyhow`. Use `thiserror`.
+- Do not add `anyhow`. Use `thiserror`. (The migration spec's §Non-Goals
+  reaffirms this; v2-style sketches that used `anyhow` are out of scope.)
 - Do not add `serialport` (sync). Use `tokio-serial`.
-- Do not add any MCP SDK crate. We hand-roll JSON-RPC.
-- Do not implement Phase 2 tools until explicitly asked.
-- Do not write to stdout except JSON-RPC responses. All logs → stderr via `tracing`.
+- Do not rename tools from dotted (`serial.open`) to underscored
+  (`serial_open`) during the rmcp migration. (Spec §Non-Goals.)
+- Do not implement `serial.reset_esp32` or `serial.capture_*` as part of
+  this migration. (Spec §Non-Goals.)
+- Do not add a `hex:` prefix or other binary payload encoding to
+  `serial.write`. UTF-8 only. (Spec §Non-Goals.)
+- Do not make `serial.exec` append a newline to `command`. Caller
+  controls the bytes. (Spec §Non-Goals.)
+- Do not change the session-id format (16-char hex, SplitMix64) without a
+  separate decision. (Spec §Non-Goals.)
+- Do not silently drop audit-journal behaviour. The rmcp migration intentionally
+  narrows JSONL auditing to tool calls only; docs and tests must describe that
+  as a tool-call / serial-operation journal, not full MCP traffic parity. (Spec
+  §Journal Requirements.)
+- Do not write to stdout except MCP-framed responses (via `rmcp`). All
+  logs → stderr via `tracing`.
 - Do not use `std::thread` for concurrency. Everything is tokio tasks.
-- Do not flatten the `serial/` submodule — keep `manager.rs`, `session.rs`, `parser.rs` separate.
+- Do not flatten the `serial/` submodule — keep `manager.rs`, `session.rs`,
+  `parser.rs`, `journal.rs` separate.
+- Do not delete the legacy `protocol.rs` / hand-rolled dispatch layer
+  until rmcp parity tests pass. (Spec §Migration Sequence step 14.)
