@@ -1430,3 +1430,357 @@ async fn double_close_returns_session_not_found() {
         "second close on the same id must be SessionNotFound, not a different code",
     );
 }
+
+// ---- concurrency hardening (step 12) -------------------------------------
+//
+// These tests exercise rmcp's concurrent dispatch — the SDK runs each
+// `tools/call` on its own tokio::task::JoinSet entry, so requests in a
+// single client batch can be IN-FLIGHT simultaneously on the server.
+// The hand-rolled stack's stdin line-loop never had this property; the
+// migration introduces it for the first time and these tests pin the
+// behaviour:
+//
+//   1. work on session A does not block work on session B;
+//   2. concurrent writes on ONE session serialise byte-cleanly through
+//      the per-port mutex (no torn payloads, no interleave);
+//   3. close racing with an in-flight read terminates deterministically
+//      (no hang, no panic) and leaves the session unusable;
+//   4. journal JSONL stays one-record-per-line under concurrent calls
+//      — the writer's tokio::sync::Mutex serialises each `log` call.
+
+/// Helper: open `n` sessions on the supplied SessionManager, returning
+/// their ids in the order created. The device-side halves are stashed
+/// inside the StubBackend; tests pop with `backend.take_device()` if
+/// they need them (LIFO order — most recently opened first).
+async fn open_n_sessions(
+    sessions: &SessionManager<StubBackend>,
+    n: usize,
+) -> Vec<String> {
+    let mut ids = Vec::with_capacity(n);
+    for _ in 0..n {
+        let sid = sessions
+            .open("/dev/ttyUSB0", 115_200, 5_000)
+            .await
+            .expect("open OOB");
+        ids.push(sid);
+    }
+    ids
+}
+
+#[tokio::test]
+async fn concurrent_calls_on_different_sessions_progress_independently() {
+    // Two sessions; on session A start a `read_until` that will time
+    // out (no matching bytes will arrive); on session B do a fast
+    // `serial.list_ports`. Under sequential dispatch session B would
+    // be blocked waiting for A's 1500ms timeout. Under rmcp's
+    // concurrent dispatch B should answer first.
+    let (server, sessions, _backend) = stub_setup(vec![]);
+    let ids = open_n_sessions(&sessions, 2).await;
+    let slow_id = ids[0].clone();
+
+    let responses = roundtrip(
+        server,
+        &[
+            init_request(),
+            initialized_notification(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 100,
+                "method": "tools/call",
+                "params": {
+                    "name": "serial.read_until",
+                    "arguments": {
+                        "session_id": slow_id,
+                        "pattern": "NEVER_GONNA_MATCH",
+                        "timeout_ms": 1500,
+                    },
+                },
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 200,
+                "method": "tools/call",
+                "params": {"name": "serial.list_ports", "arguments": {}},
+            }),
+        ],
+    )
+    .await;
+    assert_eq!(responses.len(), 3, "init + 2 tool calls = 3 responses");
+
+    // The two tool-call responses (ids 100 and 200) follow `init`.
+    // Under concurrent dispatch, the fast `list_ports` (id=200)
+    // completes long before the slow `read_until` (id=100) hits its
+    // timeout, so we expect 200 BEFORE 100 in arrival order.
+    let id_order: Vec<i64> = responses[1..]
+        .iter()
+        .map(|r| r["id"].as_i64().expect("id"))
+        .collect();
+    assert_eq!(
+        id_order,
+        vec![200, 100],
+        "fast list_ports must answer before slow read_until — proves \
+         requests dispatch concurrently and session B is not blocked \
+         by session A's timeout",
+    );
+
+    // Sanity: the slow one timed out as a *successful* partial-result
+    // tool call (matched=false), not a JSON-RPC error.
+    let slow_resp = responses.iter().find(|r| r["id"] == 100).unwrap();
+    assert_eq!(
+        slow_resp["result"]["structuredContent"]["matched"],
+        json!(false),
+    );
+}
+
+#[tokio::test]
+async fn concurrent_writes_on_same_session_serialize_without_byte_interleaving() {
+    // Two writes on ONE session in a single batch. The per-port
+    // tokio::sync::Mutex inside `SessionManager::write` is the only
+    // thing standing between rmcp's concurrent task dispatch and a
+    // torn payload on the wire. The test asserts: the device side
+    // sees one complete payload followed by the other — never an
+    // interleave. Direction (A-first vs B-first) is intentionally
+    // not asserted: which task acquires the mutex first is racy.
+    let (server, sessions, backend) = stub_setup(vec![]);
+    let ids = open_n_sessions(&sessions, 1).await;
+    let session_id = ids[0].clone();
+    let mut device = backend.take_device();
+
+    // Pick sizes that span multiple syscalls / buffer fills so an
+    // interleave would actually surface. 1024 bytes each fits inside
+    // MAX_WRITE_CHUNK (4 KiB) so neither call is rejected.
+    let payload_a = "A".repeat(1024);
+    let payload_b = "B".repeat(1024);
+
+    let _ = roundtrip(
+        server,
+        &[
+            init_request(),
+            initialized_notification(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "serial.write",
+                    "arguments": {"session_id": session_id, "data": payload_a.clone()},
+                },
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "serial.write",
+                    "arguments": {"session_id": session_id, "data": payload_b.clone()},
+                },
+            }),
+        ],
+    )
+    .await;
+
+    // Read everything the manager wrote — total bytes is exact.
+    use tokio::io::AsyncReadExt as _;
+    let mut buf = vec![0u8; payload_a.len() + payload_b.len()];
+    timeout(Duration::from_secs(2), device.read_exact(&mut buf))
+        .await
+        .expect("read_exact timeout")
+        .expect("device read");
+
+    // Acceptable: AAA...BBB or BBB...AAA. Any other shape is an
+    // interleave — fail loudly with the actual sequence so a
+    // regression is debuggable.
+    let a_then_b = {
+        let mut expected = payload_a.as_bytes().to_vec();
+        expected.extend_from_slice(payload_b.as_bytes());
+        expected
+    };
+    let b_then_a = {
+        let mut expected = payload_b.as_bytes().to_vec();
+        expected.extend_from_slice(payload_a.as_bytes());
+        expected
+    };
+    assert!(
+        buf == a_then_b || buf == b_then_a,
+        "concurrent writes on one session must serialise; saw torn output \
+         (first 64 bytes: {:?}, last 64 bytes: {:?})",
+        String::from_utf8_lossy(&buf[..64]),
+        String::from_utf8_lossy(&buf[buf.len() - 64..]),
+    );
+}
+
+#[tokio::test]
+async fn close_racing_with_in_flight_read_has_deterministic_outcome() {
+    // Send `read_until` (will time out — device never writes the
+    // pattern) and `serial.close` in the same batch. The race is
+    // intentionally not asserted to pick a specific winner — only
+    // that:
+    //   * both calls return (no hang),
+    //   * the read terminates either successfully with matched=false
+    //     OR with SessionNotFound (-32003) — both are valid given the
+    //     race; we do not pin which one,
+    //   * after the dust settles a fresh read on the same session id
+    //     returns SessionNotFound, proving the close did remove the
+    //     session.
+    let (server, sessions, _backend) = stub_setup(vec![]);
+    let ids = open_n_sessions(&sessions, 1).await;
+    let session_id = ids[0].clone();
+
+    let responses = roundtrip(
+        server,
+        &[
+            init_request(),
+            initialized_notification(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "tools/call",
+                "params": {
+                    "name": "serial.read_until",
+                    "arguments": {
+                        "session_id": session_id,
+                        "pattern": "NEVER",
+                        "timeout_ms": 800,
+                    },
+                },
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "tools/call",
+                "params": {"name": "serial.close", "arguments": {"session_id": session_id}},
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 13,
+                "method": "tools/call",
+                "params": {
+                    "name": "serial.read",
+                    "arguments": {"session_id": session_id, "max_bytes": 16, "timeout_ms": 100},
+                },
+            }),
+        ],
+    )
+    .await;
+    assert_eq!(responses.len(), 4, "init + 3 tool calls = 4 responses");
+
+    // read_until: either matched=false (timed out before close
+    // observed it) or -32003 (close removed the session mid-read).
+    // Ids start at 11 to avoid colliding with `initialize`'s id=1.
+    let read_until_resp = responses.iter().find(|r| r["id"] == 11).unwrap();
+    if let Some(err) = read_until_resp.get("error") {
+        assert_eq!(
+            err["code"].as_i64(),
+            Some(-32003),
+            "if read_until errors during close race it must be -32003 SessionNotFound; got {err}",
+        );
+    } else {
+        assert_eq!(
+            read_until_resp["result"]["structuredContent"]["matched"],
+            json!(false),
+            "if read_until succeeds during close race it must be matched=false (timeout); got {read_until_resp}",
+        );
+    }
+
+    // close: must succeed exactly once (the legacy semantics — close
+    // on Ready or Opening is fine, close on Closed is -32003).
+    // Under the race, it could also lose the racer and be -32003 if
+    // the session was somehow already gone, but with a single close
+    // call against a Ready session, it should win.
+    let close_resp = responses.iter().find(|r| r["id"] == 12).unwrap();
+    if close_resp.get("error").is_some() {
+        // Acceptable only if it lost the race to nothing else here;
+        // since we only call close once, anything other than success
+        // is suspect. Surface for debugging but do not fail — the
+        // close test in step 10 covers the deterministic path.
+        eprintln!(
+            "note: close lost the race in this run: {close_resp}; \
+             that is acceptable as long as the post-race read is -32003",
+        );
+    }
+
+    // Post-race read: deterministic. Whether close or read_until
+    // finished first, the session id must be gone by now.
+    let post_read = responses.iter().find(|r| r["id"] == 13).unwrap();
+    assert_eq!(
+        rpc_error_code(post_read),
+        -32003,
+        "after close + read_until both settle, the session id must \
+         no longer be valid; got {post_read}",
+    );
+}
+
+#[tokio::test]
+async fn concurrent_tool_calls_produce_valid_non_interleaved_journal_rows() {
+    // Stress the journal under concurrency: fire 8 `serial.list_ports`
+    // tool calls in one batch (sessionless, all dispatched in
+    // parallel by rmcp). Then parse every line of the resulting
+    // JSONL file. Each line must parse as JSON on its own — proving
+    // the JournalWriter's tokio::sync::Mutex genuinely serialises
+    // line writes and no two `log` calls produce a partial / torn
+    // line.
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let path = tmp.path().to_path_buf();
+    drop(tmp);
+
+    let (server, _sessions, _backend) = stub_server_with_journal(&path).await;
+
+    const N: usize = 8;
+    let mut reqs = vec![init_request(), initialized_notification()];
+    for i in 0..N {
+        reqs.push(json!({
+            "jsonrpc": "2.0",
+            "id": 1000 + i,
+            "method": "tools/call",
+            "params": {"name": "serial.list_ports", "arguments": {}},
+        }));
+    }
+
+    let responses = roundtrip(server, &reqs).await;
+    // 1 init response + N tool-call responses
+    assert_eq!(responses.len(), 1 + N);
+    for resp in &responses[1..] {
+        assert!(
+            resp.get("error").is_none(),
+            "every list_ports call must succeed under concurrency; got {resp}",
+        );
+    }
+
+    // Parse the journal. We expect 2*N lines (call + result per
+    // tool call). Each one must be standalone-parseable JSON.
+    let raw = std::fs::read_to_string(&path).expect("read journal");
+    let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        2 * N,
+        "expected {} JSONL rows ({N} calls × call+result), got {}",
+        2 * N,
+        lines.len(),
+    );
+    for (i, line) in lines.iter().enumerate() {
+        serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|e| {
+            panic!(
+                "line {i} is not valid JSON — likely torn/interleaved: {e}\nLINE: {line:?}",
+            )
+        });
+    }
+
+    // Aggregate by direction to prove call/result balance even when
+    // individual rows arrived interleaved (ordering between distinct
+    // calls is intentionally not asserted — that is the user-facing
+    // nondeterminism).
+    let entries: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let calls = entries
+        .iter()
+        .filter(|e| e["direction"] == "call")
+        .count();
+    let results = entries
+        .iter()
+        .filter(|e| e["direction"] == "result")
+        .count();
+    assert_eq!(calls, N);
+    assert_eq!(results, N);
+}
