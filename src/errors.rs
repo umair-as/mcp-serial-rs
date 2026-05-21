@@ -10,8 +10,6 @@
 use serde_json::json;
 use thiserror::Error;
 
-use crate::protocol;
-
 #[derive(Debug, Error)]
 pub enum SerialError {
     #[error("port '{port}' is not in the allowlist")]
@@ -84,14 +82,6 @@ impl SerialError {
     }
 }
 
-impl From<SerialError> for protocol::Error {
-    fn from(err: SerialError) -> Self {
-        let code = err.code();
-        let data = err.data();
-        protocol::Error::with_data(code, err.to_string(), data)
-    }
-}
-
 impl From<SerialError> for rmcp::ErrorData {
     /// Preserve the project's pinned JSON-RPC error codes (`-32001` …
     /// `-32009`) and structured `data` payload when adapting to rmcp's
@@ -154,16 +144,6 @@ mod tests {
         for c in variants {
             assert!((-32099..=-32000).contains(&c), "code {c} outside reserved range");
         }
-    }
-
-    #[test]
-    fn maps_to_protocol_error_with_data() {
-        let err = SerialError::PortNotAllowed {
-            port: "/dev/ttyS0".into(),
-        };
-        let p: protocol::Error = err.into();
-        assert_eq!(p.code, -32001);
-        assert!(p.data.is_some());
     }
 
     #[test]

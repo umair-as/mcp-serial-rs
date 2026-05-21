@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! End-to-end loopback integration test against the **rmcp wire shape**.
+//! End-to-end loopback integration test against the **rmcp wire shape**,
+//! exercised through the real release binary as a subprocess.
 //!
 //! Hardware-style I/O: `socat` creates a PTY pair whose symlinks live
 //! under `/tmp`. A background OS thread on the device end echoes back
@@ -8,14 +9,11 @@
 //! `serial.read_until` for the same payload validates the full round
 //! trip through real serial reads/writes via `tokio-serial`.
 //!
-//! Wire shape: the rmcp `McpServer` is wired in-process over a
-//! `tokio::io::duplex` pair; the test side speaks the SDK envelopes
-//! (`initialize`, `tools/call` with `name` + `arguments`, structured
-//! results in `structuredContent`). The hand-rolled binary's
-//! line-loop in `src/main.rs` is intentionally NOT in scope here —
-//! it stays untouched until spec §Migration Sequence step 14 switches
-//! it over. (Until then, `tests/protocol_tests.rs` keeps subprocess
-//! coverage of the legacy wire.)
+//! Wire shape (post step 14 — `src/main.rs` now speaks rmcp):
+//!   * `initialize` envelope per MCP 2025-11-25
+//!   * `notifications/initialized`
+//!   * each serial.* tool invoked via a `tools/call` envelope
+//!   * responses read from `result.structuredContent.<field>`
 //!
 //! Skips at runtime when `socat` is not on PATH. To run locally:
 //!
@@ -24,20 +22,14 @@
 //! cargo test --test loopback -- --nocapture
 //! ```
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rmcp::ServiceExt;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::time::timeout;
-
-use mcp_serial_rs::mcp::McpServer;
-use mcp_serial_rs::serial::manager::{SessionManager, TokioSerialBackend};
 
 const RESP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -105,7 +97,6 @@ fn start_pty_pair() -> PtyPair {
 
 /// Background OS thread that reads from the device end of the PTY pair
 /// and writes the same bytes back, creating a hardware-style echo loop.
-/// Returns the JoinHandle so the test can wait for orderly shutdown.
 fn spawn_echo_thread(device_path: &str) -> thread::JoinHandle<()> {
     let path = device_path.to_string();
     thread::spawn(move || {
@@ -138,30 +129,43 @@ fn spawn_echo_thread(device_path: &str) -> thread::JoinHandle<()> {
     })
 }
 
-/// Send one line-delimited JSON message into the rmcp server.
-async fn send_line(
-    writer: &mut (impl AsyncWriteExt + Unpin),
-    value: &Value,
-) {
-    let mut bytes = serde_json::to_vec(value).expect("encode");
-    bytes.push(b'\n');
-    writer.write_all(&bytes).await.expect("write line");
-    writer.flush().await.expect("flush");
+/// Pump child stdout into a channel; each whole line lands as a parsed
+/// JSON value. Empty lines and non-JSON lines (should never happen, but
+/// belt-and-braces) are dropped with a stderr note.
+fn spawn_response_pump(stdout: std::process::ChildStdout) -> mpsc::Receiver<Value> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                eprintln!("non-JSON line from binary: {line}");
+                continue;
+            };
+            if tx.send(v).is_err() {
+                break;
+            }
+        }
+    });
+    rx
 }
 
-/// Read one response from the rmcp server, with [`RESP_TIMEOUT`].
-async fn read_response<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Value {
-    let mut buf = String::new();
-    let n = timeout(RESP_TIMEOUT, reader.read_line(&mut buf))
-        .await
-        .expect("response timeout")
-        .expect("read line");
-    assert!(n > 0, "EOF on rmcp server stdout-equivalent");
-    serde_json::from_str(buf.trim_end()).expect("response JSON")
+fn next_response(rx: &mpsc::Receiver<Value>) -> Value {
+    rx.recv_timeout(RESP_TIMEOUT)
+        .expect("binary did not respond within timeout")
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn loopback_rmcp_open_write_echo_read_until_close() {
+fn send(stdin: &mut std::process::ChildStdin, req: Value) {
+    let line = req.to_string();
+    writeln!(stdin, "{line}").expect("write to binary stdin");
+    stdin.flush().expect("flush binary stdin");
+}
+
+#[test]
+fn loopback_rmcp_open_write_echo_read_until_close() {
     if !socat_available() {
         eprintln!(
             "loopback: skipping — socat not installed. \
@@ -173,36 +177,32 @@ async fn loopback_rmcp_open_write_echo_read_until_close() {
     let pty = start_pty_pair();
     let echo = spawn_echo_thread(&pty.b_path);
 
-    // Allowlist override so `/tmp/mcp-loopback-{pid}-A` is accepted by
-    // SessionManager::open. The env var bleeds into the whole test
-    // process — this is the only test in `tests/loopback.rs`, and
-    // each integration test file is its own cargo test binary, so
-    // cross-test contention does not arise here.
+    // Spawn the real binary with an allowlist override so /tmp/...
+    // resolves. The binary now speaks the rmcp wire on stdio
+    // (post-step 14 main.rs switch).
+    let bin = env!("CARGO_BIN_EXE_mcp-serial-rs");
     let pid = std::process::id();
     let allowlist = format!("/tmp/mcp-loopback-{pid}-*");
-    // SAFETY: single-test binary; no concurrent env access here.
-    unsafe { std::env::set_var("MCP_SERIAL_ALLOWLIST", &allowlist) };
+    let mut child = Command::new(bin)
+        .env("MCP_SERIAL_ALLOWLIST", &allowlist)
+        // Disable the journal for this test — `try_open_arc` would
+        // otherwise lock-step against /tmp/mcp-serial-journal.jsonl
+        // and we don't need audit rows for the loopback assertion.
+        .env("MCP_SERIAL_JOURNAL", format!("/tmp/mcp-loopback-{pid}.jsonl"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mcp-serial-rs binary");
 
-    // Build the in-process rmcp server with the REAL tokio-serial
-    // backend; the loopback intentionally exercises real OS-level
-    // serial I/O via the PTY, not a stub.
-    let sessions = Arc::new(SessionManager::new(TokioSerialBackend));
-    let server = McpServer::new(sessions, Arc::new(Vec::new()), None);
+    let mut stdin = child.stdin.take().expect("stdin piped");
+    let stdout = child.stdout.take().expect("stdout piped");
+    let rx = spawn_response_pump(stdout);
 
-    // Wire the server end of an in-memory duplex; client side stays
-    // here in the test for driving the rmcp wire.
-    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
-    let server_task = tokio::spawn(async move {
-        let svc = server.serve(server_io).await.expect("serve start");
-        let _ = svc.waiting().await;
-    });
-    let (cread, mut cwrite) = tokio::io::split(client_io);
-    let mut reader = BufReader::new(cread);
-
-    // 1. initialize — confirms the rmcp lifecycle handshake.
-    send_line(
-        &mut cwrite,
-        &json!({
+    // 1. initialize — rmcp lifecycle handshake.
+    send(
+        &mut stdin,
+        json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
@@ -212,23 +212,48 @@ async fn loopback_rmcp_open_write_echo_read_until_close() {
                 "clientInfo": {"name": "loopback", "version": "0.0.1"},
             }
         }),
-    )
-    .await;
-    let init = read_response(&mut reader).await;
-    assert_eq!(init["result"]["serverInfo"]["name"], "mcp-serial-rs");
+    );
+    let init = next_response(&rx);
+    assert_eq!(init["id"], 1);
+    assert_eq!(
+        init["result"]["serverInfo"]["name"], "mcp-serial-rs",
+        "rmcp wire: name lives under serverInfo, got {init}",
+    );
+    assert!(init["result"]["capabilities"]["tools"].is_object());
 
-    send_line(
-        &mut cwrite,
-        &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-    )
-    .await;
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    );
 
-    // 2. tools/call serial.open against the manager-side PTY.
-    send_line(
-        &mut cwrite,
-        &json!({
+    // 2. tools/list — should advertise all seven dotted tool names.
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+    );
+    let list = next_response(&rx);
+    let tools = list["result"]["tools"].as_array().expect("tools array");
+    for expected in [
+        "serial.list_ports",
+        "serial.open",
+        "serial.write",
+        "serial.read",
+        "serial.read_until",
+        "serial.exec",
+        "serial.close",
+    ] {
+        assert!(
+            tools.iter().any(|t| t["name"] == expected),
+            "tools/list missing `{expected}`; got {tools:?}",
+        );
+    }
+
+    // 3. tools/call serial.open against the manager-side PTY.
+    send(
+        &mut stdin,
+        json!({
             "jsonrpc": "2.0",
-            "id": 2,
+            "id": 3,
             "method": "tools/call",
             "params": {
                 "name": "serial.open",
@@ -239,12 +264,11 @@ async fn loopback_rmcp_open_write_echo_read_until_close() {
                 },
             }
         }),
-    )
-    .await;
-    let open = read_response(&mut reader).await;
+    );
+    let open = next_response(&rx);
     assert!(
         open.get("error").is_none(),
-        "open failed (allowlist not honored?): {open}"
+        "open failed (allowlist not honored?): {open}",
     );
     let session_id = open["result"]["structuredContent"]["session_id"]
         .as_str()
@@ -252,35 +276,34 @@ async fn loopback_rmcp_open_write_echo_read_until_close() {
         .to_string();
     assert_eq!(session_id.len(), 16, "16-char hex session id");
 
-    // 3. tools/call serial.write — bytes go onto the manager-side PTY.
+    // 4. tools/call serial.write — bytes onto the manager-side PTY.
     let payload = "echo-marker-7f3a\n";
-    send_line(
-        &mut cwrite,
-        &json!({
+    send(
+        &mut stdin,
+        json!({
             "jsonrpc": "2.0",
-            "id": 3,
+            "id": 4,
             "method": "tools/call",
             "params": {
                 "name": "serial.write",
                 "arguments": {"session_id": session_id, "data": payload},
             }
         }),
-    )
-    .await;
-    let write_resp = read_response(&mut reader).await;
+    );
+    let write_resp = next_response(&rx);
     assert_eq!(
         write_resp["result"]["structuredContent"]["bytes_written"],
         payload.len() as u64,
         "write response: {write_resp}",
     );
 
-    // 4. tools/call serial.read_until — the OS echo thread bounces
-    //    the bytes back; the matcher should see the marker.
-    send_line(
-        &mut cwrite,
-        &json!({
+    // 5. tools/call serial.read_until — echo thread bounces the
+    //    marker back; matcher should see it.
+    send(
+        &mut stdin,
+        json!({
             "jsonrpc": "2.0",
-            "id": 4,
+            "id": 5,
             "method": "tools/call",
             "params": {
                 "name": "serial.read_until",
@@ -291,9 +314,8 @@ async fn loopback_rmcp_open_write_echo_read_until_close() {
                 },
             }
         }),
-    )
-    .await;
-    let ru = read_response(&mut reader).await;
+    );
+    let ru = next_response(&rx);
     assert!(ru.get("error").is_none(), "read_until errored: {ru}");
     let structured = &ru["result"]["structuredContent"];
     assert_eq!(structured["matched"], true, "round-trip failed; got: {ru}");
@@ -303,32 +325,29 @@ async fn loopback_rmcp_open_write_echo_read_until_close() {
         "echoed data missing from buffer: {data:?}",
     );
 
-    // 5. tools/call serial.close — releases the session.
-    send_line(
-        &mut cwrite,
-        &json!({
+    // 6. tools/call serial.close — releases the session.
+    send(
+        &mut stdin,
+        json!({
             "jsonrpc": "2.0",
-            "id": 5,
+            "id": 6,
             "method": "tools/call",
             "params": {
                 "name": "serial.close",
                 "arguments": {"session_id": session_id},
             }
         }),
-    )
-    .await;
-    let close = read_response(&mut reader).await;
+    );
+    let close = next_response(&rx);
     assert_eq!(close["result"]["structuredContent"]["ok"], json!(true));
 
-    // Shutdown: drop the client side so the server task exits, then
-    // bring down the PTY pair (kills socat, which causes the echo
-    // thread's read to return Ok(0) and the JoinHandle to resolve).
-    drop(cwrite);
-    drop(reader);
-    let _ = timeout(Duration::from_secs(2), server_task).await;
+    // Shutdown: EOF stdin, reap binary, then drop the PTY (kills socat,
+    // which causes the echo thread's read to return Ok(0) and exit).
+    drop(stdin);
+    let _ = child.wait();
     drop(pty);
     let _ = echo.join();
 
-    // SAFETY: same single-test rationale as the set above.
-    unsafe { std::env::remove_var("MCP_SERIAL_ALLOWLIST") };
+    // Clean up the per-test journal file too.
+    let _ = std::fs::remove_file(format!("/tmp/mcp-loopback-{pid}.jsonl"));
 }
