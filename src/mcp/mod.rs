@@ -16,21 +16,27 @@
 //! serial-domain logic; it only adapts rmcp tool calls onto
 //! `crate::serial`.
 
+mod journal;
+
 use std::sync::Arc;
 
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo},
+    model::{
+        CallToolRequestParams, CallToolResult, Implementation, ServerCapabilities, ServerInfo,
+    },
+    service::RequestContext,
     tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tracing::instrument;
 
 use crate::config::{self, DeviceProfile};
 use crate::serial::SerialBackend;
-use crate::serial::journal::JournalWriter;
+use crate::serial::journal::{JournalEntry, JournalWriter};
 use crate::serial::manager::SessionManager;
 
 /// rmcp-facing server. Holds shared references to the same domain state as
@@ -39,10 +45,10 @@ use crate::serial::manager::SessionManager;
 pub struct McpServer<B: SerialBackend> {
     sessions: Arc<SessionManager<B>>,
     profiles: Arc<Vec<DeviceProfile>>,
-    /// Reserved for the step-11 tool-call journal narrowing. Held now so
-    /// the constructor signature does not churn when journaling is wired
-    /// onto this stack.
-    _journal: Option<Arc<JournalWriter>>,
+    /// Tool-call audit journal. `None` means degraded mode (journal
+    /// open failed at startup); every dispatch then proceeds without
+    /// logging. Wired through `call_tool` (spec §Journal Requirements).
+    journal: Option<Arc<JournalWriter>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -54,7 +60,7 @@ impl<B: SerialBackend> Clone for McpServer<B> {
         Self {
             sessions: Arc::clone(&self.sessions),
             profiles: Arc::clone(&self.profiles),
-            _journal: self._journal.clone(),
+            journal: self.journal.clone(),
             tool_router: self.tool_router.clone(),
         }
     }
@@ -70,7 +76,7 @@ impl<B: SerialBackend> McpServer<B> {
         Self {
             sessions,
             profiles,
-            _journal: journal,
+            journal,
             tool_router: Self::tool_router(),
         }
     }
@@ -93,10 +99,6 @@ impl<B: SerialBackend> McpServer<B> {
     )]
     #[instrument(skip(self))]
     pub async fn list_ports(&self) -> Result<CallToolResult, McpError> {
-        // Suppress dead-code warning for the field while step-11 journal
-        // narrowing has not yet been wired onto this stack.
-        let _ = &self.sessions;
-
         // `SerialError` -> `rmcp::ErrorData` preserves the project's pinned
         // codes (e.g. `Io = -32006`) and the structured `data` payload;
         // see `errors.rs`. Do NOT collapse this to `internal_error`.
@@ -476,6 +478,63 @@ pub struct ExecParams {
 
 #[tool_handler(router = self.tool_router)]
 impl<B: SerialBackend> ServerHandler for McpServer<B> {
+    /// Override the macro-generated `call_tool` so the rmcp dispatch
+    /// has a single chokepoint for the tool-call journal (spec
+    /// §Migration Sequence step 11 / §Journal Requirements). Lifecycle
+    /// methods (`initialize`, `tools/list`, `notifications/initialized`)
+    /// never enter this method — they are handled elsewhere in the
+    /// SDK — so narrowing to "tool calls only" falls out of the choice
+    /// of hook point, not a name filter.
+    ///
+    /// One `call` row goes in before dispatch and one `result` row
+    /// after, regardless of outcome. Journal I/O is wrapped in
+    /// `JournalWriter::log` which warns-and-swallows on failure, so
+    /// audit pressure never blocks tool execution. Concurrent calls
+    /// stay non-interleaving via the writer's `tokio::sync::Mutex`.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        // Capture the inputs we need for journaling BEFORE moving
+        // `request` into the SDK's ToolCallContext.
+        let tool_name = request.name.to_string();
+        let args_value: Value = request
+            .arguments
+            .as_ref()
+            .map(|m| Value::Object(m.clone()))
+            .unwrap_or(Value::Null);
+
+        // call row
+        if let Some(j) = &self.journal {
+            let entry = JournalEntry::new(
+                journal::call_session_id(&args_value),
+                tool_name.clone(),
+                JournalEntry::DIR_CALL,
+                journal::call_summary(&tool_name, &args_value),
+            );
+            j.log(&entry).await;
+        }
+
+        let tcc =
+            rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let result = self.tool_router.call(tcc).await;
+
+        // result row
+        if let Some(j) = &self.journal {
+            let result_ref: Result<&CallToolResult, &McpError> = result.as_ref();
+            let entry = JournalEntry::new(
+                journal::result_session_id(&tool_name, &args_value, &result_ref),
+                tool_name.clone(),
+                JournalEntry::DIR_RESULT,
+                journal::result_summary(&tool_name, &result_ref),
+            );
+            j.log(&entry).await;
+        }
+
+        result
+    }
+
     fn get_info(&self) -> ServerInfo {
         // `ServerInfo`/`InitializeResult` is `#[non_exhaustive]`, so we
         // start from `default()` (already pinned to the latest protocol

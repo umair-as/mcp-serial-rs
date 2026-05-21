@@ -1157,6 +1157,246 @@ async fn close_releases_session_and_subsequent_read_returns_session_not_found() 
     );
 }
 
+// ---- tool-call journal (step 11) -----------------------------------------
+//
+// Narrowing semantics:
+//   * only `tools/call` invocations are journaled — one `call` row and
+//     one `result` row each; `initialize` / `tools/list` / the
+//     `notifications/initialized` notification produce NO rows.
+//   * `JournalWriter` failure during startup leaves the server in
+//     degraded mode (`journal: None`) and dispatch proceeds unchanged.
+//
+// The tests open a journal file, drive the rmcp wire, then read the
+// JSONL file back and assert on the row shapes.
+
+fn read_journal(path: &std::path::Path) -> Vec<serde_json::Value> {
+    let contents = std::fs::read_to_string(path).expect("read journal");
+    contents
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("parse jsonl line"))
+        .collect()
+}
+
+async fn stub_server_with_journal(
+    path: &std::path::Path,
+) -> (
+    McpServer<StubBackend>,
+    Arc<SessionManager<StubBackend>>,
+    StubBackend,
+) {
+    let backend = StubBackend::new();
+    let sessions = Arc::new(SessionManager::new(backend.clone()));
+    let writer = mcp_serial_rs::serial::journal::JournalWriter::try_open_arc(path)
+        .await
+        .expect("journal open in test must succeed");
+    let server = McpServer::new(sessions.clone(), Arc::new(Vec::new()), Some(writer));
+    (server, sessions, backend)
+}
+
+#[tokio::test]
+async fn journal_records_tools_call_pairs_and_skips_lifecycle() {
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let path = tmp.path().to_path_buf();
+    drop(tmp); // try_open_arc opens in append mode; we own the path now.
+
+    let (server, sessions, _backend) = stub_server_with_journal(&path).await;
+    let session_id = sessions
+        .open("/dev/ttyUSB0", 115_200, 5_000)
+        .await
+        .expect("open out-of-band");
+
+    // The OOB open will NOT appear in the journal — the journal hook
+    // lives in the rmcp `call_tool` path and that's only invoked by
+    // `tools/call` over the wire.
+    let _ = roundtrip(
+        server,
+        &[
+            init_request(),
+            initialized_notification(),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "serial.list_ports", "arguments": {}},
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "serial.write",
+                    "arguments": {"session_id": session_id, "data": "hello\n"},
+                },
+            }),
+        ],
+    )
+    .await;
+
+    let entries = read_journal(&path);
+    // Two tools/call invocations × (call + result) = 4 rows. The
+    // initialize/initialized/tools-list traffic must NOT contribute.
+    // Row ORDER is intentionally not asserted: rmcp dispatches tool
+    // calls concurrently (via tokio::task::JoinSet), so a call/result
+    // pair for one tool can interleave with the call/result pair of
+    // another. We only assert per-tool counts and direction balance.
+    assert_eq!(
+        entries.len(),
+        4,
+        "expected exactly 4 journal rows (2 tools/call × call+result), got {}: {entries:?}",
+        entries.len(),
+    );
+    let counts = |tool: &str, direction: &str| {
+        entries
+            .iter()
+            .filter(|e| e["tool"] == tool && e["direction"] == direction)
+            .count()
+    };
+    assert_eq!(counts("serial.list_ports", "call"), 1);
+    assert_eq!(counts("serial.list_ports", "result"), 1);
+    assert_eq!(counts("serial.write", "call"), 1);
+    assert_eq!(counts("serial.write", "result"), 1);
+
+    // No row mentions `initialize` / `tools/list` / `notifications/initialized`.
+    for entry in &entries {
+        let t = entry["tool"].as_str().unwrap();
+        assert!(
+            !t.starts_with("initialize") && t != "tools/list" && !t.starts_with("notifications/"),
+            "lifecycle traffic must not be journaled; saw `{t}`",
+        );
+    }
+}
+
+#[tokio::test]
+async fn journal_write_summary_clips_data_head_to_128_chars() {
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let path = tmp.path().to_path_buf();
+    drop(tmp);
+
+    let (server, sessions, _backend) = stub_server_with_journal(&path).await;
+    let session_id = sessions
+        .open("/dev/ttyUSB0", 115_200, 5_000)
+        .await
+        .expect("open");
+
+    // Build a `data` payload larger than JOURNAL_HEAD_CHARS but
+    // under MAX_WRITE_CHUNK so the call itself succeeds.
+    let big = "y".repeat(200);
+    let _ = roundtrip(
+        server,
+        &[
+            init_request(),
+            initialized_notification(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "serial.write",
+                    "arguments": {"session_id": session_id, "data": big.clone()},
+                },
+            }),
+        ],
+    )
+    .await;
+
+    let entries = read_journal(&path);
+    assert_eq!(entries.len(), 2);
+    let call_summary = &entries[0]["summary"];
+    assert_eq!(call_summary["bytes"], 200, "byte count preserved");
+    let head = call_summary["head"].as_str().expect("head");
+    assert_eq!(
+        head.chars().count(),
+        128,
+        "head must clip to JOURNAL_HEAD_CHARS",
+    );
+}
+
+#[tokio::test]
+async fn journal_records_error_code_for_failed_tool_call() {
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let path = tmp.path().to_path_buf();
+    drop(tmp);
+
+    let (server, _sessions, _backend) = stub_server_with_journal(&path).await;
+
+    // Unknown session → -32003 SessionNotFound.
+    let _ = roundtrip(
+        server,
+        &[
+            init_request(),
+            initialized_notification(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "serial.write",
+                    "arguments": {"session_id": "ffffffffffffffff", "data": "x"},
+                },
+            }),
+        ],
+    )
+    .await;
+
+    let entries = read_journal(&path);
+    assert_eq!(entries.len(), 2);
+    let result = &entries[1];
+    assert_eq!(result["direction"], "result");
+    assert_eq!(result["summary"]["ok"], json!(false));
+    assert_eq!(result["summary"]["error_code"], json!(-32003));
+}
+
+#[tokio::test]
+async fn journal_open_result_uses_freshly_minted_session_id() {
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let path = tmp.path().to_path_buf();
+    drop(tmp);
+
+    let (server, _sessions, _backend) = stub_server_with_journal(&path).await;
+    let _ = roundtrip(
+        server,
+        &[
+            init_request(),
+            initialized_notification(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "serial.open",
+                    "arguments": {"port": "/dev/ttyUSB0"},
+                },
+            }),
+        ],
+    )
+    .await;
+
+    let entries = read_journal(&path);
+    assert_eq!(entries.len(), 2);
+    // call row has no session yet — sentinel applies.
+    assert_eq!(
+        entries[0]["session_id"],
+        mcp_serial_rs::serial::journal::JournalEntry::NO_SESSION,
+    );
+    // result row carries the actual id so analysts can pair it up
+    // with subsequent write/read/close rows on that session.
+    let sid = entries[1]["session_id"].as_str().expect("session_id");
+    assert_eq!(sid.len(), 16, "expected 16-char hex session_id, got {sid:?}");
+    assert!(sid.chars().all(|c| c.is_ascii_hexdigit()));
+}
+
+#[tokio::test]
+async fn degraded_mode_journal_none_still_dispatches() {
+    // No journal → call_tool must still run the tool router and
+    // return a successful response. Asserts the journal is genuinely
+    // optional, not a soft requirement.
+    let resp = handshake_then_call(stub_server(vec![]), "serial.list_ports", json!({})).await;
+    assert_ne!(resp["result"].get("isError"), Some(&json!(true)));
+    assert!(resp["result"]["structuredContent"]["ports"].is_array());
+}
+
 #[tokio::test]
 async fn double_close_returns_session_not_found() {
     let (server, session_id, _device) = server_with_open_session().await;
