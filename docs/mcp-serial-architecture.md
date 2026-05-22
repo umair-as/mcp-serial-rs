@@ -6,15 +6,15 @@ This document captures the high-level architecture of `mcp-serial-rs` and its cu
 
 ```mermaid
 flowchart LR
-    A["MCP Client (Claude/Desktop/CLI)"] -->|JSON-RPC over stdio| B["mcp-serial-rs Binary"]
+    A["MCP Client (Claude/Desktop/CLI)"] -->|MCP (JSON-RPC) over stdio| B["mcp-serial-rs Binary"]
 
     subgraph S["MCP Server (Rust)"]
-      B --> C["main.rs\nstdin/stdout loop"]
-      C --> D["protocol.rs\nJSON-RPC Request/Response/Error"]
-      C --> E["tools.rs\nmethod dispatch"]
+      B --> C["main.rs\ntokio bootstrap; builds McpServer"]
+      C --> D["rmcp SDK\ninitialize / tools/list / tools/call framing"]
+      D --> E["mcp/mod.rs\nMcpServer: #[tool] handlers + journal hook"]
       E --> F["serial.list_ports"]
       E --> G["serial.open / close"]
-      E --> H["serial.write / read / read_until"]
+      E --> H["serial.write / read / read_until / exec"]
       G --> I["serial/manager.rs\nSessionManager"]
       H --> I
       I --> J["serial/session.rs\nSession state + IO"]
@@ -22,6 +22,7 @@ flowchart LR
       H --> L["serial/parser.rs\nPattern matcher (regex)"]
       E --> M["config.rs\nallowlist, limits, defaults"]
       E --> N["errors.rs\ntyped errors -> JSON-RPC codes"]
+      E --> R["mcp/journal.rs + serial/journal.rs\ntool-call JSONL audit journal"]
     end
 
     K --> O["/dev/ttyUSB1\nUSB-UART adapter"]
@@ -74,12 +75,13 @@ sequenceDiagram
 
 - Primary hardware path: ESP32-C6 over `/dev/ttyUSB1`.
 - Primary objective: replace ad-hoc `tio` manual interaction with MCP-tool-driven, automatable serial workflows.
-- Current umbrella methods:
-- `initialize`
-- `tools/list`
+- MCP lifecycle (`initialize`, `tools/list`, `notifications/initialized`) and
+  `tools/call` dispatch are handled by the `rmcp` SDK.
+- Tools exposed via `tools/call`:
 - `serial.list_ports`
 - `serial.open`
 - `serial.write`
 - `serial.read`
 - `serial.read_until`
+- `serial.exec`
 - `serial.close`

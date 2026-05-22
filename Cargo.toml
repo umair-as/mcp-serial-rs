@@ -18,11 +18,9 @@ regex = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
-# rmcp migration (see docs/rmcp-migration-spec.md). Default features
-# already include `macros` (for #[tool], #[tool_router], #[tool_handler])
-# and `server`; we additionally enable `transport-io` for the stdio
-# transport. Hand-rolled protocol.rs stays in place until rmcp parity
-# tests pass (spec §Migration Sequence step 14).
+# MCP protocol layer. Default features already include `macros` (for
+# #[tool], #[tool_router], #[tool_handler]) and `server`; we additionally
+# enable `transport-io` for the stdio transport.
 rmcp = { version = "1.7", features = ["transport-io"] }
 schemars = "1.0"
 
