@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Serial transport layer: session lifecycle, port I/O, and pattern parsing.
 //!
 //! See CLAUDE.md §3 for the submodule split (do not flatten) and §5 for the
@@ -53,10 +55,9 @@ impl From<SerialPortInfo> for PortDescriptor {
 /// filters in the profile also agree. Profiles without `vid` / `pid` filters
 /// match purely on the serial string.
 pub fn profile_matches_port(profile: &DeviceProfile, port: &PortDescriptor) -> bool {
-    // `Option::is_none_or` is 1.82+ — we target MSRV 1.75, so use `map_or`.
     port.serial.as_deref() == Some(profile.match_serial.as_str())
-        && profile.match_vid.map_or(true, |v| Some(v) == port.vid)
-        && profile.match_pid.map_or(true, |v| Some(v) == port.pid)
+        && profile.match_vid.is_none_or(|v| Some(v) == port.vid)
+        && profile.match_pid.is_none_or(|v| Some(v) == port.pid)
 }
 
 /// Annotate each port with the first matching profile's `name` and
@@ -91,6 +92,35 @@ pub fn list_ports(profiles: &[DeviceProfile]) -> Result<Vec<PortDescriptor>, Ser
     let mut descriptors = filter_allowlisted(raw);
     enrich_with_profiles(&mut descriptors, profiles);
     Ok(descriptors)
+}
+
+/// Resolve a device-profile name to `(port_path, default_baud)`. Looks up
+/// the profile by name first — unknown names short-circuit before any
+/// host-side port enumeration. Returns [`SerialError::DeviceNotFound`]
+/// when the profile is unknown or no currently-plugged allowlisted port
+/// matches the profile's `match_serial` / `match_vid` / `match_pid`.
+pub fn resolve_device(
+    device_name: &str,
+    profiles: &[DeviceProfile],
+) -> Result<(String, u32), SerialError> {
+    let profile = profiles
+        .iter()
+        .find(|p| p.name == device_name)
+        .ok_or_else(|| SerialError::DeviceNotFound {
+            device: device_name.to_string(),
+        })?;
+    let raw = tokio_serial::available_ports().map_err(|e| SerialError::Io {
+        message: format!("available_ports: {e}"),
+    })?;
+    let ports = filter_allowlisted(raw);
+    let port_path = ports
+        .iter()
+        .find(|port| profile_matches_port(profile, port))
+        .map(|port| port.port.clone())
+        .ok_or_else(|| SerialError::DeviceNotFound {
+            device: device_name.to_string(),
+        })?;
+    Ok((port_path, profile.baud))
 }
 
 /// Pluggable opener for the underlying serial transport.

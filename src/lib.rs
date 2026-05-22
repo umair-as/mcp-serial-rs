@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! mcp-serial-rs library crate.
 //!
 //! The binary in `src/main.rs` is a thin tokio bootstrap over the modules
@@ -8,6 +10,5 @@
 
 pub mod config;
 pub mod errors;
-pub mod protocol;
+pub mod mcp;
 pub mod serial;
-pub mod tools;

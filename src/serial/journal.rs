@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Append-only JSONL traffic journal for every MCP tool call.
 //!
 //! One line per [`JournalEntry`]; each tool invocation produces a `call`
