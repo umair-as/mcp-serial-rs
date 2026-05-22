@@ -1,23 +1,25 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! In-process integration tests for the rmcp adapter layer.
+//! Integration tests for the rmcp protocol layer — the authoritative
+//! wire coverage for the server.
 //!
-//! These tests drive `crate::mcp::McpServer` over an in-memory
+//! These tests drive `crate::mcp::McpServer` in-process over an in-memory
 //! [`tokio::io::duplex`] pipe, send raw line-delimited JSON-RPC, and
-//! assert on the responses. They exist to anchor parity of the rmcp
-//! migration before the binary entry point switches over.
+//! assert on the responses — exercising the same MCP protocol surface the
+//! binary speaks over stdio. The end-to-end PTY check through the release
+//! binary lives in `tests/loopback.rs`.
 //!
 //! Coverage:
 //!
-//! * `initialize` returns a usable server-info / capabilities object.
-//! * `tools/list` advertises the dotted tool names with input schemas.
-//! * `serial.list_ports` returns structured `{"ports": [...]}`.
-//! * `serial.open` runtime validation: port XOR device, disallowed port,
-//!   unknown device, port happy-path (stub backend), and device
-//!   happy-path (hardware-conditional skip).
-//!
-//! The legacy hand-rolled stack tests in `tests/protocol_tests.rs` remain
-//! authoritative for the binary's MCP wire surface; this file is additive.
+//! * `initialize` / `tools/list` — server info, capabilities, and the
+//!   dotted tool names with rmcp-generated input schemas.
+//! * Every `serial.*` tool: happy paths, validation failures, and the
+//!   partial-output (`matched=false` / `ok=false`) outcomes.
+//! * The narrowed tool-call audit journal — call/result rows, lifecycle
+//!   traffic skipped, large-field summaries, degraded mode.
+//! * Concurrency under rmcp's parallel dispatch: independent sessions
+//!   progress in parallel, same-session writes serialise, and a close
+//!   racing an in-flight read resolves deterministically.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -256,11 +258,11 @@ async fn tools_list_contains_dotted_tools_with_input_schema() {
             t.get("inputSchema").is_some(),
             "rmcp must generate an input schema for `{name}`",
         );
-        // Spec §Structured Result Requirements: output schemas are
-        // deferred to a later migration pass.
+        // Output schemas are not implemented — rmcp generates input
+        // schemas only.
         assert!(
             t.get("outputSchema").is_none(),
-            "outputSchema for `{name}` should NOT be set yet",
+            "outputSchema for `{name}` should not be set",
         );
     }
 }
@@ -810,8 +812,8 @@ async fn read_until_empty_pattern_returns_invalid_param() {
 // guard the spec pins down is "validation BEFORE write" — bad expect
 // regex / empty expect / oversized command MUST NOT mutate device
 // state. Several tests use the same "pre-fill device side, fail exec,
-// then follow up with serial.read on the same session" pattern that
-// step 8 introduced.
+// then follow up with serial.read on the same session" pattern to
+// prove no bytes leaked through.
 
 #[tokio::test]
 async fn exec_happy_path_writes_command_verbatim_and_returns_ok_true() {
@@ -1157,7 +1159,7 @@ async fn close_releases_session_and_subsequent_read_returns_session_not_found() 
     );
 }
 
-// ---- tool-call journal (step 11) -----------------------------------------
+// ---- tool-call journal ---------------------------------------------------
 //
 // Narrowing semantics:
 //   * only `tools/call` invocations are journaled — one `call` row and
@@ -1431,14 +1433,13 @@ async fn double_close_returns_session_not_found() {
     );
 }
 
-// ---- concurrency hardening (step 12) -------------------------------------
+// ---- concurrency hardening -----------------------------------------------
 //
 // These tests exercise rmcp's concurrent dispatch — the SDK runs each
 // `tools/call` on its own tokio::task::JoinSet entry, so requests in a
 // single client batch can be IN-FLIGHT simultaneously on the server.
-// The hand-rolled stack's stdin line-loop never had this property; the
-// migration introduces it for the first time and these tests pin the
-// behaviour:
+// A plain serial stdin line-loop would not have this property; rmcp's
+// dispatch does, so these tests pin the behaviour:
 //
 //   1. work on session A does not block work on session B;
 //   2. concurrent writes on ONE session serialise byte-cleanly through

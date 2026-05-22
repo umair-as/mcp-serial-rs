@@ -44,31 +44,32 @@ sequenceDiagram
     participant ESP as ESP32-C6 (Zephyr)
 
     Client->>Server: initialize
-    Server-->>Client: name/version/capabilities
+    Server-->>Client: result {serverInfo, capabilities, protocolVersion}
+    Client->>Server: notifications/initialized
 
     Client->>Server: tools/list
-    Server-->>Client: serial.* schemas
+    Server-->>Client: result {tools: [serial.* + inputSchema]}
 
-    Client->>Server: serial.open {port:"/dev/ttyUSB1", baud:115200}
+    Client->>Server: tools/call serial.open {port:"/dev/ttyUSB1", baud:115200}
     Server->>Sess: create session + validate allowlist
     Sess->>UART: open
     UART->>ESP: UART link up
-    Server-->>Client: {session_id}
+    Server-->>Client: result.structuredContent {session_id}
 
-    Client->>Server: serial.write {session_id, data:"help\\r\\n"}
+    Client->>Server: tools/call serial.write {session_id, data:"help\\r\\n"}
     Server->>UART: write bytes
     UART->>ESP: command
-    Server-->>Client: {bytes_written}
+    Server-->>Client: result.structuredContent {bytes_written}
 
-    Client->>Server: serial.read_until {session_id, pattern:"READY|OK", timeout_ms:5000}
+    Client->>Server: tools/call serial.read_until {session_id, pattern:"READY|OK", timeout_ms:5000}
     ESP->>UART: console output
     UART->>Server: stream bytes
     Server->>Server: regex match in parser
-    Server-->>Client: {data, matched:true}
+    Server-->>Client: result.structuredContent {data, matched:true}
 
-    Client->>Server: serial.close {session_id}
+    Client->>Server: tools/call serial.close {session_id}
     Server->>Sess: close + remove session
-    Server-->>Client: {ok:true}
+    Server-->>Client: result.structuredContent {ok:true}
 ```
 
 ## Scope For Current Implementation

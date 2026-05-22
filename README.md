@@ -93,13 +93,18 @@ arguments are rejected) from the typed parameter struct.
 to override. Unknown device names return `DeviceNotFound` (`-32009`) before
 any system call.
 
-Validation failures (bad arguments, unknown session, disallowed port,
-malformed regex) surface as JSON-RPC errors with project-defined codes in the
-server range — `-32001` … `-32009`, plus a structured `error.data` payload so
-clients can branch without parsing messages. Runtime outcomes are **not**
-errors: a `serial.read_until` that times out returns a successful tool result
-with `matched=false` and the partial buffer; a `serial.exec` timeout returns
-`ok=false` with partial `output`.
+Domain validation failures detected by the tool handlers — unknown session,
+disallowed port, unknown device, malformed regex, oversized write, supplying
+both `port` and `device` — surface as JSON-RPC errors with project-defined
+codes in the server range (`-32001` … `-32009`) plus a structured `error.data`
+payload, so clients can branch without parsing messages. Argument failures
+caught earlier, by the SDK's input-schema / parameter deserialization (wrong
+JSON types, unknown fields), surface as standard `rmcp`/JSON-RPC errors —
+typically `-32602` — and do not necessarily carry a project `error.data`.
+
+Runtime outcomes are **not** errors: a `serial.read_until` that times out
+returns a successful tool result with `matched=false` and the partial buffer;
+a `serial.exec` timeout returns `ok=false` with partial `output`.
 
 ## Device profiles (`devices.toml`)
 

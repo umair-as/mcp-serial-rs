@@ -1,20 +1,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Summary shaping for rmcp tool-call journal entries (spec §Journal
-//! Requirements / §Migration Sequence step 11).
+//! Summary shaping for rmcp tool-call journal entries.
 //!
-//! The rmcp layer narrows the audit journal from "every MCP message"
-//! (what the hand-rolled dispatch in `crate::tools` does today) to
-//! **tool calls only** — one `call` row before dispatch and one
-//! `result` row after. Lifecycle traffic (`initialize`, `tools/list`,
-//! `notifications/initialized`) is intentionally NOT journaled here;
-//! it remains observable via `tracing` on stderr.
+//! The audit journal is scoped to **tool calls only** — one `call` row
+//! before dispatch and one `result` row after. Lifecycle traffic
+//! (`initialize`, `tools/list`, `notifications/initialized`) is
+//! intentionally NOT journaled here; it remains observable via `tracing`
+//! on stderr.
 //!
-//! These helpers shape `serde_json::Value` summaries that match the
-//! legacy stack's JSONL field layout for the same tool, so a journal
-//! file populated by both stacks during the migration stays mergeable.
-//! Large free-form fields (`data` / `command` / `output`) are clipped
-//! to [`JOURNAL_HEAD_CHARS`] with the byte-length preserved alongside.
+//! These helpers shape the `serde_json::Value` summaries written into
+//! each tool's JSONL rows. Large free-form fields (`data` / `command` /
+//! `output`) are clipped to [`JOURNAL_HEAD_CHARS`] with the byte-length
+//! preserved alongside.
 
 use rmcp::ErrorData;
 use rmcp::model::CallToolResult;
@@ -24,7 +21,7 @@ use crate::serial::journal::JournalEntry;
 
 /// Max chars retained from any large free-form field when summarised
 /// into the journal. Char-bounded (not byte-bounded) so the slice
-/// always lands on a UTF-8 boundary. Matches the legacy constant.
+/// always lands on a UTF-8 boundary.
 const JOURNAL_HEAD_CHARS: usize = 128;
 
 /// Truncate a string field's contents to [`JOURNAL_HEAD_CHARS`] for

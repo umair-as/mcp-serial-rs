@@ -9,7 +9,7 @@
 //! `serial.read_until` for the same payload validates the full round
 //! trip through real serial reads/writes via `tokio-serial`.
 //!
-//! Wire shape (post step 14 — `src/main.rs` now speaks rmcp):
+//! Wire shape (`src/main.rs` speaks the rmcp protocol):
 //!   * `initialize` envelope per MCP 2025-11-25
 //!   * `notifications/initialized`
 //!   * each serial.* tool invoked via a `tools/call` envelope
@@ -178,8 +178,7 @@ fn loopback_rmcp_open_write_echo_read_until_close() {
     let echo = spawn_echo_thread(&pty.b_path);
 
     // Spawn the real binary with an allowlist override so /tmp/...
-    // resolves. The binary now speaks the rmcp wire on stdio
-    // (post-step 14 main.rs switch).
+    // resolves. The binary speaks the rmcp wire on stdio.
     let bin = env!("CARGO_BIN_EXE_mcp-serial-rs");
     let pid = std::process::id();
     let allowlist = format!("/tmp/mcp-loopback-{pid}-*");
