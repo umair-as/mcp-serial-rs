@@ -30,14 +30,29 @@ impl SerialBackend for TokioSerialBackend {
         use tokio_serial::SerialPortBuilderExt;
         tokio_serial::new(port, baud)
             .open_native_async()
-            .map_err(|e| match e.kind {
-                tokio_serial::ErrorKind::NoDevice => SerialError::PortNotFound {
-                    port: port.to_string(),
-                },
-                _ => SerialError::Io {
-                    message: format!("open '{port}': {e}"),
-                },
-            })
+            .map_err(|e| map_open_error(e, port))
+    }
+}
+
+/// Map a `tokio_serial::Error` from the open path onto a typed `SerialError`.
+///
+/// The `serialport` posix backend collapses `EBUSY` (TIOCEXCL contention —
+/// the port exists but another process holds it exclusively) into
+/// `ErrorKind::NoDevice`, while a truly missing device surfaces as
+/// `ErrorKind::Io(io::ErrorKind::NotFound)` via `ENOENT`. Folding both
+/// into `PortNotFound` would mislead the caller into chasing an
+/// enumeration problem, so we split them.
+fn map_open_error(e: tokio_serial::Error, port: &str) -> SerialError {
+    match e.kind {
+        tokio_serial::ErrorKind::NoDevice => SerialError::PortBusy {
+            port: port.to_string(),
+        },
+        tokio_serial::ErrorKind::Io(std::io::ErrorKind::NotFound) => SerialError::PortNotFound {
+            port: port.to_string(),
+        },
+        _ => SerialError::Io {
+            message: format!("open '{port}': {e}"),
+        },
     }
 }
 
@@ -178,29 +193,45 @@ impl<B: SerialBackend> SessionManager<B> {
         Ok(data.len())
     }
 
-    /// Single `read()` into a fresh buffer of at most `max_bytes`. Returns
-    /// whatever the underlying port produces in one syscall (may be short).
-    /// On `timeout_ms` elapse with no data, returns [`SerialError::Timeout`].
+    /// Drain bytes from the session's port until either `max_bytes` has
+    /// been accumulated or the `timeout_ms` deadline elapses. Returns
+    /// `(data, timed_out)` — on deadline-hit, `timed_out` is `true` and
+    /// `data` is whatever was read so far (which may be empty). EOF on
+    /// the port returns `timed_out=false` because EOF is a known
+    /// completion, not a timeout. Genuine I/O errors stay errors
+    /// (issue #4: domain-outcome parity with `read_until`).
     #[instrument(skip(self), fields(session_id, max_bytes, timeout_ms))]
     pub async fn read(
         &self,
         session_id: &str,
         max_bytes: usize,
         timeout_ms: u64,
-    ) -> Result<Vec<u8>, SerialError> {
+    ) -> Result<(Vec<u8>, bool), SerialError> {
         let port = self.checkout_port(session_id)?;
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let mut guard = port.lock().await;
-        let mut buf = vec![0u8; max_bytes];
-        let read_fut = guard.read(&mut buf);
-        match tokio::time::timeout(Duration::from_millis(timeout_ms), read_fut).await {
-            Ok(Ok(n)) => {
-                buf.truncate(n);
-                Ok(buf)
+        let mut acc: Vec<u8> = Vec::with_capacity(max_bytes.min(4096));
+        let mut chunk = [0u8; 4096];
+
+        loop {
+            if acc.len() >= max_bytes {
+                return Ok((acc, false));
             }
-            Ok(Err(e)) => Err(SerialError::Io {
-                message: format!("read: {e}"),
-            }),
-            Err(_) => Err(SerialError::Timeout { timeout_ms }),
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Ok((acc, true));
+            };
+            let take = (max_bytes - acc.len()).min(chunk.len());
+            let read_fut = guard.read(&mut chunk[..take]);
+            match tokio::time::timeout(remaining, read_fut).await {
+                Ok(Ok(0)) => return Ok((acc, false)),
+                Ok(Ok(n)) => acc.extend_from_slice(&chunk[..n]),
+                Ok(Err(e)) => {
+                    return Err(SerialError::Io {
+                        message: format!("read: {e}"),
+                    });
+                }
+                Err(_) => return Ok((acc, true)),
+            }
         }
     }
 
@@ -456,6 +487,42 @@ mod tests {
     }
 
     #[test]
+    fn map_open_error_no_device_maps_to_port_busy() {
+        // serialport-rs deliberately reports EBUSY (TIOCEXCL contention)
+        // as ErrorKind::NoDevice. The mapper must surface that as
+        // PortBusy, not PortNotFound — see issue #3.
+        let e = tokio_serial::Error::new(tokio_serial::ErrorKind::NoDevice, "Device or resource busy");
+        match super::map_open_error(e, "/dev/ttyACM0") {
+            SerialError::PortBusy { port } => assert_eq!(port, "/dev/ttyACM0"),
+            other => panic!("expected PortBusy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_open_error_io_notfound_maps_to_port_not_found() {
+        let e = tokio_serial::Error::new(
+            tokio_serial::ErrorKind::Io(std::io::ErrorKind::NotFound),
+            "No such file or directory",
+        );
+        match super::map_open_error(e, "/dev/ttyUSB7") {
+            SerialError::PortNotFound { port } => assert_eq!(port, "/dev/ttyUSB7"),
+            other => panic!("expected PortNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_open_error_other_io_maps_to_io() {
+        let e = tokio_serial::Error::new(
+            tokio_serial::ErrorKind::Io(std::io::ErrorKind::PermissionDenied),
+            "Permission denied",
+        );
+        match super::map_open_error(e, "/dev/ttyUSB0") {
+            SerialError::Io { message } => assert!(message.contains("/dev/ttyUSB0")),
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn next_id_format_is_16_char_lowercase_hex() {
         let mut state = 0xDEAD_BEEFu64;
         for _ in 0..1000 {
@@ -488,8 +555,12 @@ mod tests {
         let mut device = backend.take_device();
         device.write_all(b"boot ok\n").await.unwrap();
 
-        let data = m.read(&id, 64, 1_000).await.unwrap();
+        let (data, timed_out) = m.read(&id, 64, 1_000).await.unwrap();
         assert_eq!(&data, b"boot ok\n");
+        // The first read returned bytes; the loop then re-enters and
+        // its next read blocks until the deadline (no more data). That
+        // is the new domain-outcome shape: not an error.
+        assert!(timed_out, "loop should hit the deadline after consuming data");
     }
 
     #[tokio::test]
@@ -497,11 +568,63 @@ mod tests {
         let (m, backend) = mgr_with_backend();
         let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
         // Keep the device side alive so the manager-side stream doesn't EOF;
-        // an EOF would surface as Ok(0), not as a Timeout.
+        // an EOF would surface as Ok(0) and timed_out=false.
         let _device = backend.take_device();
 
-        let err = m.read(&id, 64, 50).await.unwrap_err();
-        assert!(matches!(err, SerialError::Timeout { timeout_ms: 50 }));
+        let (data, timed_out) = m.read(&id, 64, 50).await.unwrap();
+        assert!(data.is_empty(), "no bytes should accumulate on idle port");
+        assert!(timed_out, "deadline must surface as timed_out=true, not an Err");
+    }
+
+    #[tokio::test]
+    async fn read_stops_at_max_bytes_with_timed_out_false() {
+        let (m, backend) = mgr_with_backend();
+        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let mut device = backend.take_device();
+        device.write_all(b"abcdefghij").await.unwrap();
+        let _device = device; // keep alive
+
+        let (data, timed_out) = m.read(&id, 5, 1_000).await.unwrap();
+        assert_eq!(&data, b"abcde");
+        assert!(!timed_out, "hitting max_bytes is not a timeout");
+    }
+
+    #[tokio::test]
+    async fn read_loop_accumulates_across_multiple_writes() {
+        let (m, backend) = mgr_with_backend();
+        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let mut device = backend.take_device();
+        let writer = tokio::spawn(async move {
+            device.write_all(b"part1-").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            device.write_all(b"part2").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(device);
+        });
+
+        let (data, _timed_out) = m.read(&id, 64, 150).await.unwrap();
+        // The deadline cuts the loop short — depending on scheduling the
+        // first or both chunks land. The point is both chunks are valid
+        // accumulation, not lost inside an error.
+        assert!(
+            data == b"part1-part2" || data == b"part1-",
+            "unexpected accumulator contents: {:?}",
+            String::from_utf8_lossy(&data),
+        );
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_eof_returns_timed_out_false() {
+        let (m, backend) = mgr_with_backend();
+        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let mut device = backend.take_device();
+        device.write_all(b"bye").await.unwrap();
+        drop(device); // EOF on the manager-side stream
+
+        let (data, timed_out) = m.read(&id, 64, 1_000).await.unwrap();
+        assert_eq!(&data, b"bye");
+        assert!(!timed_out, "EOF is a known completion, not a timeout");
     }
 
     #[tokio::test]
@@ -516,6 +639,9 @@ mod tests {
         let m = mgr();
         let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
         m.close(&id).unwrap();
+        // SessionNotFound is a *protocol* failure (no such id), not a
+        // domain outcome — it must still surface as Err, distinct from
+        // the timed_out=true shape that real reads now use.
         let err = m.read(&id, 64, 100).await.unwrap_err();
         assert!(matches!(err, SerialError::SessionNotFound { .. }));
     }

@@ -18,6 +18,9 @@ pub enum SerialError {
     #[error("port '{port}' not found")]
     PortNotFound { port: String },
 
+    #[error("port '{port}' is busy (held by another process)")]
+    PortBusy { port: String },
+
     #[error("unknown session_id '{session_id}'")]
     SessionNotFound { session_id: String },
 
@@ -58,13 +61,16 @@ impl SerialError {
             SerialError::MaxSessionsReached { .. } => -32007,
             SerialError::InvalidParam { .. } => -32008,
             SerialError::DeviceNotFound { .. } => -32009,
+            SerialError::PortBusy { .. } => -32010,
         }
     }
 
     /// Structured context attached as the JSON-RPC `data` field.
     pub fn data(&self) -> serde_json::Value {
         match self {
-            SerialError::PortNotAllowed { port } | SerialError::PortNotFound { port } => {
+            SerialError::PortNotAllowed { port }
+            | SerialError::PortNotFound { port }
+            | SerialError::PortBusy { port } => {
                 json!({ "port": port })
             }
             SerialError::SessionNotFound { session_id } => json!({ "session_id": session_id }),
@@ -136,6 +142,7 @@ mod tests {
                 device: "esp32c6".into(),
             }
             .code(),
+            SerialError::PortBusy { port: "p".into() }.code(),
         ];
         let mut sorted = variants.to_vec();
         sorted.sort_unstable();
@@ -144,6 +151,18 @@ mod tests {
         for c in variants {
             assert!((-32099..=-32000).contains(&c), "code {c} outside reserved range");
         }
+    }
+
+    #[test]
+    fn port_busy_pins_code_and_carries_port_in_data() {
+        let err = SerialError::PortBusy {
+            port: "/dev/ttyACM0".into(),
+        };
+        assert_eq!(err.code(), -32010);
+        assert_eq!(
+            err.data().get("port").and_then(|v| v.as_str()),
+            Some("/dev/ttyACM0"),
+        );
     }
 
     #[test]
