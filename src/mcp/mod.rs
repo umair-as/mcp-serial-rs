@@ -199,17 +199,19 @@ impl<B: SerialBackend> McpServer<B> {
         ))
     }
 
-    /// Read up to `max_bytes` from the session's port, returning whatever
-    /// arrived before `timeout_ms`. Both fields are clamped to the
-    /// configured ceilings; out-of-range values are silently capped, not
-    /// rejected.
+    /// Drain up to `max_bytes` from the session's port until the
+    /// deadline elapses. Both fields are clamped to the configured
+    /// ceilings; out-of-range values are silently capped, not rejected.
     ///
-    /// Returns structured `{"data": String}`. Bytes are decoded with
-    /// UTF-8 lossy conversion — this is a console tool, not a binary
-    /// protocol bridge (spec §Non-Goals).
+    /// Returns structured `{"data": String, "timed_out": bool}`. A
+    /// deadline hit is a normal completion (`timed_out=true` with
+    /// whatever bytes accumulated, possibly empty) — NOT a JSON-RPC
+    /// error. Genuine I/O failures still surface as errors. Bytes are
+    /// decoded with UTF-8 lossy conversion (spec §Non-Goals: console
+    /// tool, not a binary protocol bridge).
     #[tool(
         name = "serial.read",
-        description = "Read up to `max_bytes` bytes from a serial session, with timeout."
+        description = "Drain up to `max_bytes` bytes from a serial session until the deadline; returns partial output with timed_out=true on timeout."
     )]
     #[instrument(skip(self, params), fields(session_id = %params.0.session_id))]
     pub async fn read(
@@ -227,12 +229,13 @@ impl<B: SerialBackend> McpServer<B> {
             .unwrap_or(DEFAULT_READ_MAX_BYTES)
             .min(config::MAX_READ_BUFFER);
 
-        let data = self
+        let (data, timed_out) = self
             .sessions
             .read(&p.session_id, max_bytes, timeout_ms)
             .await?;
         Ok(CallToolResult::structured(serde_json::json!({
             "data": String::from_utf8_lossy(&data),
+            "timed_out": timed_out,
         })))
     }
 

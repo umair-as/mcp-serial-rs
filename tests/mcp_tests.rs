@@ -658,6 +658,35 @@ async fn read_unknown_session_returns_session_not_found() {
 }
 
 #[tokio::test]
+async fn read_timeout_returns_empty_data_with_timed_out_true_not_error() {
+    // Issue #4: an idle-port deadline is a domain outcome (parity with
+    // serial.read_until), NOT a JSON-RPC error. The call must return a
+    // successful tool result with `data=""` and `timed_out=true`, just
+    // like read_until returns `matched=false`.
+    let (server, session_id, _device) = server_with_open_session().await;
+
+    let resp = handshake_then_call(
+        server,
+        "serial.read",
+        json!({"session_id": session_id, "max_bytes": 64, "timeout_ms": 100}),
+    )
+    .await;
+
+    let result = resp.get("result").unwrap_or_else(|| {
+        panic!("read timeout must return a tool result, not a JSON-RPC error: {resp}")
+    });
+    assert_ne!(
+        result.get("isError"),
+        Some(&json!(true)),
+        "read timeout must NOT set isError=true",
+    );
+    assert!(resp.get("error").is_none(), "read timeout must not be a JSON-RPC error");
+    let structured = &result["structuredContent"];
+    assert_eq!(structured["data"], json!(""));
+    assert_eq!(structured["timed_out"], json!(true));
+}
+
+#[tokio::test]
 async fn read_until_matches_across_chunks() {
     let (server, session_id, mut device) = server_with_open_session().await;
 

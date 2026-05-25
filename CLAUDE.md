@@ -106,7 +106,7 @@ Tool names and field shapes are stable — do not rename or reshape them.
 | `serial.list_ports` | — | `[{port, vid, pid, serial, device, description}]` |
 | `serial.open` | `{port, baud?, timeout_ms?}` OR `{device, baud?, timeout_ms?}` | `{session_id}` |
 | `serial.write` | `{session_id, data}` | `{bytes_written}` |
-| `serial.read` | `{session_id, max_bytes?, timeout_ms?}` | `{data}` |
+| `serial.read` | `{session_id, max_bytes?, timeout_ms?}` | `{data, timed_out}` |
 | `serial.read_until` | `{session_id, pattern, timeout_ms?}` | `{data, matched}` |
 | `serial.exec` | `{session_id, command, expect, timeout_ms?}` | `{output, ok}` |
 | `serial.close` | `{session_id}` | `{ok}` |
@@ -123,6 +123,14 @@ Behavioural notes:
   buffer `serial.read_until` would have returned).
 - `serial.read_until` returns partial data with `matched=false` on timeout
   or EOF — partial output is normal completion, not an error.
+- `serial.read` drains until `max_bytes` is reached or the deadline
+  elapses, returning `{data, timed_out}`. A deadline hit is `timed_out=true`
+  with whatever bytes accumulated (possibly empty) — NOT a JSON-RPC error.
+  EOF returns `timed_out=false`. Genuine I/O failures still surface as
+  errors. (Issue #4 — domain-outcome parity with `read_until`.)
+- `serial.open` distinguishes a missing port (`PortNotFound`, -32002)
+  from a port held exclusively by another process (`PortBusy`, -32010,
+  reported when `serialport-rs` surfaces `EBUSY` via `ErrorKind::NoDevice`).
 
 Tool results use rmcp's structured tool results (`CallToolResult::structured`)
 for object outputs so clients read parsed fields without re-parsing a text
