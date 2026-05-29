@@ -5,3 +5,16 @@ devices.toml
 
 # Agent scratch markers (codex, etc.)
 .codex
+
+# Environment files (must never be committed).
+.env
+.env.*
+
+# Editor / OS scratch.
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Coverage artifacts.
+*.profraw
