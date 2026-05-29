@@ -164,6 +164,33 @@ visible through `tracing` logs on stderr. If the journal path cannot be
 opened the server logs a warning and continues in degraded mode (no
 journaling); it never blocks startup or tool dispatch.
 
+The journal stores **summaries, not full bodies**. Each `direction:call` row
+carries the *input* (args / written `data` head / `command` head); the
+matching `direction:result` row carries the *outcome* (`bytes_written`,
+`session_id`, `matched`, `exec_ok`, `bytes`, `head` of read data,
+`output_head`). Large free-form fields are clipped to the first 128
+characters (`JOURNAL_HEAD_CHARS`); the full byte length is preserved
+alongside in a sibling field (e.g. `bytes`, `output_bytes`). This keeps
+the audit trail bounded on resource-constrained gateways — the journal is
+designed for *who called what, when, with what shape, and what came back
+qualitatively*, not for byte-perfect replay. To capture full transcripts,
+drive the server from a client that records them.
+
+`head` and `output_head` carry the raw bytes from the serial wire,
+including `\r\n` line endings (serial consoles emit CRLF — that's the
+faithful representation, not garbled output). Tail the journal in a
+readable form with:
+
+```sh
+tail -F "${MCP_SERIAL_JOURNAL:-/tmp/mcp-serial-journal.jsonl}" \
+  | jq -r '"[\(.ts) \(.direction) \(.tool) sid=\(.session_id[0:8])] " +
+           (.summary.head // .summary.output_head // .summary.command_head // (.summary | tostring))'
+```
+
+That renders `\r\n` as real newlines for the eyeball while leaving the
+on-disk JSONL byte-faithful. Drop the `jq` filter for raw JSONL access
+when feeding the journal to other tools.
+
 ## Hardware smoke test (ESP32-C6 Zephyr)
 
 End-to-end against a real ESP32-C6 board running a Zephyr crypto KAT
