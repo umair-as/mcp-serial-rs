@@ -1,6 +1,6 @@
 # MCP Serial Server Architecture (ESP32-C6 Focus)
 
-This document captures the high-level architecture of `mcp-serial-rs` and its current target workflow around `/dev/ttyUSB1` for ESP32-C6 Zephyr bring-up/automation.
+This document captures the high-level architecture of `mcp-serial-rs` and its current target workflow around `/dev/ttyUSBx` for ESP32-C6 Zephyr bring-up/automation.
 
 ## System Overview
 
@@ -25,10 +25,10 @@ flowchart LR
       E --> R["mcp/journal.rs + serial/journal.rs\ntool-call JSONL audit journal"]
     end
 
-    K --> O["/dev/ttyUSB1\nUSB-UART adapter"]
+    K --> O["/dev/ttyUSBx\nUSB-UART adapter"]
     O --> P["ESP32-C6 (Zephyr app)"]
 
-    Q["tio /dev/ttyUSB1 (today)"] -. direct serial terminal .- O
+    Q["tio /dev/ttyUSBx (today)"] -. direct serial terminal .- O
     A -. replaces manual tio workflows with MCP tools .-> B
 ```
 
@@ -40,7 +40,7 @@ sequenceDiagram
     participant Client as MCP Client
     participant Server as mcp-serial-rs
     participant Sess as SessionManager
-    participant UART as /dev/ttyUSB1
+    participant UART as /dev/ttyUSBx
     participant ESP as ESP32-C6 (Zephyr)
 
     Client->>Server: initialize
@@ -50,7 +50,7 @@ sequenceDiagram
     Client->>Server: tools/list
     Server-->>Client: result {tools: [serial.* + inputSchema]}
 
-    Client->>Server: tools/call serial.open {port:"/dev/ttyUSB1", baud:115200}
+    Client->>Server: tools/call serial.open {port:"/dev/ttyUSBx", baud:115200}
     Server->>Sess: create session + validate allowlist
     Sess->>UART: open
     UART->>ESP: UART link up
@@ -74,7 +74,7 @@ sequenceDiagram
 
 ## Scope For Current Implementation
 
-- Primary hardware path: ESP32-C6 over `/dev/ttyUSB1`.
+- Primary hardware path: ESP32-C6 over `/dev/ttyUSBx`.
 - Primary objective: replace ad-hoc `tio` manual interaction with MCP-tool-driven, automatable serial workflows.
 - MCP lifecycle (`initialize`, `tools/list`, `notifications/initialized`) and
   `tools/call` dispatch are handled by the `rmcp` SDK.

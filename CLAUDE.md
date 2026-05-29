@@ -1,7 +1,8 @@
 # mcp-serial-rs — Claude Code Orientation
 
 > MCP tool server exposing serial-port access over stdio.
-> First consumer: ESP32-C6 Zephyr DFU application over `/dev/ttyUSB1`.
+> Example consumer: an ESP32-C6 Zephyr DFU application on a USB-UART
+> adapter (e.g. `/dev/ttyUSBx`).
 
 The MCP protocol layer is the `rmcp` SDK over its stdio transport. The
 migration off the original hand-rolled JSON-RPC layer is complete; its

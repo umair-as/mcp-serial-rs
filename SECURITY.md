@@ -5,7 +5,7 @@ This document defines minimum security requirements before shipping `mcp-serial-
 ## Scope
 
 - Transport: JSON-RPC 2.0 over stdio.
-- Capability: serial device access on host (current focus: ESP32-C6 via `/dev/ttyUSB1`).
+- Capability: serial device access on host (typical target: a USB-UART device such as `/dev/ttyUSBx`).
 - Trust model: MCP client and device output are treated as untrusted input.
 
 ## Threat Model

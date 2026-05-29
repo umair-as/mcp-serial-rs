@@ -56,7 +56,7 @@ With four boards attached and `devices.toml` from this repo, the
   "result": {
     "structuredContent": {
       "ports": [
-        {"port":"/dev/ttyUSB1","vid":4292,"pid":60000,
+        {"port":"/dev/ttyUSBx","vid":4292,"pid":60000,
          "serial":"485732f0d027ee119e0c14d8f49e3369",
          "device":"esp32c6","description":"ESP32-C6 Zephyr DFU target (CP2102N)"},
         {"port":"/dev/ttyACM0","vid":6790,"pid":21971,"serial":"575C016219",
