@@ -3,6 +3,9 @@ name = "mcp-serial-rs"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+description = "MCP server exposing serial-port access (open/read/write/exec/close) over stdio, with per-port async sessions."
+repository = "https://github.com/umair-as/mcp-serial-rs"
+readme = "README.md"
 # MSRV raised from 1.75 → 1.85 to accept rmcp's edition-2024
 # dependency chain (rmcp itself is built with edition 2024 but
 # only requires its consumer to use a 1.85+ compiler).
