@@ -9,8 +9,9 @@ writing console commands, scraping output until a regex matches, all from a
 tokio-async backend with per-session isolation and an allowlist that keeps
 stray paths out.
 
-First consumer: the ESP32-C6 Zephyr DFU target in the surrounding repo. The
-server itself is hardware-agnostic — anything matching the allowlist works.
+An example downstream target is an ESP32-C6 Zephyr DFU board, but the
+server itself is hardware-agnostic — any USB-serial device matching the
+allowlist works.
 
 ## Build
 
@@ -165,9 +166,9 @@ journaling); it never blocks startup or tool dispatch.
 
 ## Hardware smoke test (ESP32-C6 Zephyr)
 
-End-to-end against a real ESP32-C6 board running the Zephyr crypto KAT
-firmware from the surrounding repo. Using the named-device path so the test
-survives `/dev/ttyUSB*` numbering shifts across reboots:
+End-to-end against a real ESP32-C6 board running a Zephyr crypto KAT
+firmware. Using the named-device path so the test survives `/dev/ttyUSB*`
+numbering shifts across reboots:
 
 ```sh
 ./target/release/mcp-serial-rs <<'EOF'
@@ -190,7 +191,7 @@ per-port mutex.
 ## Tests
 
 ```sh
-cargo test                          # 66 unit + 39 integration
+cargo test                          # 113 total: 73 unit + 39 integration + 1 loopback
 cargo test --test loopback          # PTY round-trip — needs `socat`
 ```
 
