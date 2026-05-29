@@ -19,7 +19,7 @@
 #   tags          — freeform labels for filtering and documentation
 
 [devices.esp32c6]
-match_serial = "485732f0d027ee119e0c14d8f49e3369"
+match_serial = "AABBCCDD00001111"
 match_vid    = 0x10C4
 match_pid    = 0xEA60
 baud         = 115200
@@ -40,7 +40,7 @@ tags         = ["linux", "imx93", "nxp"]
 # match becomes ambiguous. Disambiguate via by-path or physical topology.
 
 [devices.rpi5]
-match_serial = "575C016219"
+match_serial = "EXAMPLE001"
 match_vid    = 0x1A86
 baud         = 115200
 description  = "Raspberry Pi 5 debug UART (WCH CH340)"
@@ -48,7 +48,7 @@ probe        = "login:|#|\\$"
 tags         = ["linux", "rpi5", "gateway"]
 
 [devices.pico2w]
-match_serial = "E6647C740341AA30"
+match_serial = "EXAMPLE002"
 baud         = 115200
 description  = "RPi Pico 2W via Debug Probe (CMSIS-DAP)"
 probe        = "uart:~\\$"
