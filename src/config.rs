@@ -210,7 +210,7 @@ mod tests {
         tags         = ["zephyr", "dfu"]
 
         [devices.rpi5]
-        match_serial = "575C016219"
+        match_serial = "EXAMPLE001"
         baud         = 115200
         description  = "RPi 5 debug UART"
     "#;

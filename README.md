@@ -58,13 +58,13 @@ With four boards attached and `devices.toml` from this repo, the
     "structuredContent": {
       "ports": [
         {"port":"/dev/ttyUSBx","vid":4292,"pid":60000,
-         "serial":"485732f0d027ee119e0c14d8f49e3369",
+         "serial":"AABBCCDD00001111",
          "device":"esp32c6","description":"ESP32-C6 Zephyr DFU target (CP2102N)"},
-        {"port":"/dev/ttyACM0","vid":6790,"pid":21971,"serial":"575C016219",
+        {"port":"/dev/ttyACM0","vid":6790,"pid":21971,"serial":"EXAMPLE001",
          "device":"rpi5","description":"Raspberry Pi 5 debug UART (WCH CH340)"},
         {"port":"/dev/ttyUSB0","vid":4292,"pid":60000,"serial":"0001",
          "device":"imx93-evk","description":"i.MX93 EVK debug UART (CP2102 clone)"},
-        {"port":"/dev/ttyACM1","vid":11914,"pid":12,"serial":"E6647C740341AA30",
+        {"port":"/dev/ttyACM1","vid":11914,"pid":12,"serial":"EXAMPLE002",
          "device":"pico2w","description":"RPi Pico 2W via Debug Probe (CMSIS-DAP)"}
       ]
     }
