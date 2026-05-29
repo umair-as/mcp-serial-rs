@@ -149,7 +149,10 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), variants.len(), "error codes must be unique");
         for c in variants {
-            assert!((-32099..=-32000).contains(&c), "code {c} outside reserved range");
+            assert!(
+                (-32099..=-32000).contains(&c),
+                "code {c} outside reserved range"
+            );
         }
     }
 
@@ -175,7 +178,10 @@ mod tests {
         let r: rmcp::ErrorData = err.into();
         assert_eq!(r.code, rmcp::model::ErrorCode(-32006));
         assert_eq!(
-            r.data.as_ref().and_then(|d| d.get("message")).and_then(|v| v.as_str()),
+            r.data
+                .as_ref()
+                .and_then(|d| d.get("message"))
+                .and_then(|v| v.as_str()),
             Some("open: no such file"),
         );
     }

@@ -13,9 +13,9 @@
 //! `output`) are clipped to [`JOURNAL_HEAD_CHARS`] with the byte-length
 //! preserved alongside.
 
-use rmcp::ErrorData;
 use rmcp::model::CallToolResult;
-use serde_json::{Value, json};
+use rmcp::ErrorData;
+use serde_json::{json, Value};
 
 use crate::serial::journal::JournalEntry;
 
@@ -213,7 +213,8 @@ mod tests {
 
     #[test]
     fn result_summary_for_list_ports_reports_count_from_array() {
-        let result = ok_with(json!({"ports": [{"port": "/dev/ttyUSB0"}, {"port": "/dev/ttyUSB1"}]}));
+        let result =
+            ok_with(json!({"ports": [{"port": "/dev/ttyUSB0"}, {"port": "/dev/ttyUSB1"}]}));
         let summary = result_summary("serial.list_ports", &Ok(&result));
         assert_eq!(summary["ok"], json!(true));
         assert_eq!(summary["port_count"], json!(2));

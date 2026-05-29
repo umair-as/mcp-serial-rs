@@ -16,9 +16,9 @@ use tracing::{debug, instrument, warn};
 
 use crate::config;
 use crate::errors::SerialError;
-use crate::serial::SerialBackend;
 use crate::serial::parser::PatternMatcher;
 use crate::serial::session::Session;
+use crate::serial::SerialBackend;
 
 /// Real production backend over `tokio-serial`.
 pub struct TokioSerialBackend;
@@ -181,12 +181,9 @@ impl<B: SerialBackend> SessionManager<B> {
     pub async fn write(&self, session_id: &str, data: &[u8]) -> Result<usize, SerialError> {
         let port = self.checkout_port(session_id)?;
         let mut guard = port.lock().await;
-        guard
-            .write_all(data)
-            .await
-            .map_err(|e| SerialError::Io {
-                message: format!("write: {e}"),
-            })?;
+        guard.write_all(data).await.map_err(|e| SerialError::Io {
+            message: format!("write: {e}"),
+        })?;
         guard.flush().await.map_err(|e| SerialError::Io {
             message: format!("flush: {e}"),
         })?;
@@ -491,7 +488,8 @@ mod tests {
         // serialport-rs deliberately reports EBUSY (TIOCEXCL contention)
         // as ErrorKind::NoDevice. The mapper must surface that as
         // PortBusy, not PortNotFound — see issue #3.
-        let e = tokio_serial::Error::new(tokio_serial::ErrorKind::NoDevice, "Device or resource busy");
+        let e =
+            tokio_serial::Error::new(tokio_serial::ErrorKind::NoDevice, "Device or resource busy");
         match super::map_open_error(e, "/dev/ttyACM0") {
             SerialError::PortBusy { port } => assert_eq!(port, "/dev/ttyACM0"),
             other => panic!("expected PortBusy, got {other:?}"),
@@ -528,7 +526,9 @@ mod tests {
         for _ in 0..1000 {
             let id = next_id(&mut state);
             assert_eq!(id.len(), 16);
-            assert!(id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+            assert!(id
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         }
     }
 
@@ -560,7 +560,10 @@ mod tests {
         // The first read returned bytes; the loop then re-enters and
         // its next read blocks until the deadline (no more data). That
         // is the new domain-outcome shape: not an error.
-        assert!(timed_out, "loop should hit the deadline after consuming data");
+        assert!(
+            timed_out,
+            "loop should hit the deadline after consuming data"
+        );
     }
 
     #[tokio::test]
@@ -573,7 +576,10 @@ mod tests {
 
         let (data, timed_out) = m.read(&id, 64, 50).await.unwrap();
         assert!(data.is_empty(), "no bytes should accumulate on idle port");
-        assert!(timed_out, "deadline must surface as timed_out=true, not an Err");
+        assert!(
+            timed_out,
+            "deadline must surface as timed_out=true, not an Err"
+        );
     }
 
     #[tokio::test]
@@ -702,7 +708,10 @@ mod tests {
     #[tokio::test]
     async fn read_until_unknown_session_errors() {
         let m = mgr();
-        let err = m.read_until("noSuchId00000000", "x", 100).await.unwrap_err();
+        let err = m
+            .read_until("noSuchId00000000", "x", 100)
+            .await
+            .unwrap_err();
         assert!(matches!(err, SerialError::SessionNotFound { .. }));
     }
 

@@ -200,10 +200,8 @@ mod tests {
 
     #[test]
     fn non_usb_port_descriptor_has_null_metadata() {
-        let filtered = filter_allowlisted(vec![other_port(
-            "/dev/ttyACM0",
-            SerialPortType::PciPort,
-        )]);
+        let filtered =
+            filter_allowlisted(vec![other_port("/dev/ttyACM0", SerialPortType::PciPort)]);
         assert_eq!(filtered.len(), 1);
         let d = &filtered[0];
         assert_eq!(d.port, "/dev/ttyACM0");
@@ -243,7 +241,12 @@ mod tests {
     #[test]
     fn profile_matches_on_serial_only() {
         let p = profile("esp32c6", "ABC123", None, None);
-        let mut ports = filter_allowlisted(vec![usb_port("/dev/ttyUSB0", 0x10C4, 0xEA60, Some("ABC123"))]);
+        let mut ports = filter_allowlisted(vec![usb_port(
+            "/dev/ttyUSB0",
+            0x10C4,
+            0xEA60,
+            Some("ABC123"),
+        )]);
         enrich_with_profiles(&mut ports, &[p]);
         assert_eq!(ports[0].device.as_deref(), Some("esp32c6"));
         assert_eq!(ports[0].description.as_deref(), Some("esp32c6 test"));
@@ -281,7 +284,12 @@ mod tests {
     fn enrichment_first_match_wins_for_overlapping_profiles() {
         let a = profile("first", "ABC123", None, None);
         let b = profile("second", "ABC123", None, None);
-        let mut ports = filter_allowlisted(vec![usb_port("/dev/ttyUSB0", 0x10C4, 0xEA60, Some("ABC123"))]);
+        let mut ports = filter_allowlisted(vec![usb_port(
+            "/dev/ttyUSB0",
+            0x10C4,
+            0xEA60,
+            Some("ABC123"),
+        )]);
         enrich_with_profiles(&mut ports, &[a, b]);
         assert_eq!(ports[0].device.as_deref(), Some("first"));
     }
@@ -302,10 +310,8 @@ mod tests {
     #[test]
     fn port_without_usb_serial_never_matches() {
         let p = profile("anything", "anything", None, None);
-        let mut ports = filter_allowlisted(vec![other_port(
-            "/dev/ttyACM0",
-            SerialPortType::PciPort,
-        )]);
+        let mut ports =
+            filter_allowlisted(vec![other_port("/dev/ttyACM0", SerialPortType::PciPort)]);
         enrich_with_profiles(&mut ports, &[p]);
         assert_eq!(ports[0].device, None);
     }

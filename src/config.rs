@@ -112,11 +112,10 @@ struct DevicesFile {
 /// is arbitrary — but consumers use first-match-wins on stable predicates
 /// (serial+vid+pid), so order rarely matters.
 pub fn parse_devices(toml_text: &str) -> Result<Vec<DeviceProfile>, SerialError> {
-    let parsed: DevicesFile =
-        toml::from_str(toml_text).map_err(|e| SerialError::InvalidParam {
-            name: "devices.toml".into(),
-            reason: format!("parse error: {e}"),
-        })?;
+    let parsed: DevicesFile = toml::from_str(toml_text).map_err(|e| SerialError::InvalidParam {
+        name: "devices.toml".into(),
+        reason: format!("parse error: {e}"),
+    })?;
     Ok(parsed
         .devices
         .into_iter()

@@ -12,8 +12,8 @@
 
 use std::sync::Arc;
 
-use rmcp::ServiceExt;
 use rmcp::transport;
+use rmcp::ServiceExt;
 use tracing::{info, warn};
 
 use mcp_serial_rs::config;

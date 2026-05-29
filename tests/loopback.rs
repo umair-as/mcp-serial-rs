@@ -29,7 +29,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 const RESP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -86,7 +86,11 @@ fn start_pty_pair() -> PtyPair {
             // Symlinks resolve; allow socat a beat to finish wiring
             // the bridge before either side is opened for I/O.
             thread::sleep(Duration::from_millis(80));
-            return PtyPair { socat, a_path, b_path };
+            return PtyPair {
+                socat,
+                a_path,
+                b_path,
+            };
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -187,7 +191,10 @@ fn loopback_rmcp_open_write_echo_read_until_close() {
         // Disable the journal for this test — `try_open_arc` would
         // otherwise lock-step against /tmp/mcp-serial-journal.jsonl
         // and we don't need audit rows for the loopback assertion.
-        .env("MCP_SERIAL_JOURNAL", format!("/tmp/mcp-loopback-{pid}.jsonl"))
+        .env(
+            "MCP_SERIAL_JOURNAL",
+            format!("/tmp/mcp-loopback-{pid}.jsonl"),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

@@ -16,13 +16,12 @@ mod journal;
 use std::sync::Arc;
 
 use rmcp::{
-    ErrorData as McpError, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
         CallToolRequestParams, CallToolResult, Implementation, ServerCapabilities, ServerInfo,
     },
     service::RequestContext,
-    tool, tool_handler, tool_router,
+    tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -30,9 +29,9 @@ use serde_json::Value;
 use tracing::instrument;
 
 use crate::config::{self, DeviceProfile};
-use crate::serial::SerialBackend;
 use crate::serial::journal::{JournalEntry, JournalWriter};
 use crate::serial::manager::SessionManager;
+use crate::serial::SerialBackend;
 
 /// rmcp-facing server. Holds shared references to the serial domain state
 /// — session manager, device profiles, and the audit journal handle — and
@@ -115,10 +114,7 @@ impl<B: SerialBackend> McpServer<B> {
         description = "Open a serial session by literal port path or named device profile."
     )]
     #[instrument(skip(self, params), fields(port = ?params.0.port, device = ?params.0.device, baud = ?params.0.baud))]
-    pub async fn open(
-        &self,
-        params: Parameters<OpenParams>,
-    ) -> Result<CallToolResult, McpError> {
+    pub async fn open(&self, params: Parameters<OpenParams>) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
 
         // Tool-contract validation: surface as SerialError::InvalidParam so
@@ -172,10 +168,7 @@ impl<B: SerialBackend> McpServer<B> {
         description = "Write UTF-8 bytes to an open serial session. No implicit newline."
     )]
     #[instrument(skip(self, params), fields(session_id = %params.0.session_id, len = params.0.data.len()))]
-    pub async fn write(
-        &self,
-        params: Parameters<WriteParams>,
-    ) -> Result<CallToolResult, McpError> {
+    pub async fn write(&self, params: Parameters<WriteParams>) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
 
         if p.data.len() > config::MAX_WRITE_CHUNK {
@@ -214,10 +207,7 @@ impl<B: SerialBackend> McpServer<B> {
         description = "Drain up to `max_bytes` bytes from a serial session until the deadline; returns partial output with timed_out=true on timeout."
     )]
     #[instrument(skip(self, params), fields(session_id = %params.0.session_id))]
-    pub async fn read(
-        &self,
-        params: Parameters<ReadParams>,
-    ) -> Result<CallToolResult, McpError> {
+    pub async fn read(&self, params: Parameters<ReadParams>) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
 
         let timeout_ms = p
@@ -292,10 +282,7 @@ impl<B: SerialBackend> McpServer<B> {
         description = "Write a command and read until an `expect` regex matches or timeout elapses. Validation happens before write."
     )]
     #[instrument(skip(self, params), fields(session_id = %params.0.session_id, cmd_len = params.0.command.len()))]
-    pub async fn exec(
-        &self,
-        params: Parameters<ExecParams>,
-    ) -> Result<CallToolResult, McpError> {
+    pub async fn exec(&self, params: Parameters<ExecParams>) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
 
         // Step 1: size cap on command — surfaces the pinned -32008,
@@ -366,13 +353,12 @@ impl<B: SerialBackend> McpServer<B> {
         description = "Close a serial session and release its port."
     )]
     #[instrument(skip(self, params), fields(session_id = %params.0.session_id))]
-    pub async fn close(
-        &self,
-        params: Parameters<CloseParams>,
-    ) -> Result<CallToolResult, McpError> {
+    pub async fn close(&self, params: Parameters<CloseParams>) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
         self.sessions.close(&p.session_id)?;
-        Ok(CallToolResult::structured(serde_json::json!({ "ok": true })))
+        Ok(CallToolResult::structured(
+            serde_json::json!({ "ok": true }),
+        ))
     }
 }
 
@@ -510,8 +496,7 @@ impl<B: SerialBackend> ServerHandler for McpServer<B> {
             j.log(&entry).await;
         }
 
-        let tcc =
-            rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         let result = self.tool_router.call(tcc).await;
 
         // result row
@@ -542,10 +527,7 @@ impl<B: SerialBackend> ServerHandler for McpServer<B> {
         // identity to reach the client.
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
-        info.server_info = Implementation::new(
-            env!("CARGO_PKG_NAME"),
-            env!("CARGO_PKG_VERSION"),
-        );
+        info.server_info = Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         info
     }
 }

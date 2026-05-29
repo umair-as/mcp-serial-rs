@@ -21,20 +21,20 @@
 //!   progress in parallel, same-session writes serialise, and a close
 //!   racing an in-flight read resolves deterministically.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rmcp::ServiceExt;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::time::timeout;
 
 use mcp_serial_rs::config::{self, DeviceProfile};
 use mcp_serial_rs::errors::SerialError;
 use mcp_serial_rs::mcp::McpServer;
-use mcp_serial_rs::serial::SerialBackend;
 use mcp_serial_rs::serial::manager::{SessionManager, TokioSerialBackend};
+use mcp_serial_rs::serial::SerialBackend;
 
 // ---- helpers --------------------------------------------------------------
 
@@ -100,9 +100,7 @@ impl SerialBackend for StubBackend {
 /// Build an `McpServer` backed by [`StubBackend`] with the supplied
 /// device profiles. Returns the server and a handle to the backend so
 /// read/read_until tests can pop the device side after `serial.open`.
-fn stub_server_with_backend(
-    profiles: Vec<DeviceProfile>,
-) -> (McpServer<StubBackend>, StubBackend) {
+fn stub_server_with_backend(profiles: Vec<DeviceProfile>) -> (McpServer<StubBackend>, StubBackend) {
     let backend = StubBackend::new();
     let sessions = Arc::new(SessionManager::new(backend.clone()));
     let server = McpServer::new(sessions, Arc::new(profiles), None);
@@ -139,10 +137,7 @@ async fn roundtrip<B: SerialBackend>(server: McpServer<B>, requests: &[Value]) -
 
     // Count expected responses: every request with an `id` (i.e. not a
     // notification) gets exactly one response back.
-    let expected: usize = requests
-        .iter()
-        .filter(|r| r.get("id").is_some())
-        .count();
+    let expected: usize = requests.iter().filter(|r| r.get("id").is_some()).count();
 
     let mut responses = Vec::with_capacity(expected);
     for _ in 0..expected {
@@ -328,7 +323,9 @@ async fn open_by_port_succeeds_returns_16_char_hex_session_id() {
         "session_id must be 16-char hex; got '{session_id}'",
     );
     assert!(
-        session_id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        session_id
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
         "session_id must be lowercase hex; got '{session_id}'",
     );
 }
@@ -365,10 +362,7 @@ async fn open_with_neither_port_nor_device_returns_invalid_param() {
         -32008,
         "missing-both-fields is the same tool-contract failure → -32008",
     );
-    assert_eq!(
-        resp["error"]["data"]["name"].as_str(),
-        Some("port/device"),
-    );
+    assert_eq!(resp["error"]["data"]["name"].as_str(), Some("port/device"),);
 }
 
 #[tokio::test]
@@ -388,7 +382,9 @@ async fn open_disallowed_port_returns_port_not_allowed() {
         -32001,
         "PortNotAllowed must surface with the project's pinned code; got {resp}",
     );
-    let data = resp["error"]["data"].as_object().expect("error.data object");
+    let data = resp["error"]["data"]
+        .as_object()
+        .expect("error.data object");
     assert_eq!(
         data.get("port").and_then(Value::as_str),
         Some("/etc/passwd"),
@@ -460,9 +456,9 @@ async fn open_by_device_resolves_through_profile_succeeds() {
         json!({"device": "step7-device"}),
     )
     .await;
-    let result = resp.get("result").unwrap_or_else(|| {
-        panic!("expected tools/call result for device-open, got {resp}")
-    });
+    let result = resp
+        .get("result")
+        .unwrap_or_else(|| panic!("expected tools/call result for device-open, got {resp}"));
     assert_ne!(result.get("isError"), Some(&json!(true)));
     let structured = result
         .get("structuredContent")
@@ -680,7 +676,10 @@ async fn read_timeout_returns_empty_data_with_timed_out_true_not_error() {
         Some(&json!(true)),
         "read timeout must NOT set isError=true",
     );
-    assert!(resp.get("error").is_none(), "read timeout must not be a JSON-RPC error");
+    assert!(
+        resp.get("error").is_none(),
+        "read timeout must not be a JSON-RPC error"
+    );
     let structured = &result["structuredContent"];
     assert_eq!(structured["data"], json!(""));
     assert_eq!(structured["timed_out"], json!(true));
@@ -710,7 +709,10 @@ async fn read_until_matches_across_chunks() {
     let structured = &result["structuredContent"];
     assert_eq!(structured["matched"], json!(true));
     let data = structured["data"].as_str().expect("data string");
-    assert!(data.contains("WORLD"), "data should contain match: {data:?}");
+    assert!(
+        data.contains("WORLD"),
+        "data should contain match: {data:?}"
+    );
 }
 
 #[tokio::test]
@@ -734,7 +736,10 @@ async fn read_until_timeout_returns_partial_with_matched_false_not_error() {
         Some(&json!(true)),
         "timeout must NOT set isError=true (spec §Error Semantics)",
     );
-    assert!(resp.get("error").is_none(), "timeout must not be a JSON-RPC error");
+    assert!(
+        resp.get("error").is_none(),
+        "timeout must not be a JSON-RPC error"
+    );
     let structured = &result["structuredContent"];
     assert_eq!(structured["matched"], json!(false));
     assert!(structured["data"].is_string());
@@ -749,7 +754,10 @@ async fn read_until_invalid_regex_returns_invalid_param_without_consuming_bytes(
     // contract), they remain readable via a follow-up `serial.read` on
     // the same session.
     use tokio::io::AsyncWriteExt as _;
-    device.write_all(b"untouched\n").await.expect("device write");
+    device
+        .write_all(b"untouched\n")
+        .await
+        .expect("device write");
     device.flush().await.expect("flush");
 
     // Single roundtrip drives both calls on the same server / session:
@@ -904,7 +912,10 @@ async fn exec_oversized_command_returns_invalid_param_without_writing() {
     // Pre-fill device side; a follow-up read must still see these
     // bytes intact, proving the failed exec did not consume them.
     use tokio::io::AsyncWriteExt as _;
-    device.write_all(b"untouched\n").await.expect("device write");
+    device
+        .write_all(b"untouched\n")
+        .await
+        .expect("device write");
     device.flush().await.expect("flush");
 
     let oversize = "x".repeat(config::MAX_WRITE_CHUNK + 1);
@@ -976,7 +987,10 @@ async fn exec_empty_expect_returns_invalid_param() {
 async fn exec_invalid_regex_expect_returns_invalid_param_without_writing() {
     let (server, session_id, mut device) = server_with_open_session().await;
     use tokio::io::AsyncWriteExt as _;
-    device.write_all(b"still-there\n").await.expect("device write");
+    device
+        .write_all(b"still-there\n")
+        .await
+        .expect("device write");
     device.flush().await.expect("flush");
 
     // Single roundtrip: bad-expect exec, then serial.read to prove
@@ -1040,7 +1054,8 @@ async fn exec_invalid_regex_expect_returns_invalid_param_without_writing() {
         .map(|r| r.unwrap_or(0))
         .unwrap_or(0);
     assert_eq!(
-        n, 0,
+        n,
+        0,
         "device side received {n} bytes after a rejected exec: {:?}",
         &buf[..n],
     );
@@ -1068,7 +1083,10 @@ async fn exec_timeout_returns_partial_output_ok_false_not_error() {
         panic!("timeout must return a tool result, not a JSON-RPC error; got {resp}")
     });
     assert_ne!(result.get("isError"), Some(&json!(true)));
-    assert!(resp.get("error").is_none(), "timeout must not be a JSON-RPC error");
+    assert!(
+        resp.get("error").is_none(),
+        "timeout must not be a JSON-RPC error"
+    );
     let structured = &result["structuredContent"];
     assert_eq!(structured["ok"], json!(false));
     assert!(structured["output"].is_string());
@@ -1099,12 +1117,7 @@ async fn exec_unknown_session_returns_session_not_found() {
 #[tokio::test]
 async fn close_happy_path_returns_ok_true() {
     let (server, session_id, _device) = server_with_open_session().await;
-    let resp = handshake_then_call(
-        server,
-        "serial.close",
-        json!({"session_id": session_id}),
-    )
-    .await;
+    let resp = handshake_then_call(server, "serial.close", json!({"session_id": session_id})).await;
     let result = resp.get("result").expect("tools/call result");
     assert_ne!(result.get("isError"), Some(&json!(true)));
     assert_eq!(result["structuredContent"]["ok"], json!(true));
@@ -1164,7 +1177,11 @@ async fn close_releases_session_and_subsequent_read_returns_session_not_found() 
         ],
     )
     .await;
-    assert_eq!(responses.len(), 4, "init + close + read + write = 4 responses");
+    assert_eq!(
+        responses.len(),
+        4,
+        "init + close + read + write = 4 responses"
+    );
 
     let close_resp = &responses[1];
     assert_eq!(
@@ -1414,7 +1431,11 @@ async fn journal_open_result_uses_freshly_minted_session_id() {
     // result row carries the actual id so analysts can pair it up
     // with subsequent write/read/close rows on that session.
     let sid = entries[1]["session_id"].as_str().expect("session_id");
-    assert_eq!(sid.len(), 16, "expected 16-char hex session_id, got {sid:?}");
+    assert_eq!(
+        sid.len(),
+        16,
+        "expected 16-char hex session_id, got {sid:?}"
+    );
     assert!(sid.chars().all(|c| c.is_ascii_hexdigit()));
 }
 
@@ -1482,10 +1503,7 @@ async fn double_close_returns_session_not_found() {
 /// their ids in the order created. The device-side halves are stashed
 /// inside the StubBackend; tests pop with `backend.take_device()` if
 /// they need them (LIFO order — most recently opened first).
-async fn open_n_sessions(
-    sessions: &SessionManager<StubBackend>,
-    n: usize,
-) -> Vec<String> {
+async fn open_n_sessions(sessions: &SessionManager<StubBackend>, n: usize) -> Vec<String> {
     let mut ids = Vec::with_capacity(n);
     for _ in 0..n {
         let sid = sessions
@@ -1789,9 +1807,7 @@ async fn concurrent_tool_calls_produce_valid_non_interleaved_journal_rows() {
     );
     for (i, line) in lines.iter().enumerate() {
         serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|e| {
-            panic!(
-                "line {i} is not valid JSON — likely torn/interleaved: {e}\nLINE: {line:?}",
-            )
+            panic!("line {i} is not valid JSON — likely torn/interleaved: {e}\nLINE: {line:?}",)
         });
     }
 
@@ -1803,10 +1819,7 @@ async fn concurrent_tool_calls_produce_valid_non_interleaved_journal_rows() {
         .iter()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    let calls = entries
-        .iter()
-        .filter(|e| e["direction"] == "call")
-        .count();
+    let calls = entries.iter().filter(|e| e["direction"] == "call").count();
     let results = entries
         .iter()
         .filter(|e| e["direction"] == "result")

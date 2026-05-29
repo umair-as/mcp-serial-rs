@@ -215,7 +215,12 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let writer = JournalWriter::open(tmp.path()).await.unwrap();
 
-        let a = JournalEntry::new("none", "initialize", JournalEntry::DIR_CALL, json!({"id": 1}));
+        let a = JournalEntry::new(
+            "none",
+            "initialize",
+            JournalEntry::DIR_CALL,
+            json!({"id": 1}),
+        );
         let b = JournalEntry::new(
             "deadbeef",
             "serial.write",
@@ -233,7 +238,11 @@ mod tests {
         assert_eq!(parsed_a.tool, "initialize");
         assert_eq!(parsed_a.direction, "call");
         assert_eq!(parsed_a.session_id, "none");
-        assert!(parsed_a.ts.ends_with('Z'), "ts must be UTC: {}", parsed_a.ts);
+        assert!(
+            parsed_a.ts.ends_with('Z'),
+            "ts must be UTC: {}",
+            parsed_a.ts
+        );
 
         let parsed_b: JournalEntry = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(parsed_b.tool, "serial.write");
