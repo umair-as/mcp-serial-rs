@@ -13,6 +13,7 @@ pub mod manager;
 pub mod parser;
 pub mod session;
 
+use schemars::JsonSchema;
 use serde::Serialize;
 use tokio_serial::{SerialPortInfo, SerialPortType};
 
@@ -23,7 +24,7 @@ use crate::errors::SerialError;
 /// `serial.list_ports` returns. `vid` / `pid` / `serial` are `Some` only
 /// when the underlying transport reports a USB descriptor. `device` /
 /// `description` are populated when a [`DeviceProfile`] matches.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct PortDescriptor {
     pub port: String,
     pub vid: Option<u16>,

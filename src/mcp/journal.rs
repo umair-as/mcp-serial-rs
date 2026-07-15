@@ -9,9 +9,9 @@
 //! on stderr.
 //!
 //! These helpers shape the `serde_json::Value` summaries written into
-//! each tool's JSONL rows. Large free-form fields (`data` / `command` /
-//! `output`) are clipped to [`JOURNAL_HEAD_CHARS`] with the byte-length
-//! preserved alongside.
+//! each tool's JSONL rows. The default journal is metadata-only: it records
+//! bounded field names, byte counts, statuses, and error codes, but not raw
+//! command or device-output text.
 
 use rmcp::model::CallToolResult;
 use rmcp::ErrorData;
@@ -19,20 +19,11 @@ use serde_json::{json, Value};
 
 use crate::serial::journal::JournalEntry;
 
-/// Max chars retained from any large free-form field when summarised
-/// into the journal. Char-bounded (not byte-bounded) so the slice
-/// always lands on a UTF-8 boundary.
-const JOURNAL_HEAD_CHARS: usize = 128;
+const MAX_ARG_KEYS: usize = 16;
+const MAX_JOURNAL_FIELD_CHARS: usize = 128;
 
-/// Truncate a string field's contents to [`JOURNAL_HEAD_CHARS`] for
-/// inclusion in the summary. Returns empty when the field is missing
-/// or not a string.
-fn head(value: &Value, key: &str) -> String {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .map(|s| s.chars().take(JOURNAL_HEAD_CHARS).collect())
-        .unwrap_or_default()
+fn clipped(value: &str) -> String {
+    value.chars().take(MAX_JOURNAL_FIELD_CHARS).collect()
 }
 
 /// Byte length of a string field, or `0` when missing / non-string.
@@ -45,13 +36,37 @@ fn byte_len(value: &Value, key: &str) -> usize {
         .unwrap_or(0)
 }
 
+fn object_keys(value: &Value) -> Vec<String> {
+    value
+        .as_object()
+        .map(|obj| {
+            obj.keys()
+                .take(MAX_ARG_KEYS)
+                .map(|key| clipped(key))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn optional_session_id(value: &Value) -> Option<String> {
+    value.get("session_id").and_then(Value::as_str).map(clipped)
+}
+
+fn optional_u64(value: &Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(Value::as_u64)
+}
+
+fn optional_bool(value: &Value, key: &str) -> Option<bool> {
+    value.get(key).and_then(Value::as_bool)
+}
+
 /// `session_id` for a `call` row, before the handler runs. Most tools
 /// take it in their arguments; `serial.list_ports` and `serial.open`
 /// have no session yet, so the `NO_SESSION` sentinel is used.
 pub fn call_session_id(args: &Value) -> String {
     args.get("session_id")
         .and_then(Value::as_str)
-        .map(str::to_string)
+        .map(clipped)
         .unwrap_or_else(|| JournalEntry::NO_SESSION.to_string())
 }
 
@@ -72,7 +87,7 @@ pub fn result_session_id(
                 .and_then(|sc| sc.get("session_id"))
                 .and_then(Value::as_str)
             {
-                return sid.to_string();
+                return clipped(sid);
             }
         }
     }
@@ -84,20 +99,22 @@ pub fn result_session_id(
 pub fn call_summary(tool: &str, args: &Value) -> Value {
     match tool {
         "serial.write" => json!({
-            "session_id": args.get("session_id"),
+            "session_id": optional_session_id(args),
             "bytes": byte_len(args, "data"),
-            "head": head(args, "data"),
+            "arg_keys": object_keys(args),
         }),
         "serial.exec" => json!({
-            "session_id": args.get("session_id"),
+            "session_id": optional_session_id(args),
             "command_bytes": byte_len(args, "command"),
-            "command_head": head(args, "command"),
-            "expect": args.get("expect"),
-            "timeout_ms": args.get("timeout_ms"),
+            "expect_bytes": byte_len(args, "expect"),
+            "timeout_ms": optional_u64(args, "timeout_ms"),
+            "clear_before_write": optional_bool(args, "clear_before_write"),
+            "normalize_output": optional_bool(args, "normalize_output"),
+            "arg_keys": object_keys(args),
         }),
-        // Tools without large fields: pass the compact arguments
-        // through so the call row stays useful for debugging.
-        _ => json!({ "args": args }),
+        _ => json!({
+            "arg_keys": object_keys(args),
+        }),
     }
 }
 
@@ -109,10 +126,18 @@ pub fn result_summary(tool: &str, result: &Result<&CallToolResult, &ErrorData>) 
         Err(e) => json!({
             "ok": false,
             "error_code": e.code.0,
-            "error_message": e.message,
         }),
         Ok(call_result) => {
             let sc = call_result.structured_content.as_ref();
+            if call_result.is_error == Some(true) {
+                let error = sc.and_then(|v| v.get("error"));
+                return json!({
+                    "ok": false,
+                    "is_error": true,
+                    "error_code": error.and_then(|e| e.get("code")),
+                    "error_type": error.and_then(|e| e.get("type")),
+                });
+            }
             match tool {
                 "serial.list_ports" => json!({
                     "ok": true,
@@ -135,7 +160,8 @@ pub fn result_summary(tool: &str, result: &Result<&CallToolResult, &ErrorData>) 
                     json!({
                         "ok": true,
                         "bytes": byte_len(&data, "data"),
-                        "head": head(&data, "data"),
+                        "status": data.get("status"),
+                        "truncated": data.get("truncated"),
                     })
                 }
                 "serial.read_until" => {
@@ -143,8 +169,9 @@ pub fn result_summary(tool: &str, result: &Result<&CallToolResult, &ErrorData>) 
                     json!({
                         "ok": true,
                         "bytes": byte_len(&data, "data"),
-                        "head": head(&data, "data"),
+                        "status": data.get("status"),
                         "matched": data.get("matched"),
+                        "truncated": data.get("truncated"),
                     })
                 }
                 "serial.exec" => {
@@ -152,18 +179,17 @@ pub fn result_summary(tool: &str, result: &Result<&CallToolResult, &ErrorData>) 
                     json!({
                         "ok": true,
                         "output_bytes": byte_len(&out, "output"),
-                        "output_head": head(&out, "output"),
+                        "status": out.get("status"),
                         "exec_ok": out.get("ok"),
+                        "command_written": out.get("command_written"),
+                        "truncated": out.get("truncated"),
                     })
                 }
                 "serial.close" => json!({
                     "ok": true,
                     "closed": sc.and_then(|v| v.get("ok")),
                 }),
-                // Unknown tool name (shouldn't happen unless the
-                // router somehow accepts it): include the raw
-                // structured content for triage.
-                _ => json!({ "ok": true, "structured_content": sc }),
+                _ => json!({ "ok": true, "has_structured_content": sc.is_some() }),
             }
         }
     }
@@ -179,13 +205,51 @@ mod tests {
     }
 
     #[test]
-    fn call_summary_truncates_write_head_to_128_chars() {
+    fn call_summary_records_write_size_without_payload() {
         let big = "x".repeat(200);
-        let args = json!({"session_id": "s", "data": big.clone()});
+        let args = json!({"session_id": "s".repeat(10_000), "data": big.clone()});
         let summary = call_summary("serial.write", &args);
         assert_eq!(summary["bytes"], 200, "byte_len preserves the full size");
-        let h = summary["head"].as_str().expect("head");
-        assert_eq!(h.chars().count(), JOURNAL_HEAD_CHARS);
+        assert_eq!(
+            summary["session_id"].as_str().unwrap().chars().count(),
+            MAX_JOURNAL_FIELD_CHARS
+        );
+        assert!(summary.get("head").is_none());
+        assert!(summary.to_string().len() < big.len());
+    }
+
+    #[test]
+    fn unknown_call_summary_is_bounded_and_metadata_only() {
+        let big = "secret".repeat(1000);
+        let args = json!({"session_id": "s", "data": big, "other": "value"});
+        let summary = call_summary("unknown.tool", &args);
+        assert!(summary.get("args").is_none());
+        assert!(summary.to_string().len() < 256);
+        assert!(!summary.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn call_summary_bounds_keys_and_omits_regex_text() {
+        let huge_key = "k".repeat(10_000);
+        let secret = "TOP_SECRET_SENTINEL";
+        let args = json!({
+            "session_id": "s",
+            huge_key: "value",
+            "expect": format!("bad-regex-{secret}[")
+        });
+        let summary = call_summary("serial.exec", &args);
+        assert!(
+            summary.to_string().len() < 512,
+            "summary should stay bounded: {summary}"
+        );
+        assert!(
+            !summary.to_string().contains(secret),
+            "regex text must not be journaled by default"
+        );
+        let keys = summary["arg_keys"].as_array().expect("arg_keys");
+        assert!(keys
+            .iter()
+            .all(|key| key.as_str().unwrap().chars().count() <= MAX_JOURNAL_FIELD_CHARS));
     }
 
     #[test]
@@ -208,7 +272,7 @@ mod tests {
         let summary = result_summary("serial.write", &Err(&err));
         assert_eq!(summary["ok"], json!(false));
         assert_eq!(summary["error_code"], json!(-32003));
-        assert_eq!(summary["error_message"], json!("unknown session"));
+        assert!(summary.get("error_message").is_none());
     }
 
     #[test]
@@ -221,14 +285,11 @@ mod tests {
     }
 
     #[test]
-    fn result_summary_for_read_clips_data_head() {
+    fn result_summary_for_read_records_size_without_payload() {
         let big = "y".repeat(300);
         let result = ok_with(json!({"data": big}));
         let summary = result_summary("serial.read", &Ok(&result));
         assert_eq!(summary["bytes"], 300);
-        assert_eq!(
-            summary["head"].as_str().unwrap().chars().count(),
-            JOURNAL_HEAD_CHARS
-        );
+        assert!(summary.get("head").is_none());
     }
 }

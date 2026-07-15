@@ -4,9 +4,9 @@
 //!
 //! One line per [`JournalEntry`]; each tool invocation produces a `call`
 //! entry before dispatch and a `result` entry after. Per CLAUDE.md §6 this
-//! is always-on auditing — not opt-in — but I/O failures degrade gracefully
-//! (logged via `tracing::warn` and the journal handle becomes `None`) so
-//! a missing or unwritable journal never blocks tool execution.
+//! is always-on auditing — not opt-in — but I/O failures degrade gracefully.
+//! Open failure leaves the server with no journal handle; per-row failures are
+//! logged via `tracing::warn` and the writer is retained for later retry.
 //!
 //! Concurrency: the inner `BufWriter` sits behind a `tokio::sync::Mutex`
 //! because dispatch tasks can in principle interleave on the runtime. The
@@ -27,9 +27,13 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex as TokioMutex;
 use tracing::warn;
 
-/// One row in the journal. `summary` is tool-specific; producers must keep
-/// it small (truncate `data` / `command` / `output` to 128 chars + a byte
-/// count) so the journal stays line-oriented and tail-able.
+const MAX_IDENTIFIER_CHARS: usize = 128;
+const JOURNAL_IO_TIMEOUT_MS: u64 = 250;
+const MAX_JOURNAL_ROW_BYTES: usize = 16 * 1024;
+
+/// One row in the journal. `summary` is tool-specific and metadata-only by
+/// default; producers must keep it small so the journal stays line-oriented
+/// and tail-able.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalEntry {
     pub ts: String,
@@ -55,12 +59,16 @@ impl JournalEntry {
     ) -> Self {
         Self {
             ts: iso8601_now(),
-            session_id: session_id.into(),
-            tool: tool.into(),
+            session_id: clip_identifier(&session_id.into()),
+            tool: clip_identifier(&tool.into()),
             direction: direction.into(),
             summary,
         }
     }
+}
+
+fn clip_identifier(value: &str) -> String {
+    value.chars().take(MAX_IDENTIFIER_CHARS).collect()
 }
 
 /// Wraps an append-mode file. `log` serialises an entry as a single JSONL
@@ -78,11 +86,37 @@ impl JournalWriter {
     /// the underlying I/O error — callers in `main.rs` log the error and
     /// fall back to `journal = None` (degraded mode) rather than aborting.
     pub async fn open(path: &Path) -> std::io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await?;
+        if let Some(parent) = path.parent() {
+            let parent_existed = tokio::fs::symlink_metadata(parent).await.is_ok();
+            tokio::fs::create_dir_all(parent).await?;
+            #[cfg(unix)]
+            if !parent_existed {
+                use std::os::unix::fs::PermissionsExt;
+                tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await?;
+            }
+        }
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options.open(path).await?;
+        let metadata = file.metadata().await?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "journal path is not a regular file",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .await?;
+        }
         Ok(Self {
             inner: TokioMutex::new(BufWriter::new(file)),
             path: path.to_path_buf(),
@@ -126,14 +160,37 @@ impl JournalWriter {
                 return;
             }
         };
-        line.push(b'\n');
-        let mut guard = self.inner.lock().await;
-        if let Err(e) = guard.write_all(&line).await {
-            warn!(error = %e, path = %self.path.display(), "journal write failed");
+        if line.len() > MAX_JOURNAL_ROW_BYTES {
+            warn!(
+                path = %self.path.display(),
+                len = line.len(),
+                max = MAX_JOURNAL_ROW_BYTES,
+                "journal row too large; dropping row"
+            );
             return;
         }
-        if let Err(e) = guard.flush().await {
-            warn!(error = %e, path = %self.path.display(), "journal flush failed");
+        line.push(b'\n');
+        let Ok(mut guard) = tokio::time::timeout(
+            std::time::Duration::from_millis(JOURNAL_IO_TIMEOUT_MS),
+            self.inner.lock(),
+        )
+        .await
+        else {
+            warn!(path = %self.path.display(), "journal lock timed out");
+            return;
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(JOURNAL_IO_TIMEOUT_MS),
+            async {
+                guard.write_all(&line).await?;
+                guard.flush().await
+            },
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!(error = %e, path = %self.path.display(), "journal write failed"),
+            Err(_) => warn!(path = %self.path.display(), "journal write timed out"),
         }
     }
 }
@@ -252,6 +309,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writer_drops_oversized_row_and_recovers() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let writer = JournalWriter::open(tmp.path()).await.unwrap();
+
+        let oversized = JournalEntry::new(
+            "none",
+            "serial.write",
+            JournalEntry::DIR_CALL,
+            json!({"blob": "x".repeat(MAX_JOURNAL_ROW_BYTES + 1)}),
+        );
+        writer.log(&oversized).await;
+
+        let normal = JournalEntry::new(
+            "none",
+            "serial.list_ports",
+            JournalEntry::DIR_RESULT,
+            json!({"ok": true, "port_count": 1}),
+        );
+        writer.log(&normal).await;
+
+        let contents = std::fs::read_to_string(tmp.path()).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 1, "oversized row must be dropped");
+        let parsed: JournalEntry = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed.tool, "serial.list_ports");
+    }
+
+    #[tokio::test]
     async fn writer_open_on_unwritable_path_errors() {
         // Opening a journal inside a non-existent directory cannot succeed,
         // and the error is what feeds the degraded-mode branch in main.rs.
@@ -265,5 +350,58 @@ mod tests {
         // Unwritable path → tracing::warn + None, no panic.
         let result = JournalWriter::try_open_arc(Path::new("/proc/1/no-such-journal")).await;
         assert!(result.is_none(), "must degrade to None on open failure");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writer_creates_new_parent_private_and_file_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("state").join("mcp-serial-rs");
+        let path = dir.join("audit.jsonl");
+        let _writer = JournalWriter::open(&path).await.unwrap();
+
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writer_rejects_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.jsonl");
+        let link = temp.path().join("audit.jsonl");
+        std::fs::write(&target, b"keep\n").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let err = JournalWriter::open(&link).await.unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writer_rejects_fifo_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fifo = temp.path().join("audit.fifo");
+        let c_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            JournalWriter::open(&fifo),
+        )
+        .await
+        .expect("journal open must not block on FIFO");
+        assert!(result.is_err(), "FIFO must not be accepted as a journal");
     }
 }

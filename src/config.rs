@@ -47,13 +47,14 @@ pub const DEVICES_ENV: &str = "MCP_SERIAL_DEVICES";
 pub const DEFAULT_DEVICES_PATH: &str = "devices.toml";
 
 /// Env var pointing at the JSONL traffic-journal file. Set to override the
-/// default `/tmp/mcp-serial-journal.jsonl`. The journal is always-on (per
+/// default user-private state path. The journal is always-on (per
 /// CLAUDE.md §6); if the path is unwritable, the server logs a warning and
 /// runs in degraded mode without auditing rather than failing to start.
 pub const JOURNAL_ENV: &str = "MCP_SERIAL_JOURNAL";
 
-/// Default journal path when [`JOURNAL_ENV`] is unset.
-pub const DEFAULT_JOURNAL_PATH: &str = "/tmp/mcp-serial-journal.jsonl";
+/// Fallback default journal path when neither [`JOURNAL_ENV`] nor
+/// `XDG_STATE_HOME` can supply a user-private location.
+pub const DEFAULT_JOURNAL_PATH: &str = ".mcp-serial-rs/audit.jsonl";
 
 /// Resolve the device-profile path: env var if set, else
 /// [`DEFAULT_DEVICES_PATH`] relative to the current working directory.
@@ -65,9 +66,22 @@ pub fn devices_path() -> PathBuf {
 
 /// Resolve the journal path: env var if set, else [`DEFAULT_JOURNAL_PATH`].
 pub fn journal_path() -> PathBuf {
-    std::env::var(JOURNAL_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_JOURNAL_PATH))
+    if let Ok(path) = std::env::var(JOURNAL_ENV) {
+        return PathBuf::from(path);
+    }
+    if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
+        return PathBuf::from(state_home)
+            .join("mcp-serial-rs")
+            .join("audit.jsonl");
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("mcp-serial-rs")
+            .join("audit.jsonl");
+    }
+    PathBuf::from(DEFAULT_JOURNAL_PATH)
 }
 
 /// A device profile loaded from `devices.toml`. `name` is the TOML table

@@ -189,7 +189,7 @@ fn loopback_rmcp_open_write_echo_read_until_close() {
     let mut child = Command::new(bin)
         .env("MCP_SERIAL_ALLOWLIST", &allowlist)
         // Disable the journal for this test — `try_open_arc` would
-        // otherwise lock-step against /tmp/mcp-serial-journal.jsonl
+        // otherwise lock-step against the default per-user journal path
         // and we don't need audit rows for the loopback assertion.
         .env(
             "MCP_SERIAL_JOURNAL",
@@ -232,7 +232,7 @@ fn loopback_rmcp_open_write_echo_read_until_close() {
         json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
     );
 
-    // 2. tools/list — should advertise all seven dotted tool names.
+    // 2. tools/list — should advertise the expected dotted tool names.
     send(
         &mut stdin,
         json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
@@ -280,7 +280,7 @@ fn loopback_rmcp_open_write_echo_read_until_close() {
         .as_str()
         .expect("session_id string in structuredContent")
         .to_string();
-    assert_eq!(session_id.len(), 16, "16-char hex session id");
+    assert_eq!(session_id.len(), 32, "128-bit hex session id");
 
     // 4. tools/call serial.write — bytes onto the manager-side PTY.
     let payload = "echo-marker-7f3a\n";

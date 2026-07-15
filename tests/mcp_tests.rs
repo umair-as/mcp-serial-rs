@@ -23,7 +23,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rmcp::ServiceExt;
 use serde_json::{json, Value};
@@ -203,12 +203,19 @@ async fn handshake_then_call<B: SerialBackend>(
     responses.into_iter().nth(1).expect("tools/call response")
 }
 
-/// Extract the JSON-RPC server-defined error code from a response.
+/// Extract the serial-domain error code from a tool error result. Falls back
+/// to JSON-RPC error.code only for protocol-level failures.
 fn rpc_error_code(resp: &Value) -> i64 {
-    resp.get("error")
-        .and_then(|e| e.get("code"))
+    resp.pointer("/result/structuredContent/error/code")
+        .or_else(|| resp.get("error").and_then(|e| e.get("code")))
         .and_then(Value::as_i64)
-        .unwrap_or_else(|| panic!("expected JSON-RPC error.code in {resp}"))
+        .unwrap_or_else(|| panic!("expected tool error or JSON-RPC error.code in {resp}"))
+}
+
+fn tool_error_data(resp: &Value) -> &Value {
+    resp.pointer("/result/structuredContent/error/data")
+        .or_else(|| resp.get("error").and_then(|e| e.get("data")))
+        .unwrap_or_else(|| panic!("expected structured tool error data in {resp}"))
 }
 
 // ---- lifecycle / list_ports ----------------------------------------------
@@ -244,7 +251,19 @@ async fn tools_list_contains_dotted_tools_with_input_schema() {
     let result = responses[1].get("result").expect("tools/list result");
     let tools = result["tools"].as_array().expect("tools array");
 
-    for name in ["serial.list_ports", "serial.open"] {
+    for name in [
+        "serial.list_ports",
+        "serial.open",
+        "serial.sessions",
+        "serial.get_session",
+        "serial.write",
+        "serial.read",
+        "serial.drain",
+        "serial.clear_input",
+        "serial.read_until",
+        "serial.exec",
+        "serial.close",
+    ] {
         let t = tools
             .iter()
             .find(|t| t["name"] == name)
@@ -253,11 +272,64 @@ async fn tools_list_contains_dotted_tools_with_input_schema() {
             t.get("inputSchema").is_some(),
             "rmcp must generate an input schema for `{name}`",
         );
-        // Output schemas are not implemented — rmcp generates input
-        // schemas only.
         assert!(
-            t.get("outputSchema").is_none(),
-            "outputSchema for `{name}` should not be set",
+            t.get("outputSchema").is_some(),
+            "tool `{name}` must advertise an output schema",
+        );
+        assert_eq!(
+            t["outputSchema"]["type"], "object",
+            "tool `{name}` outputSchema root must be an object",
+        );
+        let output_schema = &t["outputSchema"];
+        let any_of = output_schema
+            .get("anyOf")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| {
+                panic!("tool `{name}` outputSchema must expose success/error branches")
+            });
+        assert!(
+            !any_of.is_empty(),
+            "tool `{name}` outputSchema anyOf must not be empty",
+        );
+        for branch in any_of {
+            assert!(
+                branch.get("required").and_then(Value::as_array).is_some(),
+                "tool `{name}` outputSchema branch must preserve required fields: {branch}",
+            );
+        }
+        let defs = output_schema.get("$defs").and_then(Value::as_object);
+        let error_ref = any_of
+            .iter()
+            .find_map(|branch| branch.pointer("/properties/error/$ref"))
+            .and_then(Value::as_str);
+        if let Some(error_ref) = error_ref {
+            let def_name = error_ref.trim_start_matches("#/$defs/");
+            assert!(
+                defs.and_then(|defs| defs.get(def_name)).is_some(),
+                "tool `{name}` outputSchema has unresolved error ref `{error_ref}`",
+            );
+        }
+        assert!(
+            t.get("annotations").is_some(),
+            "tool `{name}` should have annotations"
+        );
+        let destructive = t
+            .pointer("/annotations/destructiveHint")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| panic!("tool `{name}` must set destructiveHint"));
+        let expected_destructive = matches!(
+            name,
+            "serial.write"
+                | "serial.read"
+                | "serial.drain"
+                | "serial.clear_input"
+                | "serial.read_until"
+                | "serial.exec"
+                | "serial.close"
+        );
+        assert_eq!(
+            destructive, expected_destructive,
+            "tool `{name}` destructiveHint mismatch",
         );
     }
 }
@@ -299,7 +371,7 @@ async fn call_serial_list_ports_returns_structured_object() {
 // ---- serial.open ----------------------------------------------------------
 
 #[tokio::test]
-async fn open_by_port_succeeds_returns_16_char_hex_session_id() {
+async fn open_by_port_succeeds_returns_32_char_hex_session_id() {
     let resp = handshake_then_call(
         stub_server(vec![]),
         "serial.open",
@@ -319,8 +391,8 @@ async fn open_by_port_succeeds_returns_16_char_hex_session_id() {
         .expect("session_id field must be a string");
     assert_eq!(
         session_id.len(),
-        16,
-        "session_id must be 16-char hex; got '{session_id}'",
+        32,
+        "session_id must be 32-char hex; got '{session_id}'",
     );
     assert!(
         session_id
@@ -348,7 +420,7 @@ async fn open_with_both_port_and_device_returns_invalid_param() {
         "InvalidParam must use the project's pinned code; got {resp}",
     );
     assert_eq!(
-        resp["error"]["data"]["name"].as_str(),
+        tool_error_data(&resp)["name"].as_str(),
         Some("port/device"),
         "structured error.data.name must identify the offending field",
     );
@@ -362,7 +434,7 @@ async fn open_with_neither_port_nor_device_returns_invalid_param() {
         -32008,
         "missing-both-fields is the same tool-contract failure → -32008",
     );
-    assert_eq!(resp["error"]["data"]["name"].as_str(), Some("port/device"),);
+    assert_eq!(tool_error_data(&resp)["name"].as_str(), Some("port/device"),);
 }
 
 #[tokio::test]
@@ -382,7 +454,7 @@ async fn open_disallowed_port_returns_port_not_allowed() {
         -32001,
         "PortNotAllowed must surface with the project's pinned code; got {resp}",
     );
-    let data = resp["error"]["data"]
+    let data = tool_error_data(&resp)
         .as_object()
         .expect("error.data object");
     assert_eq!(
@@ -408,7 +480,7 @@ async fn open_unknown_device_returns_device_not_found() {
         "DeviceNotFound must surface with the project's pinned code; got {resp}",
     );
     assert_eq!(
-        resp["error"]["data"]["device"].as_str(),
+        tool_error_data(&resp)["device"].as_str(),
         Some("esp32c6"),
         "structured error.data must include the offending device name",
     );
@@ -468,7 +540,7 @@ async fn open_by_device_resolves_through_profile_succeeds() {
         .get("session_id")
         .and_then(Value::as_str)
         .expect("session_id field");
-    assert_eq!(session_id.len(), 16);
+    assert_eq!(session_id.len(), 32);
 }
 
 // ---- serial.write / serial.read / serial.read_until ----------------------
@@ -531,8 +603,12 @@ async fn tools_list_advertises_all_ported_tools() {
     for name in [
         "serial.list_ports",
         "serial.open",
+        "serial.sessions",
+        "serial.get_session",
         "serial.write",
         "serial.read",
+        "serial.drain",
+        "serial.clear_input",
         "serial.read_until",
         "serial.exec",
         "serial.close",
@@ -575,6 +651,115 @@ async fn write_happy_path_returns_bytes_written() {
 }
 
 #[tokio::test]
+async fn sessions_and_get_session_report_open_session_metadata() {
+    let (server, session_id, _device) = server_with_open_session().await;
+
+    let responses = roundtrip(
+        server,
+        &[
+            init_request(),
+            initialized_notification(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "serial.sessions", "arguments": {}},
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "serial.get_session",
+                    "arguments": {"session_id": session_id},
+                },
+            }),
+        ],
+    )
+    .await;
+
+    let sessions = responses[1]["result"]["structuredContent"]["sessions"]
+        .as_array()
+        .expect("sessions array");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["state"], "Ready");
+    assert_eq!(sessions[0]["port"], "/dev/ttyUSB0");
+
+    let session = &responses[2]["result"]["structuredContent"]["session"];
+    assert_eq!(session["state"], "Ready");
+    assert_eq!(session["baud"], 115_200);
+}
+
+#[tokio::test]
+async fn drain_returns_raw_buffer() {
+    let (server, session_id, mut device) = server_with_open_session().await;
+    use tokio::io::AsyncWriteExt as _;
+    device
+        .write_all(b"\x1b]3008;start=test\x1b\\prompt> stale\n")
+        .await
+        .expect("device write");
+    device.flush().await.expect("flush");
+
+    let responses = roundtrip(
+        server,
+        &[
+            init_request(),
+            initialized_notification(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "serial.drain",
+                    "arguments": {"session_id": session_id, "max_bytes": 256},
+                },
+            }),
+        ],
+    )
+    .await;
+    let drained = responses[1]["result"]["structuredContent"]["data"]
+        .as_str()
+        .expect("drain data");
+    assert!(
+        drained.contains("\u{1b}]3008"),
+        "raw OSC sequence must be preserved"
+    );
+}
+
+#[tokio::test]
+async fn clear_input_discards_buffer_and_reports_counts() {
+    let (server, session_id, mut device) = server_with_open_session().await;
+    use tokio::io::AsyncWriteExt as _;
+    device
+        .write_all(b"discard-me\n")
+        .await
+        .expect("device write");
+    device.flush().await.expect("flush");
+
+    let responses = roundtrip(
+        server,
+        &[
+            init_request(),
+            initialized_notification(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "serial.clear_input",
+                    "arguments": {"session_id": session_id, "max_bytes": 256},
+                },
+            }),
+        ],
+    )
+    .await;
+    let structured = &responses[1]["result"]["structuredContent"];
+    assert_eq!(structured["discarded_bytes"], b"discard-me\n".len());
+    assert_eq!(structured["bytes_read"], b"discard-me\n".len());
+    assert_eq!(structured["session_usable"], true);
+}
+
+#[tokio::test]
 async fn write_oversized_returns_invalid_param() {
     let (server, session_id, _device) = server_with_open_session().await;
     let oversize = "x".repeat(config::MAX_WRITE_CHUNK + 1);
@@ -591,7 +776,7 @@ async fn write_oversized_returns_invalid_param() {
         "oversized writes must surface as the pinned InvalidParam code; got {resp}",
     );
     assert_eq!(
-        resp["error"]["data"]["name"].as_str(),
+        tool_error_data(&resp)["name"].as_str(),
         Some("data"),
         "structured error.data.name must point at the offending field",
     );
@@ -607,7 +792,7 @@ async fn write_unknown_session_returns_session_not_found() {
     .await;
     assert_eq!(rpc_error_code(&resp), -32003);
     assert_eq!(
-        resp["error"]["data"]["session_id"].as_str(),
+        tool_error_data(&resp)["session_id"].as_str(),
         Some("0000000000000000"),
     );
 }
@@ -807,7 +992,7 @@ async fn read_until_invalid_regex_returns_invalid_param_without_consuming_bytes(
         "invalid regex must surface as InvalidParam (-32008); got {read_until_resp}",
     );
     assert_eq!(
-        read_until_resp["error"]["data"]["name"].as_str(),
+        tool_error_data(read_until_resp)["name"].as_str(),
         Some("pattern"),
         "structured error.data.name must identify the offending field",
     );
@@ -840,7 +1025,7 @@ async fn read_until_empty_pattern_returns_invalid_param() {
     )
     .await;
     assert_eq!(rpc_error_code(&resp), -32008);
-    assert_eq!(resp["error"]["data"]["name"].as_str(), Some("pattern"));
+    assert_eq!(tool_error_data(&resp)["name"].as_str(), Some("pattern"));
 }
 
 // ---- serial.exec ---------------------------------------------------------
@@ -953,7 +1138,7 @@ async fn exec_oversized_command_returns_invalid_param_without_writing() {
 
     let exec_resp = &responses[1];
     assert_eq!(rpc_error_code(exec_resp), -32008);
-    assert_eq!(exec_resp["error"]["data"]["name"].as_str(), Some("command"));
+    assert_eq!(tool_error_data(exec_resp)["name"].as_str(), Some("command"));
 
     let read_data = responses[2]["result"]["structuredContent"]["data"]
         .as_str()
@@ -980,7 +1165,7 @@ async fn exec_empty_expect_returns_invalid_param() {
     )
     .await;
     assert_eq!(rpc_error_code(&resp), -32008);
-    assert_eq!(resp["error"]["data"]["name"].as_str(), Some("expect"));
+    assert_eq!(tool_error_data(&resp)["name"].as_str(), Some("expect"));
 }
 
 #[tokio::test]
@@ -1029,7 +1214,7 @@ async fn exec_invalid_regex_expect_returns_invalid_param_without_writing() {
 
     let exec_resp = &responses[1];
     assert_eq!(rpc_error_code(exec_resp), -32008);
-    assert_eq!(exec_resp["error"]["data"]["name"].as_str(), Some("expect"));
+    assert_eq!(tool_error_data(exec_resp)["name"].as_str(), Some("expect"));
 
     let read_data = responses[2]["result"]["structuredContent"]["data"]
         .as_str()
@@ -1093,6 +1278,36 @@ async fn exec_timeout_returns_partial_output_ok_false_not_error() {
 }
 
 #[tokio::test]
+async fn exec_uses_session_default_timeout_when_omitted() {
+    let (server, sessions, backend) = stub_setup(vec![]);
+    let session_id = sessions
+        .open("/dev/ttyUSB0", 115_200, 75)
+        .await
+        .expect("open out-of-band");
+    let _device = backend.take_device();
+
+    let started = Instant::now();
+    let resp = handshake_then_call(
+        server,
+        "serial.exec",
+        json!({
+            "session_id": session_id,
+            "command": "ping",
+            "expect": "NEVER_THIS_PATTERN"
+        }),
+    )
+    .await;
+
+    assert!(
+        started.elapsed() < Duration::from_millis(800),
+        "omitted exec timeout should use the short session default, not the global default"
+    );
+    let result = resp.get("result").expect("tools/call result");
+    assert_ne!(result.get("isError"), Some(&json!(true)));
+    assert_eq!(result["structuredContent"]["status"], json!("timed_out"));
+}
+
+#[tokio::test]
 async fn exec_unknown_session_returns_session_not_found() {
     let resp = handshake_then_call(
         stub_server(vec![]),
@@ -1107,7 +1322,7 @@ async fn exec_unknown_session_returns_session_not_found() {
     .await;
     assert_eq!(rpc_error_code(&resp), -32003);
     assert_eq!(
-        resp["error"]["data"]["session_id"].as_str(),
+        tool_error_data(&resp)["session_id"].as_str(),
         Some("deadbeefdeadbeef"),
     );
 }
@@ -1133,7 +1348,7 @@ async fn close_unknown_session_returns_session_not_found() {
     .await;
     assert_eq!(rpc_error_code(&resp), -32003);
     assert_eq!(
-        resp["error"]["data"]["session_id"].as_str(),
+        tool_error_data(&resp)["session_id"].as_str(),
         Some("0000000000000000"),
     );
 }
@@ -1317,7 +1532,7 @@ async fn journal_records_tools_call_pairs_and_skips_lifecycle() {
 }
 
 #[tokio::test]
-async fn journal_write_summary_clips_data_head_to_128_chars() {
+async fn journal_write_summary_records_size_without_payload() {
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     let path = tmp.path().to_path_buf();
     drop(tmp);
@@ -1328,8 +1543,8 @@ async fn journal_write_summary_clips_data_head_to_128_chars() {
         .await
         .expect("open");
 
-    // Build a `data` payload larger than JOURNAL_HEAD_CHARS but
-    // under MAX_WRITE_CHUNK so the call itself succeeds.
+    // Build a non-trivial `data` payload under MAX_WRITE_CHUNK so the call
+    // itself succeeds while the journal records only metadata.
     let big = "y".repeat(200);
     let _ = roundtrip(
         server,
@@ -1353,11 +1568,14 @@ async fn journal_write_summary_clips_data_head_to_128_chars() {
     assert_eq!(entries.len(), 2);
     let call_summary = &entries[0]["summary"];
     assert_eq!(call_summary["bytes"], 200, "byte count preserved");
-    let head = call_summary["head"].as_str().expect("head");
     assert_eq!(
-        head.chars().count(),
-        128,
-        "head must clip to JOURNAL_HEAD_CHARS",
+        call_summary.get("head"),
+        None,
+        "default journal must not store command/data payload heads",
+    );
+    assert!(
+        !call_summary.to_string().contains(&big),
+        "journal summary must not contain the payload"
     );
 }
 
@@ -1433,8 +1651,8 @@ async fn journal_open_result_uses_freshly_minted_session_id() {
     let sid = entries[1]["session_id"].as_str().expect("session_id");
     assert_eq!(
         sid.len(),
-        16,
-        "expected 16-char hex session_id, got {sid:?}"
+        32,
+        "expected 32-char hex session_id, got {sid:?}"
     );
     assert!(sid.chars().all(|c| c.is_ascii_hexdigit()));
 }
@@ -1505,9 +1723,9 @@ async fn double_close_returns_session_not_found() {
 /// they need them (LIFO order — most recently opened first).
 async fn open_n_sessions(sessions: &SessionManager<StubBackend>, n: usize) -> Vec<String> {
     let mut ids = Vec::with_capacity(n);
-    for _ in 0..n {
+    for idx in 0..n {
         let sid = sessions
-            .open("/dev/ttyUSB0", 115_200, 5_000)
+            .open(&format!("/dev/ttyUSB{idx}"), 115_200, 5_000)
             .await
             .expect("open OOB");
         ids.push(sid);
@@ -1747,15 +1965,15 @@ async fn close_racing_with_in_flight_read_has_deterministic_outcome() {
         "close result must report ok=true; got {close_resp}",
     );
 
-    // Post-race read: deterministic. Whether close or read_until
-    // finished first, the session id must be gone by now.
+    // Post-race read in the same batch is deterministic in safety terms:
+    // it must not perform I/O. Depending on dispatch ordering it may observe
+    // either Closing or the already-removed session.
     let post_read = responses.iter().find(|r| r["id"] == 13).unwrap();
-    assert_eq!(
-        rpc_error_code(post_read),
-        -32003,
-        "after close + read_until both settle, the session id must \
-         no longer be valid; got {post_read}",
+    assert!(
+        matches!(rpc_error_code(post_read), -32003 | -32004),
+        "read queued after close begins must fail without I/O; got {post_read}",
     );
+    assert_eq!(sessions.session_count(), 0);
 }
 
 #[tokio::test]

@@ -18,3 +18,4 @@ devices.toml
 
 # Coverage artifacts.
 *.profraw
+scratch/**

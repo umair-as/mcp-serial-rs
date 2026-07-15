@@ -1,88 +1,165 @@
-# MCP Serial Server Architecture (ESP32-C6 Focus)
+# MCP Serial Server Architecture
 
-This document captures the high-level architecture of `mcp-serial-rs` and its current target workflow around `/dev/ttyUSBx` for ESP32-C6 Zephyr bring-up/automation.
+`mcp-serial-rs` is a hardware-neutral MCP server for local serial-console
+access. It is intended for any allowlisted serial device path such as
+`/dev/ttyUSB*`, `/dev/ttyACM*`, or a deployment-specific override. The current
+server deliberately does not encode board-specific behavior into the protocol
+surface.
+
+Device profiles are optional local conveniences. They can name a known target,
+pin USB VID/PID/serial matching, and provide a default baud rate. The tools
+still operate on generic serial sessions.
 
 ## System Overview
 
 ```mermaid
 flowchart LR
-    A["MCP Client (Claude/Desktop/CLI)"] -->|MCP (JSON-RPC) over stdio| B["mcp-serial-rs Binary"]
+    A[MCP client] -->|stdio JSON-RPC| B[mcp-serial-rs]
 
-    subgraph S["MCP Server (Rust)"]
-      B --> C["main.rs\ntokio bootstrap; builds McpServer"]
-      C --> D["rmcp SDK\ninitialize / tools/list / tools/call framing"]
-      D --> E["mcp/mod.rs\nMcpServer: #[tool] handlers + journal hook"]
-      E --> F["serial.list_ports"]
-      E --> G["serial.open / close"]
-      E --> H["serial.write / read / read_until / exec"]
-      G --> I["serial/manager.rs\nSessionManager"]
-      H --> I
-      I --> J["serial/session.rs\nSession state + IO"]
-      J --> K["tokio-serial backend"]
-      H --> L["serial/parser.rs\nPattern matcher (regex)"]
-      E --> M["config.rs\nallowlist, limits, defaults"]
-      E --> N["errors.rs\ntyped errors -> JSON-RPC codes"]
-      E --> R["mcp/journal.rs + serial/journal.rs\ntool-call JSONL audit journal"]
+    subgraph S[MCP server process]
+        B --> C[main.rs]
+        C --> D[rmcp SDK]
+        D --> E[mcp/mod.rs tool handlers]
+        E --> F[serial list and open tools]
+        E --> G[serial IO tools]
+        F --> H[SessionManager]
+        G --> H
+        H --> I[Session state]
+        I --> J[tokio-serial backend]
+        G --> K[Pattern matcher]
+        E --> L[Config and allowlist]
+        E --> M[Structured tool errors]
+        E --> N[Audit journal]
     end
 
-    K --> O["/dev/ttyUSBx\nUSB-UART adapter"]
-    O --> P["ESP32-C6 (Zephyr app)"]
-
-    Q["tio /dev/ttyUSBx (today)"] -. direct serial terminal .- O
-    A -. replaces manual tio workflows with MCP tools .-> B
+    J --> O[USB serial adapter]
+    O --> P[Target serial console]
+    Q[Manual terminal fallback] -.-> O
 ```
 
-## Typical MCP Session
+The diagram intentionally avoids board names. The target may be a Linux console,
+an RTOS shell, a bootloader prompt, a modem, an MCU monitor, or another serial
+endpoint.
+
+## Tool Boundary
+
+The MCP adapter owns protocol concerns:
+
+- lifecycle and `tools/list`/`tools/call` dispatch via `rmcp`;
+- tool input and output schemas;
+- tool annotations;
+- conversion of serial-domain failures into MCP tool errors;
+- audit-journal summaries.
+
+The serial domain owns hardware behavior:
+
+- session lifecycle;
+- allowlist enforcement;
+- port opening and close semantics;
+- per-session locking;
+- reads, writes, drains, and atomic exec;
+- regex matching over accumulated serial output.
+
+## Typical Session
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Client as MCP Client
-    participant Server as mcp-serial-rs
-    participant Sess as SessionManager
-    participant UART as /dev/ttyUSBx
-    participant ESP as ESP32-C6 (Zephyr)
+    participant Client
+    participant Server
+    participant Sessions
+    participant Port
+    participant Target
 
     Client->>Server: initialize
-    Server-->>Client: result {serverInfo, capabilities, protocolVersion}
+    Server-->>Client: server info and capabilities
     Client->>Server: notifications/initialized
 
     Client->>Server: tools/list
-    Server-->>Client: result {tools: [serial.* + inputSchema]}
+    Server-->>Client: tool schemas and annotations
 
-    Client->>Server: tools/call serial.open {port:"/dev/ttyUSBx", baud:115200}
-    Server->>Sess: create session + validate allowlist
-    Sess->>UART: open
-    UART->>ESP: UART link up
-    Server-->>Client: result.structuredContent {session_id}
+    Client->>Server: serial.open
+    Server->>Sessions: create session
+    Sessions->>Port: open allowlisted path
+    Port->>Target: serial link active
+    Server-->>Client: session_id
 
-    Client->>Server: tools/call serial.write {session_id, data:"help\\r\\n"}
-    Server->>UART: write bytes
-    UART->>ESP: command
-    Server-->>Client: result.structuredContent {bytes_written}
+    Client->>Server: serial.exec
+    Server->>Sessions: lock session
+    Sessions->>Port: optional clear, write, flush, read
+    Target-->>Port: raw console output
+    Port-->>Sessions: bytes
+    Sessions-->>Server: exec outcome
+    Server-->>Client: structured result
 
-    Client->>Server: tools/call serial.read_until {session_id, pattern:"READY|OK", timeout_ms:5000}
-    ESP->>UART: console output
-    UART->>Server: stream bytes
-    Server->>Server: regex match in parser
-    Server-->>Client: result.structuredContent {data, matched:true}
-
-    Client->>Server: tools/call serial.close {session_id}
-    Server->>Sess: close + remove session
-    Server-->>Client: result.structuredContent {ok:true}
+    Client->>Server: serial.close
+    Server->>Sessions: remove session
+    Server-->>Client: closed
 ```
 
-## Scope For Current Implementation
+`serial.exec` is a single manager-level operation. It holds the per-session port
+lock across optional input clearing, command write, flush, and read-until. This
+prevents another same-session request from consuming or injecting bytes between
+a command and its expected response.
 
-- Primary hardware path: ESP32-C6 over `/dev/ttyUSBx`.
-- Primary objective: replace ad-hoc `tio` manual interaction with MCP-tool-driven, automatable serial workflows.
-- MCP lifecycle (`initialize`, `tools/list`, `notifications/initialized`) and
-  `tools/call` dispatch are handled by the `rmcp` SDK.
-- Tools exposed via `tools/call`:
+## Current Tool Surface
+
+The current server exposes these tools:
+
 - `serial.list_ports`
 - `serial.open`
+- `serial.sessions`
+- `serial.get_session`
 - `serial.write`
 - `serial.read`
+- `serial.drain`
+- `serial.clear_input`
 - `serial.read_until`
 - `serial.exec`
 - `serial.close`
+
+All tools are advertised through `tools/list` with input schemas, output
+schemas, descriptions, and annotations. The tool list is static.
+
+## Error Model
+
+JSON-RPC protocol errors are reserved for MCP framing, dispatch, unknown
+methods/tools, and SDK deserialization failures.
+
+Serial-domain failures inside a dispatched tool are MCP tool errors:
+
+- the JSON-RPC response has a `result`;
+- `result.isError` is `true`;
+- `result.structuredContent.error` contains recovery fields such as error type,
+  code, retryability, session id, whether a command was written, whether bytes
+  were consumed, and whether the session remains usable.
+
+## Raw Output Model
+
+Serial output is untrusted device data. Tool results preserve raw lossy-UTF-8
+output, including:
+
+- command echo;
+- prompts;
+- CRLF line endings;
+- line wrapping;
+- ANSI escapes;
+- OSC shell-integration sequences.
+
+Normalization is explicit and additive. It may add a normalized field, but it
+must not replace raw output.
+
+## Out of Scope
+
+This server should remain a reliable serial-console capability. It should not
+become a full HIL orchestrator. Keep these as separate systems or future
+composed MCP servers:
+
+- power switching;
+- programmable PSU control;
+- relay control;
+- firmware flashing;
+- SSH;
+- test scheduling;
+- artifact management;
+- board reservation.
