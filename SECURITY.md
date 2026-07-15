@@ -40,6 +40,11 @@ Out of scope (must be stated to users):
 ### 3) Resource limits and anti-DoS
 
 - Clamp timeouts to configured max.
+- Include per-session lock wait, write, flush, and read phases in operation
+  deadlines where the tool exposes a timeout.
+- Propagate MCP cancellation into serial read loops and cancellable
+  lock/write/flush phases; cancellation during ambiguous I/O reports
+  conservative side-effect metadata.
 - Cap read buffer and write chunk sizes.
 - Limit concurrent sessions.
 - Bound regex pattern size/complexity for `read_until` to avoid pathological behavior.
@@ -47,14 +52,33 @@ Out of scope (must be stated to users):
 ### 4) Data handling and leak prevention
 
 - Do not log raw serial payload by default.
+- Do not log command text, serial output, regex/error text, or unknown-tool
+  argument bodies by default.
 - Keep logs on stderr only; stdout is JSON-RPC only.
 - Redact known sensitive patterns in errors/logging where feasible.
 - Avoid embedding host-specific absolute paths in docs/examples/responses.
+- Preserve serial console output as lossy UTF-8 tool-result text when requested
+  by the client; terminal controls and command echoes are untrusted device
+  data, not logs.
+- Store the default audit journal in a user-private state directory, not a
+  shared `/tmp` path. On Unix, create the parent directory `0700` and file
+  `0600`, reject final-component symlinks, and reject non-regular journal
+  files. Journal I/O must have bounded lock/write/flush deadlines.
 
 ### 5) Session lifecycle safety
 
 - Generate unguessable session IDs.
+- Session IDs are 128-bit OS-random lowercase hex strings.
 - Enforce valid state transitions.
+- Reserve exact port paths across Opening, Ready, and Closing states so one
+  server process cannot assign the same configured path to two sessions.
+- Keep compound `serial.exec` atomic under one per-session lock so a
+  privileged shell response cannot be consumed by the wrong request.
+- `serial.close` must mark the session Closing and wait for the per-session
+  port lock before returning, so checked-out operations cannot perform I/O
+  after close has completed.
+- Tool errors must state whether a write occurred, whether bytes were
+  consumed, and whether the session remains usable.
 - Ensure cleanup on EOF/error/panic paths so ports are closed and sessions removed.
 
 ### 6) Prompt injection guardrails (consumer guidance)
@@ -66,6 +90,22 @@ Out of scope (must be stated to users):
   - Require explicit user confirmation before sensitive actions.
 
 ## CI / Release Gates
+
+## Recommended Deployment Hardening
+
+For shared benches or CI hosts, run the server as a dedicated unprivileged user
+with only the required serial-device group or udev access. Do not run as root.
+Prefer a private state directory for the audit journal and keep stdout reserved
+for MCP JSON-RPC only.
+
+For systemd deployments, consider hardening such as:
+
+- `PrivateTmp=yes`;
+- `ProtectSystem=strict`;
+- `ProtectHome=yes`;
+- `NoNewPrivileges=yes`;
+- `DeviceAllow=` narrowed to expected TTY devices where practical;
+- no network access unless a wrapper explicitly requires it.
 
 Required before release:
 

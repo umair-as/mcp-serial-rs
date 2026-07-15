@@ -45,6 +45,9 @@ pub enum SerialError {
 
     #[error("device '{device}' not found in profiles or not currently connected")]
     DeviceNotFound { device: String },
+
+    #[error("operation cancelled")]
+    Cancelled,
 }
 
 impl SerialError {
@@ -62,6 +65,7 @@ impl SerialError {
             SerialError::InvalidParam { .. } => -32008,
             SerialError::DeviceNotFound { .. } => -32009,
             SerialError::PortBusy { .. } => -32010,
+            SerialError::Cancelled => -32011,
         }
     }
 
@@ -84,7 +88,35 @@ impl SerialError {
             SerialError::MaxSessionsReached { max } => json!({ "max": max }),
             SerialError::InvalidParam { name, reason } => json!({ "name": name, "reason": reason }),
             SerialError::DeviceNotFound { device } => json!({ "device": device }),
+            SerialError::Cancelled => json!({}),
         }
+    }
+
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            SerialError::PortNotAllowed { .. } => "port_not_allowed",
+            SerialError::PortNotFound { .. } => "port_not_found",
+            SerialError::PortBusy { .. } => "port_busy",
+            SerialError::SessionNotFound { .. } => "unknown_session",
+            SerialError::InvalidState { .. } => "invalid_session_state",
+            SerialError::Timeout { .. } => "timeout",
+            SerialError::Io { .. } => "io_error",
+            SerialError::MaxSessionsReached { .. } => "max_sessions_reached",
+            SerialError::InvalidParam { .. } => "invalid_parameter",
+            SerialError::DeviceNotFound { .. } => "device_not_found",
+            SerialError::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn retryable(&self) -> bool {
+        matches!(
+            self,
+            SerialError::PortBusy { .. }
+                | SerialError::PortNotFound { .. }
+                | SerialError::DeviceNotFound { .. }
+                | SerialError::Io { .. }
+                | SerialError::Cancelled
+        )
     }
 }
 

@@ -32,11 +32,13 @@ impl SessionState {
     }
 }
 
-/// A single serial session. `id` is a 16-char lowercase hex string derived
-/// from a random `u64`; see `SessionManager::next_id`.
+/// A single serial session. `id` is a random lowercase hex string; see
+/// `SessionManager::next_session_id`.
 pub struct Session<P> {
     pub id: String,
     pub state: SessionState,
+    pub port_path: String,
+    pub baud: u32,
     /// Some(port) iff `state == Ready`. `Arc<Mutex<P>>` so concurrent
     /// `serial.write` / `serial.read` calls on the same session serialise
     /// while leaving the manager-wide lock unheld during I/O.
@@ -50,10 +52,12 @@ impl<P> Session<P> {
     /// Construct a placeholder in `Opening`. The manager reserves the slot
     /// under lock before awaiting `SerialBackend::open` so the `MAX_SESSIONS`
     /// cap is enforced even across the await point.
-    pub fn opening(id: String, default_timeout_ms: u64) -> Self {
+    pub fn opening(id: String, port_path: String, baud: u32, default_timeout_ms: u64) -> Self {
         Self {
             id,
             state: SessionState::Opening,
+            port_path,
+            baud,
             port: None,
             default_timeout_ms,
         }
@@ -86,6 +90,15 @@ impl<P> Session<P> {
     pub fn finish_close(&mut self) {
         debug_assert!(matches!(self.state, SessionState::Closing));
         self.state = SessionState::Closed;
+    }
+
+    /// Roll back `Closing → Ready` when close could not acquire the port lock.
+    /// The manager is the only caller and passes back the same checked-out port
+    /// handle that `begin_close` removed.
+    pub fn restore_ready(&mut self, port: Arc<AsyncMutex<P>>) {
+        debug_assert!(matches!(self.state, SessionState::Closing));
+        self.state = SessionState::Ready;
+        self.port = Some(port);
     }
 
     pub fn is_ready(&self) -> bool {

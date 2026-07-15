@@ -32,6 +32,13 @@ pub struct PatternMatcher {
     max_buffer: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchDetails {
+    pub text: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
 impl PatternMatcher {
     /// Compile `pattern` and start with an empty buffer of capacity
     /// [`config::MAX_READ_BUFFER`]. An empty pattern is rejected — it would
@@ -83,8 +90,16 @@ impl PatternMatcher {
 
     /// Re-evaluate the pattern against the current buffer without pushing.
     pub fn is_match(&self) -> bool {
+        self.match_details().is_some()
+    }
+
+    pub fn match_details(&self) -> Option<MatchDetails> {
         let text = String::from_utf8_lossy(self.live());
-        self.regex.is_match(&text)
+        self.regex.find(&text).map(|m| MatchDetails {
+            text: m.as_str().to_string(),
+            start_byte: m.start(),
+            end_byte: m.end(),
+        })
     }
 
     pub fn buffer(&self) -> &[u8] {

@@ -1,5 +1,11 @@
 # mcp-serial-rs
 
+[![CI](https://github.com/umair-as/mcp-serial-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/umair-as/mcp-serial-rs/actions/workflows/ci.yml)
+![Rust MSRV](https://img.shields.io/badge/rust-1.85%2B-orange)
+![MCP](https://img.shields.io/badge/MCP-2025--11--25-blue)
+![Transport](https://img.shields.io/badge/transport-stdio-lightgrey)
+![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)
+
 An MCP server that exposes a curated set of serial-port operations over stdio.
 Built on the [`rmcp`](https://crates.io/crates/rmcp) SDK: it speaks the Model
 Context Protocol — `initialize`, `tools/list`, `tools/call` — with one JSON-RPC
@@ -9,9 +15,8 @@ writing console commands, scraping output until a regex matches, all from a
 tokio-async backend with per-session isolation and an allowlist that keeps
 stray paths out.
 
-An example downstream target is an ESP32-C6 Zephyr DFU board, but the
-server itself is hardware-agnostic — any USB-serial device matching the
-allowlist works.
+The server is hardware-agnostic: any USB-serial device matching the allowlist
+can be exposed as a bounded MCP serial-console session.
 
 ## Build
 
@@ -27,6 +32,16 @@ dependency rationale. The protocol layer is the `rmcp` SDK over its
 stdio transport; this crate owns the serial domain (sessions, the
 device-profile registry, the allowlist, the audit journal) and
 registers the `serial.*` tools with the SDK.
+
+## Migration notes
+
+`0.2.0` contains wire-visible changes from the original prototype:
+session IDs are now opaque 32-character random hex strings, serial-domain
+failures inside `tools/call` are MCP tool errors (`isError=true`) instead of
+JSON-RPC protocol errors, output schemas are object-root schemas that include
+the structured tool-error shape, duplicate opens for the same configured path
+return `PortBusy`, and the default journal is metadata-only. Regenerate strict client types from
+`tools/list` and branch on `result.isError` for tool execution failures.
 
 ## Quick start
 
@@ -59,7 +74,7 @@ With four boards attached and `devices.toml` from this repo, the
       "ports": [
         {"port":"/dev/ttyUSBx","vid":4292,"pid":60000,
          "serial":"AABBCCDD00001111",
-         "device":"esp32c6","description":"ESP32-C6 Zephyr DFU target (CP2102N)"},
+         "device":"lab-node","description":"Lab device console (CP2102N)"},
         {"port":"/dev/ttyACM0","vid":6790,"pid":21971,"serial":"EXAMPLE001",
          "device":"rpi5","description":"Raspberry Pi 5 debug UART (WCH CH340)"},
         {"port":"/dev/ttyUSB0","vid":4292,"pid":60000,"serial":"0001",
@@ -74,38 +89,57 @@ With four boards attached and `devices.toml` from this repo, the
 
 ## Tool reference
 
-All seven tools are invoked via `tools/call` (`{"name": "<tool>", "arguments":
+All tools are invoked via `tools/call` (`{"name": "<tool>", "arguments":
 {...}}`) and advertised by `tools/list` under their dotted names. The `rmcp`
-SDK generates each tool's input schema (`additionalProperties: false` — unknown
-arguments are rejected) from the typed parameter struct.
+SDK generates input and output schemas from typed Rust structs.
 
 | Tool | Arguments | `structuredContent` |
 |---|---|---|
-| `serial.list_ports` | — | `{ports: [{port, vid, pid, serial, device, description}]}` (latter two `null` when no profile matches) |
-| `serial.open` | `{port, baud?, timeout_ms?}` **or** `{device, baud?, timeout_ms?}` | `{session_id}` (16-char hex) |
+| `serial.list_ports` | — | `{ports: [{port, vid, pid, serial, device, description}]}` |
+| `serial.open` | `{port, baud?, timeout_ms?}` **or** `{device, baud?, timeout_ms?}` | `{session_id}` (32-char random hex) |
+| `serial.sessions` | — | `{sessions: [{session_id, port, baud, state, default_timeout_ms}]}` |
+| `serial.get_session` | `{session_id}` | `{session}` |
 | `serial.write` | `{session_id, data}` (≤ 4 KiB) | `{bytes_written}` |
-| `serial.read` | `{session_id, max_bytes?, timeout_ms?}` | `{data}` (UTF-8 lossy) |
-| `serial.read_until` | `{session_id, pattern, timeout_ms?}` | `{data, matched}` (`matched=false` on timeout or EOF) |
-| `serial.exec` | `{session_id, command, expect, timeout_ms?}` | `{output, ok}` (compound write + read_until) |
+| `serial.read` | `{session_id, max_bytes?, timeout_ms?}` | `{data, status, timed_out, bytes_read, truncated, session_usable, output_is_untrusted}` |
+| `serial.drain` | `{session_id, max_bytes?}` | same shape as `serial.read`, with a short idle deadline |
+| `serial.clear_input` | `{session_id, max_bytes?}` | `{status, bytes_read, discarded_bytes, truncated, session_usable}` |
+| `serial.read_until` | `{session_id, pattern, timeout_ms?}` | `{data, matched, status, bytes_read, truncated, match_details?, session_usable, output_is_untrusted}` |
+| `serial.exec` | `{session_id, command, expect, timeout_ms?, clear_before_write?, normalize_output?}` | rich exec result including `status`, `raw_output`, optional `normalized_output`, byte counts, match details, and `command_written` |
 | `serial.close` | `{session_id}` | `{ok}` |
 
 `serial.open` accepts either a literal `port` path or a `device` profile name
 — never both. The profile's `baud` is the default; pass an explicit `baud`
 to override. Unknown device names return `DeviceNotFound` (`-32009`) before
-any system call.
+any system call. A path already reserved by an Opening, Ready, or Closing
+session returns `PortBusy` (`-32010`); the production backend also requests
+exclusive OS access as defense in depth.
 
-Domain validation failures detected by the tool handlers — unknown session,
-disallowed port, unknown device, malformed regex, oversized write, supplying
-both `port` and `device` — surface as JSON-RPC errors with project-defined
-codes in the server range (`-32001` … `-32009`) plus a structured `error.data`
-payload, so clients can branch without parsing messages. Argument failures
-caught earlier, by the SDK's input-schema / parameter deserialization (wrong
-JSON types, unknown fields), surface as standard `rmcp`/JSON-RPC errors —
-typically `-32602` — and do not necessarily carry a project `error.data`.
+Domain validation and serial failures detected inside a tool call — unknown
+session, disallowed port, unknown device, malformed regex, oversized write,
+supplying both `port` and `device` — return a normal JSON-RPC result whose
+MCP `CallToolResult` has `isError: true`. The structured error is under
+`result.structuredContent.error` with a stable `type`, numeric `code`,
+`data`, `retryable`, `command_written`, `bytes_consumed`, and
+`session_usable`. JSON-RPC protocol errors are reserved for invalid MCP
+framing, unknown methods/tools, and SDK-level parameter deserialization
+failures such as wrong JSON types or unknown fields.
 
 Runtime outcomes are **not** errors: a `serial.read_until` that times out
 returns a successful tool result with `matched=false` and the partial buffer;
-a `serial.exec` timeout returns `ok=false` with partial `output`.
+a `serial.exec` timeout returns `status="timed_out"`, `ok=false`, and partial
+raw output.
+
+Deadline exhaustion before a result can be formed is a tool execution error:
+waiting for the per-session lock, writing, or flushing can return `isError:
+true` with the configured `timeout_ms` and conservative side-effect metadata.
+
+Serial output is preserved as lossy UTF-8 console text, including command echo,
+prompts, wrapping, CRLF, ANSI escapes, and OSC shell-integration sequences.
+Invalid UTF-8 bytes are represented by replacement characters; this is not a
+binary transport. An allowlisted path can open directly onto an interactive
+(and possibly privileged) device shell, so treat all device output as untrusted
+data, never as instructions. `normalize_output=true` on `serial.exec` adds a
+best-effort normalized copy; it never replaces `raw_output`.
 
 ## Device profiles (`devices.toml`)
 
@@ -137,7 +171,7 @@ or disambiguate via `/dev/serial/by-path` and hard-code the port path.
 |---|---|---|
 | `MCP_SERIAL_DEVICES` | Path to the device-profile TOML file | `./devices.toml` |
 | `MCP_SERIAL_ALLOWLIST` | Comma-separated glob patterns of openable device paths. When set, replaces the compiled-in list entirely. | unset → `/dev/ttyUSB*,/dev/ttyACM*` |
-| `MCP_SERIAL_JOURNAL` | Append-only JSONL audit journal path (see below) | `/tmp/mcp-serial-journal.jsonl` |
+| `MCP_SERIAL_JOURNAL` | Append-only JSONL audit journal path (see below) | `$XDG_STATE_HOME/mcp-serial-rs/audit.jsonl`, else `~/.local/state/mcp-serial-rs/audit.jsonl` |
 | `RUST_LOG` | `tracing-subscriber` filter, e.g. `mcp_serial_rs=debug` | `mcp_serial_rs=info` |
 
 The compile-time allowlist is `/dev/ttyUSB*` and `/dev/ttyACM*` — Linux USB
@@ -157,60 +191,58 @@ Other compile-time limits live in `src/config.rs`:
 
 The server keeps an always-on, append-only JSONL audit journal at
 `MCP_SERIAL_JOURNAL`. It is a **tool-call journal**: every `tools/call`
-appends a `call` row and, once a result is produced, a `result` row. Large
-`data` fields are summarised and truncated. Lifecycle traffic (`initialize`,
+appends a `call` row and, once a result is produced, a `result` row. Lifecycle
+traffic (`initialize`,
 `tools/list`, `notifications/initialized`) is **not** journaled — it stays
 visible through `tracing` logs on stderr. If the journal path cannot be
 opened the server logs a warning and continues in degraded mode (no
-journaling); it never blocks startup or tool dispatch.
+journaling). Journal lock, write, and flush operations have short deadlines so
+auditing cannot indefinitely block tool dispatch. On Unix, the default
+parent directory is created `0700` and the journal file `0600`. Final-component
+symlinks and non-regular journal files are rejected on Unix.
 
-The journal stores **summaries, not full bodies**. Each `direction:call` row
-carries the *input* (args / written `data` head / `command` head); the
-matching `direction:result` row carries the *outcome* (`bytes_written`,
-`session_id`, `matched`, `exec_ok`, `bytes`, `head` of read data,
-`output_head`). Large free-form fields are clipped to the first 128
-characters (`JOURNAL_HEAD_CHARS`); the full byte length is preserved
-alongside in a sibling field (e.g. `bytes`, `output_bytes`). This keeps
-the audit trail bounded on resource-constrained gateways — the journal is
-designed for *who called what, when, with what shape, and what came back
-qualitatively*, not for byte-perfect replay. To capture full transcripts,
-drive the server from a client that records them.
+The journal stores **metadata-only summaries, not payload bodies**. Call rows
+record bounded argument-key lists plus byte counts for large fields such as
+`data`, `command`, and `expect`; result rows record status, byte counts,
+matching state, error code/type, and write/consume indicators. Command text,
+serial output, error messages, and unknown-tool argument bodies are not written by default.
+This keeps the audit trail bounded on resource-constrained gateways and avoids
+recording credentials typed into a privileged serial shell. To capture full
+transcripts, drive the server from a client that records them.
 
-`head` and `output_head` carry the raw bytes from the serial wire,
-including `\r\n` line endings (serial consoles emit CRLF — that's the
-faithful representation, not garbled output). Tail the journal in a
-readable form with:
+Tail the journal in a readable form with:
 
 ```sh
-tail -F "${MCP_SERIAL_JOURNAL:-/tmp/mcp-serial-journal.jsonl}" \
+tail -F "${MCP_SERIAL_JOURNAL:-${XDG_STATE_HOME:-$HOME/.local/state}/mcp-serial-rs/audit.jsonl}" \
   | jq -r '"[\(.ts) \(.direction) \(.tool) sid=\(.session_id[0:8])] " +
-           (.summary.head // .summary.output_head // .summary.command_head // (.summary | tostring))'
+           (.summary | tostring)'
 ```
 
-That renders `\r\n` as real newlines for the eyeball while leaving the
-on-disk JSONL byte-faithful. Drop the `jq` filter for raw JSONL access
-when feeding the journal to other tools.
+Drop the `jq` filter for raw JSONL access when feeding the journal to other
+tools.
 
-## Hardware smoke test (ESP32-C6 Zephyr)
+## Hardware smoke test
 
-End-to-end against a real ESP32-C6 board running a Zephyr crypto KAT
-firmware. Using the named-device path so the test survives `/dev/ttyUSB*`
-numbering shifts across reboots:
+End-to-end against a real serial-attached target. Using the named-device path
+keeps the test stable when `/dev/ttyUSB*` numbering shifts across reboots. This
+example uses a shell-like target and `serial.exec`, which preserves raw output
+while reporting whether the command was written and whether the expected prompt
+was observed:
 
 ```sh
 ./target/release/mcp-serial-rs <<'EOF'
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"smoke","version":"0.1.0"}}}
 {"jsonrpc":"2.0","method":"notifications/initialized"}
-{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"serial.open","arguments":{"device":"esp32c6","timeout_ms":2000}}}
-{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"serial.write","arguments":{"session_id":"<from-#2>","data":"crypto kat\n"}}}
-{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"serial.read_until","arguments":{"session_id":"<from-#2>","pattern":"ALL KATS PASSED","timeout_ms":8000}}}
-{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"serial.close","arguments":{"session_id":"<from-#2>"}}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"serial.open","arguments":{"device":"rpi5","timeout_ms":2000}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"serial.exec","arguments":{"session_id":"<from-#2>","command":"uname -a\n","expect":"[#>$] ","timeout_ms":8000,"clear_before_write":true,"normalize_output":true}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"serial.close","arguments":{"session_id":"<from-#2>"}}}
 EOF
 ```
 
 The `session_id` comes from request #2's `result.structuredContent.session_id`.
-Expect `result.structuredContent.matched: true` on request 4 with the full
-console transcript in `data`. Drive this from any MCP client — `rmcp`
+Expect request 3 to return `status`, `ok`, `raw_output`, `bytes_written`,
+`bytes_read`, `command_written`, `match_details`, and `session_usable`. Drive
+this from any MCP client — `rmcp`
 dispatches `tools/call` requests concurrently, so calls on independent
 sessions run in parallel; calls on the same session serialise through the
 per-port mutex.
@@ -218,7 +250,7 @@ per-port mutex.
 ## Tests
 
 ```sh
-cargo test                          # 113 total: 73 unit + 39 integration + 1 loopback
+cargo test                          # 132 total: 85 lib unit + 3 CLI + 43 MCP wire + 1 loopback
 cargo test --test loopback          # PTY round-trip — needs `socat`
 ```
 
@@ -235,13 +267,17 @@ Architecture diagrams live in `docs/mcp-serial-architecture.md`. The `rmcp`
 migration that produced the current protocol layer is recorded in
 `docs/archive/rmcp-migration-spec.md`.
 
+Agent-consumer guidance lives in `AGENTS.md`. MCP conformance dispositions are
+tracked in `docs/mcp-conformance-findings.md`, and significant design decisions
+are recorded under `docs/adr/`.
+
 ## Status
 
 The `serial.*` MVP and the `rmcp` SDK adoption are complete:
 
 - MCP lifecycle (`initialize`, `tools/list`, `notifications/initialized`) and
   `tools/call` dispatch handled by the `rmcp` SDK over stdio.
-- All seven `serial.*` tools, with `rmcp`-generated input schemas and
+- The `serial.*` tool set, with `rmcp`-generated input/output schemas and
   structured tool results.
 - Device profiles and named-device open.
 - Allowlist + timeout clamping + session cap.
@@ -252,7 +288,7 @@ Deferred (not implemented):
 
 - `serial.reset_esp32` — DTR/RTS toggle for hard reset / bootloader entry.
 - `serial.capture_start` / `serial.capture_stop` — tee session bytes to a log file.
-- Per-tool output schemas (input schemas are generated; output schemas are not).
+- MCP resources/prompts/progress beyond the current tools-only surface.
 
 ## License
 
