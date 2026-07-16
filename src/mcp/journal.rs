@@ -99,9 +99,12 @@ pub fn result_session_id(
 pub fn call_summary(tool: &str, args: &Value) -> Value {
     match tool {
         "serial.open" => json!({
-            // `write_policy` is a bounded enum string (allow/confirm/deny) —
-            // safe metadata, no payload. Records the requested policy for audit.
-            "write_policy": args.get("write_policy"),
+            // Records the requested `write_policy` for audit. `call_summary`
+            // runs on *unvalidated* args (before deserialization), so this is
+            // attacker-controlled and may not be a valid enum — clip it to a
+            // bounded string like every other field so a huge value can't bloat
+            // the row (or, past the 16 KiB row cap, drop it from the journal).
+            "write_policy": args.get("write_policy").and_then(Value::as_str).map(clipped),
             "arg_keys": object_keys(args),
         }),
         "serial.write" => json!({
@@ -227,6 +230,25 @@ mod tests {
         assert!(summary.get("head").is_none());
         assert!(!summary.to_string().contains(&big));
         assert!(summary.to_string().len() < big.len());
+    }
+
+    #[test]
+    fn open_call_summary_clips_write_policy() {
+        // `call_summary` runs before arg deserialization, so `write_policy` is
+        // unvalidated and attacker-controlled. It must be clipped like every
+        // other field — never passed through verbatim (which could bloat the
+        // row past the 16 KiB cap and drop the audit record).
+        let big = "z".repeat(50_000);
+        let args = json!({"port": "/dev/ttyUSB0", "write_policy": big.clone()});
+        let summary = call_summary("serial.open", &args);
+        assert_eq!(
+            summary["write_policy"].as_str().unwrap().chars().count(),
+            MAX_JOURNAL_FIELD_CHARS,
+        );
+        assert!(!summary.to_string().contains(&big));
+        // A non-string value coerces to null rather than passing through.
+        let odd = json!({"port": "/dev/ttyUSB0", "write_policy": {"nested": "x"}});
+        assert!(call_summary("serial.open", &odd)["write_policy"].is_null());
     }
 
     #[test]

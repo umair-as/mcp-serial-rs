@@ -1089,6 +1089,71 @@ async fn exec_denied_on_read_only_session_writes_no_command() {
 }
 
 #[tokio::test]
+async fn exec_confirm_required_without_confirm() {
+    let (server, session_id, mut device) =
+        server_with_open_session_policy(WritePolicy::Confirm).await;
+    let resp = handshake_then_call(
+        server,
+        "serial.exec",
+        json!({"session_id": session_id, "command": "ls\n", "expect": "\\$"}),
+    )
+    .await;
+    assert_eq!(
+        rpc_error_code(&resp),
+        -32013,
+        "exec confirm w/o confirm → -32013; got {resp}"
+    );
+    let error = &resp["result"]["structuredContent"]["error"];
+    assert_eq!(error["type"], "confirmation_required");
+    assert_eq!(error["command_written"], false);
+    assert_device_untouched(&mut device).await;
+}
+
+#[tokio::test]
+async fn exec_confirm_with_confirm_true_writes_command() {
+    // Confirmed exec proceeds to the write phase (then times out waiting for
+    // `expect`, which is a normal outcome). What we assert is that the command
+    // reached the device — i.e. the gate let it through.
+    let (server, session_id, mut device) =
+        server_with_open_session_policy(WritePolicy::Confirm).await;
+    let resp = handshake_then_call(
+        server,
+        "serial.exec",
+        json!({
+            "session_id": session_id,
+            "command": "probe\n",
+            "expect": "NEVER_MATCHES",
+            "timeout_ms": 200,
+            "confirm": true,
+        }),
+    )
+    .await;
+    let result = resp.get("result").expect("tools/call result");
+    assert_ne!(
+        result.get("isError"),
+        Some(&json!(true)),
+        "confirmed exec must not be gated; got {resp}"
+    );
+    let sc = &result["structuredContent"];
+    assert_eq!(
+        sc["command_written"], true,
+        "the command reached the device"
+    );
+    assert_eq!(
+        sc["status"], "timed_out",
+        "no match within the deadline is a normal outcome"
+    );
+    // The command bytes actually crossed the duplex.
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; b"probe\n".len()];
+    timeout(Duration::from_secs(2), device.read_exact(&mut buf))
+        .await
+        .expect("read timeout")
+        .expect("read");
+    assert_eq!(buf, b"probe\n");
+}
+
+#[tokio::test]
 async fn write_confirm_required_without_confirm() {
     let (server, session_id, mut device) =
         server_with_open_session_policy(WritePolicy::Confirm).await;
