@@ -694,6 +694,16 @@ fn tool_error(
     command_written: bool,
     bytes_consumed: bool,
 ) -> CallToolResult {
+    // Invariant: `session_usable => session_id present`. A failure with no
+    // session id (e.g. open-time InvalidParam / PortBusy / DeviceNotFound)
+    // never created a session, so it can never be "usable".
+    let session_usable = session_id.is_some()
+        && !matches!(
+            err,
+            SerialError::SessionNotFound { .. }
+                | SerialError::InvalidState { .. }
+                | SerialError::Io { .. }
+        );
     CallToolResult::structured_error(
         serde_json::to_value(ToolErrorResult {
             error: ToolErrorBody {
@@ -705,12 +715,7 @@ fn tool_error(
                 session_id,
                 command_written,
                 bytes_consumed,
-                session_usable: !matches!(
-                    err,
-                    SerialError::SessionNotFound { .. }
-                        | SerialError::InvalidState { .. }
-                        | SerialError::Io { .. }
-                ),
+                session_usable,
             },
         })
         .expect("tool error must serialize"),
@@ -1000,5 +1005,75 @@ impl<B: SerialBackend> ServerHandler for McpServer<B> {
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info = Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         info
+    }
+}
+
+#[cfg(test)]
+mod tool_error_tests {
+    use super::tool_error;
+    use crate::errors::SerialError;
+
+    /// Extract `error.session_usable` from a `tool_error` result.
+    fn session_usable(err: SerialError, session_id: Option<String>) -> bool {
+        let result = tool_error(err, session_id, false, false);
+        assert_eq!(result.is_error, Some(true), "tool_error must set isError");
+        result
+            .structured_content
+            .expect("structured error content")
+            .get("error")
+            .and_then(|e| e.get("session_usable"))
+            .and_then(|v| v.as_bool())
+            .expect("session_usable bool")
+    }
+
+    // Invariant: `session_usable => session_id present`. Open-time failures
+    // carry no session id and must never claim the session is usable.
+    #[test]
+    fn open_invalid_param_without_session_is_not_usable() {
+        assert!(!session_usable(
+            SerialError::InvalidParam {
+                name: "port/device".into(),
+                reason: "specify one".into(),
+            },
+            None,
+        ));
+    }
+
+    #[test]
+    fn port_busy_without_session_is_not_usable() {
+        assert!(!session_usable(
+            SerialError::PortBusy {
+                port: "/dev/ttyUSB0".into(),
+            },
+            None,
+        ));
+    }
+
+    #[test]
+    fn device_not_found_without_session_is_not_usable() {
+        assert!(!session_usable(
+            SerialError::DeviceNotFound {
+                device: "unknown".into(),
+            },
+            None,
+        ));
+    }
+
+    #[test]
+    fn recoverable_op_error_with_session_stays_usable() {
+        assert!(session_usable(
+            SerialError::Timeout { timeout_ms: 1_000 },
+            Some("0123456789abcdef0123456789abcdef".into()),
+        ));
+    }
+
+    #[test]
+    fn session_not_found_with_session_is_unusable() {
+        assert!(!session_usable(
+            SerialError::SessionNotFound {
+                session_id: "sid".into(),
+            },
+            Some("sid".into()),
+        ));
     }
 }

@@ -93,7 +93,8 @@ where
     W: std::io::Write,
     E: std::io::Write,
 {
-    let mut exit_code = None;
+    let mut saw_info = false;
+    let mut saw_unknown = false;
     for arg in args {
         match arg.as_ref() {
             "--version" | "-V" => {
@@ -103,7 +104,7 @@ where
                     env!("CARGO_PKG_NAME"),
                     env!("CARGO_PKG_VERSION")
                 )?;
-                exit_code = Some(0);
+                saw_info = true;
             }
             "--help" | "-h" => {
                 writeln!(
@@ -113,15 +114,24 @@ where
                     env!("CARGO_PKG_VERSION"),
                     env!("CARGO_PKG_NAME"),
                 )?;
-                exit_code = Some(0);
+                saw_info = true;
             }
             other => {
                 writeln!(stderr, "unknown argument: {other}")?;
-                exit_code = Some(2);
+                saw_unknown = true;
             }
         }
     }
-    Ok(exit_code)
+    // An unknown argument is a usage error (exit 2) regardless of position and
+    // must not be cleared by a later --help/--version. Recognized flags alone
+    // exit 0; no flags returns None so the caller starts the MCP server.
+    Ok(if saw_unknown {
+        Some(2)
+    } else if saw_info {
+        Some(0)
+    } else {
+        None
+    })
 }
 
 #[cfg(test)]
@@ -164,5 +174,33 @@ mod tests {
             String::from_utf8(stderr).unwrap(),
             "unknown argument: --definitely-invalid\n"
         );
+    }
+
+    #[test]
+    fn unknown_before_help_stays_usage_error() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit_code = handle_cli_args(["--bad", "--help"], &mut stdout, &mut stderr).unwrap();
+        assert_eq!(
+            exit_code,
+            Some(2),
+            "unknown arg must not be cleared by --help"
+        );
+    }
+
+    #[test]
+    fn unknown_before_version_stays_usage_error() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit_code = handle_cli_args(["--bad", "--version"], &mut stdout, &mut stderr).unwrap();
+        assert_eq!(exit_code, Some(2));
+    }
+
+    #[test]
+    fn help_then_unknown_is_usage_error() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit_code = handle_cli_args(["--help", "--bad"], &mut stdout, &mut stderr).unwrap();
+        assert_eq!(exit_code, Some(2), "later unknown arg must force exit 2");
     }
 }
