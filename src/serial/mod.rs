@@ -19,6 +19,7 @@ use tokio_serial::{SerialPortInfo, SerialPortType};
 
 use crate::config::{self, DeviceProfile};
 use crate::errors::SerialError;
+pub use session::WritePolicy;
 
 /// JSON-serializable description of one available serial port — the shape
 /// `serial.list_ports` returns. `vid` / `pid` / `serial` are `Some` only
@@ -95,15 +96,27 @@ pub fn list_ports(profiles: &[DeviceProfile]) -> Result<Vec<PortDescriptor>, Ser
     Ok(descriptors)
 }
 
-/// Resolve a device-profile name to `(port_path, default_baud)`. Looks up
-/// the profile by name first — unknown names short-circuit before any
-/// host-side port enumeration. Returns [`SerialError::DeviceNotFound`]
-/// when the profile is unknown or no currently-plugged allowlisted port
-/// matches the profile's `match_serial` / `match_vid` / `match_pid`.
+/// Default write policy implied by a profile: `privileged` profiles default
+/// to `Confirm` (writes require explicit confirmation), all others to `Allow`.
+pub fn profile_write_policy(profile: &DeviceProfile) -> WritePolicy {
+    if profile.privileged {
+        WritePolicy::Confirm
+    } else {
+        WritePolicy::Allow
+    }
+}
+
+/// Resolve a device-profile name to `(port_path, default_baud, write_policy)`.
+/// Looks up the profile by name first — unknown names short-circuit before any
+/// host-side port enumeration. The third element is the profile's default
+/// write policy ([`profile_write_policy`]). Returns
+/// [`SerialError::DeviceNotFound`] when the profile is unknown or no
+/// currently-plugged allowlisted port matches the profile's `match_serial` /
+/// `match_vid` / `match_pid`.
 pub fn resolve_device(
     device_name: &str,
     profiles: &[DeviceProfile],
-) -> Result<(String, u32), SerialError> {
+) -> Result<(String, u32, WritePolicy), SerialError> {
     let profile = profiles
         .iter()
         .find(|p| p.name == device_name)
@@ -121,7 +134,7 @@ pub fn resolve_device(
         .ok_or_else(|| SerialError::DeviceNotFound {
             device: device_name.to_string(),
         })?;
-    Ok((port_path, profile.baud))
+    Ok((port_path, profile.baud, profile_write_policy(profile)))
 }
 
 /// Pluggable opener for the underlying serial transport.
@@ -236,7 +249,16 @@ mod tests {
             description: format!("{name} test"),
             probe: None,
             tags: vec![],
+            privileged: false,
         }
+    }
+
+    #[test]
+    fn profile_write_policy_maps_privileged_to_confirm() {
+        let mut p = profile("gw", "S", None, None);
+        assert_eq!(profile_write_policy(&p), WritePolicy::Allow);
+        p.privileged = true;
+        assert_eq!(profile_write_policy(&p), WritePolicy::Confirm);
     }
 
     #[test]

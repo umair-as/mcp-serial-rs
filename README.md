@@ -96,15 +96,15 @@ SDK generates input and output schemas from typed Rust structs.
 | Tool | Arguments | `structuredContent` |
 |---|---|---|
 | `serial.list_ports` | — | `{ports: [{port, vid, pid, serial, device, description}]}` |
-| `serial.open` | `{port, baud?, timeout_ms?}` **or** `{device, baud?, timeout_ms?}` | `{session_id}` (32-char random hex) |
-| `serial.sessions` | — | `{sessions: [{session_id, port, baud, state, default_timeout_ms}]}` |
-| `serial.get_session` | `{session_id}` | `{session}` |
-| `serial.write` | `{session_id, data}` (≤ 4 KiB) | `{bytes_written}` |
+| `serial.open` | `{port, baud?, timeout_ms?, write_policy?}` **or** `{device, baud?, timeout_ms?, write_policy?}` | `{session_id}` (32-char random hex) |
+| `serial.sessions` | — | `{sessions: [{session_id, port, baud, state, default_timeout_ms, write_policy}]}` |
+| `serial.get_session` | `{session_id}` | `{session}` (includes `write_policy`) |
+| `serial.write` | `{session_id, data, confirm?}` (≤ 4 KiB) | `{bytes_written}` |
 | `serial.read` | `{session_id, max_bytes?, timeout_ms?}` | `{data, status, timed_out, bytes_read, truncated, session_usable, output_is_untrusted}` |
 | `serial.drain` | `{session_id, max_bytes?}` | same shape as `serial.read`, with a short idle deadline |
 | `serial.clear_input` | `{session_id, max_bytes?}` | `{status, bytes_read, discarded_bytes, truncated, session_usable}` |
 | `serial.read_until` | `{session_id, pattern, timeout_ms?}` | `{data, matched, status, bytes_read, truncated, match_details?, session_usable, output_is_untrusted}` |
-| `serial.exec` | `{session_id, command, expect, timeout_ms?, clear_before_write?, normalize_output?}` | rich exec result including `status`, `raw_output`, optional `normalized_output`, byte counts, match details, and `command_written` |
+| `serial.exec` | `{session_id, command, expect, timeout_ms?, clear_before_write?, normalize_output?, confirm?}` | rich exec result including `status`, `raw_output`, optional `normalized_output`, byte counts, match details, and `command_written` |
 | `serial.close` | `{session_id}` | `{ok}` |
 
 `serial.open` accepts either a literal `port` path or a `device` profile name
@@ -113,6 +113,24 @@ to override. Unknown device names return `DeviceNotFound` (`-32009`) before
 any system call. A path already reserved by an Opening, Ready, or Closing
 session returns `PortBusy` (`-32010`); the production backend also requests
 exclusive OS access as defense in depth.
+
+Each session carries a **write policy** set at `open` (`write_policy`), enforced
+before any bytes reach the device:
+
+- `allow` (default) — writes proceed as before.
+- `deny` — a read-only session. `serial.write` / `serial.exec` are refused
+  server-side with `WriteForbidden` (`-32012`) regardless of the request; reads,
+  `drain`, and `clear_input` still work. This is model-proof: no bug and no
+  injected device text can cause a write.
+- `confirm` — writes require an explicit `confirm: true` on the call, else
+  `ConfirmationRequired` (`-32013`). This is a tripwire and audit seam, not a
+  hard gate (an automated caller can set `confirm` itself); use `deny` when you
+  need a guarantee.
+
+The effective policy is the most restrictive of the caller's `write_policy` and
+any `privileged` device-profile default (`allow < confirm < deny`), so a caller
+may escalate but never downgrade a privileged profile. Both gate errors carry
+`command_written=false` and `session_usable=true`. See `docs/adr/0005`.
 
 Domain validation and serial failures detected inside a tool call — unknown
 session, disallowed port, unknown device, malformed regex, oversized write,
@@ -155,6 +173,11 @@ short device name and human-readable description. Two effects:
    {"jsonrpc":"2.0","id":3,"method":"tools/call",
     "params":{"name":"serial.open","arguments":{"device":"esp32c6"}}}
    ```
+
+A profile may also set `privileged = true` (optional, default false) for ports
+that open onto an interactive or privileged shell. Sessions opened via such a
+profile default to `write_policy = "confirm"`; a caller can still escalate to
+`deny` at `serial.open`, but cannot downgrade below `confirm`.
 
 The file shipped at `devices.toml.example` is a working template — copy to
 `devices.toml` (the default location) and edit. Or set `MCP_SERIAL_DEVICES`

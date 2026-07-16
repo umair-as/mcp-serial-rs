@@ -98,9 +98,16 @@ pub fn result_session_id(
 /// large data clipped + sized; everything else passes through as-is.
 pub fn call_summary(tool: &str, args: &Value) -> Value {
     match tool {
+        "serial.open" => json!({
+            // `write_policy` is a bounded enum string (allow/confirm/deny) —
+            // safe metadata, no payload. Records the requested policy for audit.
+            "write_policy": args.get("write_policy"),
+            "arg_keys": object_keys(args),
+        }),
         "serial.write" => json!({
             "session_id": optional_session_id(args),
             "bytes": byte_len(args, "data"),
+            "confirm": optional_bool(args, "confirm"),
             "arg_keys": object_keys(args),
         }),
         "serial.exec" => json!({
@@ -108,6 +115,7 @@ pub fn call_summary(tool: &str, args: &Value) -> Value {
             "command_bytes": byte_len(args, "command"),
             "expect_bytes": byte_len(args, "expect"),
             "timeout_ms": optional_u64(args, "timeout_ms"),
+            "confirm": optional_bool(args, "confirm"),
             "clear_before_write": optional_bool(args, "clear_before_write"),
             "normalize_output": optional_bool(args, "normalize_output"),
             "arg_keys": object_keys(args),
@@ -206,15 +214,18 @@ mod tests {
 
     #[test]
     fn call_summary_records_write_size_without_payload() {
-        let big = "x".repeat(200);
-        let args = json!({"session_id": "s".repeat(10_000), "data": big.clone()});
+        let big = "x".repeat(500);
+        let args = json!({"session_id": "s".repeat(10_000), "data": big.clone(), "confirm": true});
         let summary = call_summary("serial.write", &args);
-        assert_eq!(summary["bytes"], 200, "byte_len preserves the full size");
+        assert_eq!(summary["bytes"], 500, "byte_len preserves the full size");
         assert_eq!(
             summary["session_id"].as_str().unwrap().chars().count(),
             MAX_JOURNAL_FIELD_CHARS
         );
+        // `confirm` is recorded as metadata (bool), never the data payload.
+        assert_eq!(summary["confirm"], json!(true));
         assert!(summary.get("head").is_none());
+        assert!(!summary.to_string().contains(&big));
         assert!(summary.to_string().len() < big.len());
     }
 

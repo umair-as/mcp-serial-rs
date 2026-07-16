@@ -19,7 +19,7 @@ use tracing::{debug, instrument, warn};
 use crate::config;
 use crate::errors::SerialError;
 use crate::serial::parser::{MatchDetails, PatternMatcher};
-use crate::serial::session::Session;
+use crate::serial::session::{Session, WritePolicy};
 use crate::serial::SerialBackend;
 
 /// Real production backend over `tokio-serial`.
@@ -75,6 +75,7 @@ pub struct SessionSnapshot {
     pub baud: u32,
     pub state: &'static str,
     pub default_timeout_ms: u64,
+    pub write_policy: WritePolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +174,21 @@ impl<B: SerialBackend> SessionManager<B> {
         lock(&self.inner).sessions.get(id).map(|s| s.state.name())
     }
 
+    /// The session's write policy, captured at open. Used by the `write` /
+    /// `exec` handlers to gate device mutation before any port I/O. Returns
+    /// [`SerialError::SessionNotFound`] for an unknown id. The policy is
+    /// immutable for the session's lifetime, so reading it here and acting on
+    /// it before the subsequent checkout is race-free with respect to policy.
+    pub fn write_policy(&self, id: &str) -> Result<WritePolicy, SerialError> {
+        lock(&self.inner)
+            .sessions
+            .get(id)
+            .map(|s| s.write_policy)
+            .ok_or_else(|| SerialError::SessionNotFound {
+                session_id: id.to_string(),
+            })
+    }
+
     pub fn sessions(&self) -> Vec<SessionSnapshot> {
         let inner = lock(&self.inner);
         inner.sessions.values().map(snapshot).collect()
@@ -198,6 +214,7 @@ impl<B: SerialBackend> SessionManager<B> {
         port_path: &str,
         baud: u32,
         default_timeout_ms: u64,
+        write_policy: WritePolicy,
     ) -> Result<String, SerialError> {
         if !config::matches_allowlist(port_path) {
             return Err(SerialError::PortNotAllowed {
@@ -225,7 +242,13 @@ impl<B: SerialBackend> SessionManager<B> {
             let id = next_session_id(&mut inner)?;
             inner.sessions.insert(
                 id.clone(),
-                Session::opening(id.clone(), port_path.to_string(), baud, default_timeout_ms),
+                Session::opening(
+                    id.clone(),
+                    port_path.to_string(),
+                    baud,
+                    default_timeout_ms,
+                    write_policy,
+                ),
             );
             id
         };
@@ -622,6 +645,7 @@ fn snapshot<P>(session: &Session<P>) -> SessionSnapshot {
         baud: session.baud,
         state: session.state.name(),
         default_timeout_ms: session.default_timeout_ms,
+        write_policy: session.write_policy,
     }
 }
 
@@ -1005,7 +1029,10 @@ mod tests {
     #[tokio::test]
     async fn allowlist_accepts_ttyusb() {
         let m = mgr();
-        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
         assert_eq!(id.len(), 32, "128-bit hex id must be 32 chars: {id}");
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(m.session_count(), 1);
@@ -1015,13 +1042,18 @@ mod tests {
     #[tokio::test]
     async fn allowlist_accepts_ttyacm() {
         let m = mgr();
-        m.open("/dev/ttyACM0", 115_200, 5_000).await.unwrap();
+        m.open("/dev/ttyACM0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn allowlist_rejects_non_matching_path() {
         let m = mgr();
-        let err = m.open("/dev/ttyS0", 115_200, 5_000).await.unwrap_err();
+        let err = m
+            .open("/dev/ttyS0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap_err();
         assert!(matches!(err, SerialError::PortNotAllowed { .. }));
         assert_eq!(m.session_count(), 0);
     }
@@ -1029,7 +1061,10 @@ mod tests {
     #[tokio::test]
     async fn opening_then_close_removes_session() {
         let m = mgr();
-        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
         assert_eq!(m.session_count(), 1);
         m.close(&id).await.unwrap();
         assert_eq!(m.session_count(), 0);
@@ -1044,9 +1079,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_records_write_policy_and_exposes_it() {
+        let m = mgr();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Deny)
+            .await
+            .unwrap();
+        // Accessor and snapshot both surface the policy captured at open.
+        assert_eq!(m.write_policy(&id).unwrap(), WritePolicy::Deny);
+        assert_eq!(m.get_session(&id).unwrap().write_policy, WritePolicy::Deny);
+        // Unknown id → SessionNotFound, same as the other lookups.
+        assert!(matches!(
+            m.write_policy("0000000000000000").unwrap_err(),
+            SerialError::SessionNotFound { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn double_close_errors() {
         let m = mgr();
-        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
         m.close(&id).await.unwrap();
         let err = m.close(&id).await.unwrap_err();
         assert!(matches!(err, SerialError::SessionNotFound { .. }));
@@ -1055,7 +1110,10 @@ mod tests {
     #[tokio::test]
     async fn close_timeout_rolls_back_to_ready_and_can_retry() {
         let m = mgr();
-        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
         let port = m.checkout_port(&id).unwrap();
         let guard = port.lock().await;
 
@@ -1074,7 +1132,10 @@ mod tests {
         // Open with a short session default timeout distinct from the 5000ms
         // global default. `serial.write` has no per-call timeout, so this must
         // be the deadline for lock wait / write / flush.
-        let id = m.open("/dev/ttyUSB0", 115_200, 40).await.unwrap();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 40, WritePolicy::Allow)
+            .await
+            .unwrap();
         let port = m.checkout_port(&id).unwrap();
         let guard = port.lock().await; // force write to block on lock acquisition
 
@@ -1099,28 +1160,46 @@ mod tests {
         let mut ids = Vec::new();
         for idx in 0..config::MAX_SESSIONS {
             ids.push(
-                m.open(&format!("/dev/ttyUSB{idx}"), 115_200, 5_000)
-                    .await
-                    .unwrap(),
+                m.open(
+                    &format!("/dev/ttyUSB{idx}"),
+                    115_200,
+                    5_000,
+                    WritePolicy::Allow,
+                )
+                .await
+                .unwrap(),
             );
         }
-        let err = m.open("/dev/ttyUSB99", 115_200, 5_000).await.unwrap_err();
+        let err = m
+            .open("/dev/ttyUSB99", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, SerialError::MaxSessionsReached { max } if max == config::MAX_SESSIONS),
             "unexpected error: {err:?}"
         );
         m.close(&ids.pop().unwrap()).await.unwrap();
-        m.open("/dev/ttyUSB99", 115_200, 5_000).await.unwrap();
+        m.open("/dev/ttyUSB99", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn duplicate_port_path_is_rejected_until_close_completes() {
         let m = mgr();
-        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
-        let err = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap_err();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
+        let err = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap_err();
         assert!(matches!(err, SerialError::PortBusy { .. }));
         m.close(&id).await.unwrap();
-        m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        m.open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1128,7 +1207,10 @@ mod tests {
         let backend = MockBackend::new();
         backend.fail_next();
         let m = SessionManager::with_seed(backend, 0x1234);
-        let err = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap_err();
+        let err = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap_err();
         assert!(matches!(err, SerialError::Io { .. }));
         assert_eq!(m.session_count(), 0, "placeholder must be removed");
     }
@@ -1139,7 +1221,12 @@ mod tests {
         let mut ids = std::collections::HashSet::new();
         for idx in 0..config::MAX_SESSIONS {
             let id = m
-                .open(&format!("/dev/ttyUSB{idx}"), 115_200, 5_000)
+                .open(
+                    &format!("/dev/ttyUSB{idx}"),
+                    115_200,
+                    5_000,
+                    WritePolicy::Allow,
+                )
                 .await
                 .unwrap();
             assert!(ids.insert(id.clone()), "duplicate session id: {id}");
@@ -1203,7 +1290,10 @@ mod tests {
     #[tokio::test]
     async fn write_round_trips_to_device_side() {
         let (m, backend) = mgr_with_backend();
-        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
         let mut device = backend.take_device();
 
         let n = m.write(&id, b"hello esp32\n").await.unwrap();
@@ -1217,7 +1307,10 @@ mod tests {
     #[tokio::test]
     async fn read_returns_buffered_device_data() {
         let (m, backend) = mgr_with_backend();
-        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
         let mut device = backend.take_device();
         device.write_all(b"boot ok\n").await.unwrap();
 
@@ -1235,7 +1328,10 @@ mod tests {
     #[tokio::test]
     async fn read_times_out_when_no_data() {
         let (m, backend) = mgr_with_backend();
-        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
         // Keep the device side alive so the manager-side stream doesn't EOF;
         // an EOF would surface as Ok(0) and timed_out=false.
         let _device = backend.take_device();
@@ -1251,7 +1347,10 @@ mod tests {
     #[tokio::test]
     async fn read_stops_at_max_bytes_with_timed_out_false() {
         let (m, backend) = mgr_with_backend();
-        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
         let mut device = backend.take_device();
         device.write_all(b"abcdefghij").await.unwrap();
         let _device = device; // keep alive
@@ -1264,7 +1363,10 @@ mod tests {
     #[tokio::test]
     async fn read_loop_accumulates_across_multiple_writes() {
         let (m, backend) = mgr_with_backend();
-        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
         let mut device = backend.take_device();
         let writer = tokio::spawn(async move {
             device.write_all(b"part1-").await.unwrap();
@@ -1289,7 +1391,10 @@ mod tests {
     #[tokio::test]
     async fn read_eof_returns_timed_out_false() {
         let (m, backend) = mgr_with_backend();
-        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
         let mut device = backend.take_device();
         device.write_all(b"bye").await.unwrap();
         drop(device); // EOF on the manager-side stream
@@ -1309,7 +1414,10 @@ mod tests {
     #[tokio::test]
     async fn read_after_close_returns_session_not_found() {
         let m = mgr();
-        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
         m.close(&id).await.unwrap();
         // SessionNotFound is a *protocol* failure (no such id), not a
         // domain outcome — it must still surface as Err, distinct from
@@ -1321,7 +1429,10 @@ mod tests {
     #[tokio::test]
     async fn empty_write_succeeds_with_zero_bytes() {
         let (m, _backend) = mgr_with_backend();
-        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
         let n = m.write(&id, b"").await.unwrap();
         assert_eq!(n, 0);
     }
@@ -1331,7 +1442,10 @@ mod tests {
     #[tokio::test]
     async fn read_until_matches_pattern_split_across_reads() {
         let (m, backend) = mgr_with_backend();
-        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
         let mut device = backend.take_device();
 
         // Drive the device in chunks; the pattern straddles a chunk boundary.
@@ -1352,7 +1466,10 @@ mod tests {
     #[tokio::test]
     async fn read_until_returns_partial_on_timeout() {
         let (m, backend) = mgr_with_backend();
-        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
         let mut device = backend.take_device();
         device.write_all(b"partial output").await.unwrap();
         // Keep device alive so we don't EOF.
@@ -1366,7 +1483,10 @@ mod tests {
     #[tokio::test]
     async fn read_until_with_empty_pattern_errors() {
         let m = mgr();
-        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
         let err = m.read_until(&id, "", 100).await.unwrap_err();
         assert!(matches!(err, SerialError::InvalidParam { ref name, .. } if name == "pattern"));
     }
@@ -1384,7 +1504,10 @@ mod tests {
     #[tokio::test]
     async fn read_until_eof_returns_unmatched_partial() {
         let (m, backend) = mgr_with_backend();
-        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
         let mut device = backend.take_device();
         device.write_all(b"goodbye").await.unwrap();
         drop(device); // signals EOF on the manager-side read
@@ -1400,7 +1523,10 @@ mod tests {
         // if they weren't serialised. With per-session mutex, the second
         // write waits, the device drains, then both complete.
         let (m, backend) = mgr_with_backend();
-        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
         let mut device = backend.take_device();
 
         // Start two writes; one drains the device in parallel.
@@ -1434,7 +1560,10 @@ mod tests {
     #[tokio::test]
     async fn exec_holds_session_lock_across_write_and_read_until() {
         let (m, backend) = mgr_with_backend();
-        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
         let mut device = backend.take_device();
         let m = Arc::new(m);
 
@@ -1482,7 +1611,10 @@ mod tests {
     #[tokio::test]
     async fn exec_cancelled_before_write_reports_no_side_effect() {
         let (m, backend) = mgr_with_backend();
-        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
         let _device = backend.take_device();
         let cancellation = CancellationToken::new();
         cancellation.cancel();
@@ -1502,7 +1634,10 @@ mod tests {
     #[tokio::test]
     async fn exec_clear_before_write_respects_operation_deadline() {
         let (m, backend) = mgr_with_backend();
-        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
         let mut device = backend.take_device();
 
         let writer = tokio::spawn(async move {
@@ -1541,7 +1676,10 @@ mod tests {
     #[tokio::test]
     async fn close_waits_for_in_flight_exec_before_returning() {
         let (m, backend) = mgr_with_backend();
-        let id = m.open("/dev/ttyUSB0", 115_200, 5_000).await.unwrap();
+        let id = m
+            .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+            .await
+            .unwrap();
         let mut device = backend.take_device();
         let m = Arc::new(m);
 

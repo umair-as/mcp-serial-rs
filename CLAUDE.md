@@ -65,15 +65,15 @@ Names and field shapes are stable — do not rename (dotted `serial.open`, never
 | Tool | Params | Returns |
 |---|---|---|
 | `serial.list_ports` | — | `{ports}` |
-| `serial.open` | `{port, baud?, timeout_ms?}` OR `{device, baud?, timeout_ms?}` | `{session_id}` |
-| `serial.sessions` | — | `{sessions}` |
-| `serial.get_session` | `{session_id}` | `{session}` |
-| `serial.write` | `{session_id, data}` | `{bytes_written}` |
+| `serial.open` | `{port, baud?, timeout_ms?, write_policy?}` OR `{device, baud?, timeout_ms?, write_policy?}` | `{session_id}` |
+| `serial.sessions` | — | `{sessions}` (each incl. `write_policy`) |
+| `serial.get_session` | `{session_id}` | `{session}` (incl. `write_policy`) |
+| `serial.write` | `{session_id, data, confirm?}` | `{bytes_written}` |
 | `serial.read` | `{session_id, max_bytes?, timeout_ms?}` | `{data, status, timed_out, bytes_read, truncated, session_usable}` |
 | `serial.drain` | `{session_id, max_bytes?}` | read-shaped result, short idle deadline |
 | `serial.clear_input` | `{session_id, max_bytes?}` | `{status, bytes_read, discarded_bytes, truncated, session_usable}` |
 | `serial.read_until` | `{session_id, pattern, timeout_ms?}` | `{data, matched, status, bytes_read, match_details?}` |
-| `serial.exec` | `{session_id, command, expect, timeout_ms?, clear_before_write?, normalize_output?}` | rich exec result: raw output + write/consume state |
+| `serial.exec` | `{session_id, command, expect, timeout_ms?, clear_before_write?, normalize_output?, confirm?}` | rich exec result: raw output + write/consume state |
 | `serial.close` | `{session_id}` | `{ok}` |
 
 Results are rmcp structured tool results (`CallToolResult::structured`); rmcp
@@ -107,6 +107,18 @@ generates both input and output schemas from the typed structs.
   by another process → `PortBusy` (-32010, when the backend surfaces `EBUSY` as
   `ErrorKind::NoDevice`); a path already reserved by an Opening/Ready/Closing
   session → `PortBusy` *before* touching the backend.
+- **Write policy (per session, set at `open`, enforced in `write`/`exec`):**
+  `allow` (default) | `confirm` | `deny`. `deny` refuses writes server-side →
+  `WriteForbidden` (-32012); a hard, model-proof read-only session (reads /
+  `drain` / `clear_input` still allowed). `confirm` needs `confirm: true` on the
+  call → else `ConfirmationRequired` (-32013); a tripwire/audit seam, **not** a
+  hard gate (a caller can self-confirm) — `deny` is the guarantee. Effective
+  policy = most-restrictive of the caller's `write_policy` and any `privileged`
+  device-profile default (`Allow < Confirm < Deny`): callers may escalate, never
+  downgrade a privileged profile. Both errors are tool errors with
+  `command_written=false`, `session_usable=true`. Success shapes are unchanged;
+  the audit journal records denials via `error_code`/`error_type` plus a
+  metadata-only `confirm` flag. (See `docs/adr/0005`.)
 
 Deferred (do not implement without a separate decision): `serial.reset_esp32`
 (DTR/RTS toggle), `serial.capture_start` / `serial.capture_stop` (tee bytes to

@@ -34,7 +34,7 @@ use crate::config::{self, DeviceProfile};
 use crate::errors::SerialError;
 use crate::serial::journal::{JournalEntry, JournalWriter};
 use crate::serial::manager::{ExecOutcome, ReadOutcome, SessionManager, SessionSnapshot};
-use crate::serial::SerialBackend;
+use crate::serial::{SerialBackend, WritePolicy};
 
 /// rmcp-facing server. Holds shared references to the serial domain state
 /// — session manager, device profiles, and the audit journal handle — and
@@ -126,7 +126,11 @@ impl<B: SerialBackend> McpServer<B> {
         // "Error-code compatibility"). Do NOT use `McpError::invalid_params`
         // here — that maps to -32602 and is reserved for JSON-RPC envelope
         // / params-deserialization failures.
-        let (port_path, baud) = match (p.port, p.device) {
+        // `profile_policy` is the write policy the resolution path implies:
+        // a bare port path implies `Allow`; a `privileged` device profile
+        // implies `Confirm`. The caller's `write_policy` override is combined
+        // below (most-restrictive wins).
+        let (port_path, baud, profile_policy) = match (p.port, p.device) {
             (Some(_), Some(_)) => {
                 return Ok(tool_error(
                     SerialError::InvalidParam {
@@ -149,14 +153,18 @@ impl<B: SerialBackend> McpServer<B> {
                     false,
                 ));
             }
-            (Some(port), None) => (port, p.baud.unwrap_or(config::DEFAULT_BAUD)),
+            (Some(port), None) => (
+                port,
+                p.baud.unwrap_or(config::DEFAULT_BAUD),
+                WritePolicy::Allow,
+            ),
             (None, Some(device_name)) => {
-                let (path, profile_baud) =
+                let (path, profile_baud, profile_policy) =
                     match crate::serial::resolve_device(&device_name, &self.profiles) {
                         Ok(resolved) => resolved,
                         Err(err) => return Ok(tool_error(err, None, false, false)),
                     };
-                (path, p.baud.unwrap_or(profile_baud))
+                (path, p.baud.unwrap_or(profile_baud), profile_policy)
             }
         };
 
@@ -165,7 +173,15 @@ impl<B: SerialBackend> McpServer<B> {
             .unwrap_or(config::DEFAULT_TIMEOUT_MS)
             .min(config::MAX_TIMEOUT_MS);
 
-        match self.sessions.open(&port_path, baud, timeout_ms).await {
+        // Most-restrictive wins (Allow < Confirm < Deny): a caller may escalate
+        // a session's policy but never downgrade a privileged profile default.
+        let write_policy = profile_policy.max(p.write_policy.unwrap_or_default());
+
+        match self
+            .sessions
+            .open(&port_path, baud, timeout_ms, write_policy)
+            .await
+        {
             Ok(session_id) => structured(OpenResult { session_id }),
             Err(err) => Ok(tool_error(err, None, false, false)),
         }
@@ -237,6 +253,12 @@ impl<B: SerialBackend> McpServer<B> {
                 false,
                 false,
             ));
+        }
+
+        // Write-policy gate: refuse (deny) or require confirmation (confirm)
+        // before any bytes reach the device. No side effect on rejection.
+        if let Some(blocked) = self.gate_write(&p.session_id, p.confirm.unwrap_or(false)) {
+            return Ok(blocked);
         }
 
         match self
@@ -479,6 +501,13 @@ impl<B: SerialBackend> McpServer<B> {
             ));
         }
 
+        // Write-policy gate — placed after input validation so a bad pattern
+        // still errors first, and before any write so a gated session never
+        // mutates the device (matching exec's "no side effect on bad input").
+        if let Some(blocked) = self.gate_write(&p.session_id, p.confirm.unwrap_or(false)) {
+            return Ok(blocked);
+        }
+
         let timeout_ms = match self.operation_timeout_ms(&p.session_id, p.timeout_ms) {
             Ok(timeout_ms) => timeout_ms,
             Err(err) => return Ok(tool_error(err, Some(p.session_id), false, false)),
@@ -527,6 +556,31 @@ impl<B: SerialBackend> McpServer<B> {
             Ok(()) => structured(CloseResult { ok: true }),
             Err(err) => Ok(tool_error(err, Some(p.session_id), false, false)),
         }
+    }
+
+    /// Enforce the session's write policy before any device I/O. Returns
+    /// `Some(tool_error)` when the write must be blocked (session gone,
+    /// `deny`, or `confirm` without `confirm=true`) and `None` when it may
+    /// proceed. The policy is immutable per-session, so consulting it here —
+    /// before the manager checks out the port — is race-free; a session
+    /// closed concurrently is still caught by the subsequent state check.
+    fn gate_write(&self, session_id: &str, confirmed: bool) -> Option<CallToolResult> {
+        let blocked = match self.sessions.write_policy(session_id) {
+            Err(err) => err,
+            Ok(WritePolicy::Deny) => SerialError::WriteForbidden {
+                session_id: session_id.to_string(),
+            },
+            Ok(WritePolicy::Confirm) if !confirmed => SerialError::ConfirmationRequired {
+                session_id: session_id.to_string(),
+            },
+            Ok(_) => return None,
+        };
+        Some(tool_error(
+            blocked,
+            Some(session_id.to_string()),
+            false,
+            false,
+        ))
     }
 
     fn operation_timeout_ms(
@@ -848,6 +902,13 @@ pub struct OpenParams {
     /// `config::DEFAULT_TIMEOUT_MS` when absent.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// Write policy for this session: `allow` (default), `confirm` (writes
+    /// need `confirm=true`), or `deny` (writes refused — read-only session).
+    /// The effective policy is the most restrictive of this value and any
+    /// `privileged` device-profile default, so a caller may escalate but not
+    /// downgrade a privileged profile.
+    #[serde(default)]
+    pub write_policy: Option<WritePolicy>,
 }
 
 /// Input for `serial.write`. `data` is UTF-8 text; binary protocols are
@@ -857,6 +918,10 @@ pub struct OpenParams {
 pub struct WriteParams {
     pub session_id: String,
     pub data: String,
+    /// Required to be `true` when the session's write policy is `confirm`;
+    /// ignored under `allow`, and cannot override `deny`. Defaults to `false`.
+    #[serde(default)]
+    pub confirm: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -921,6 +986,10 @@ pub struct ExecParams {
     pub session_id: String,
     pub command: String,
     pub expect: String,
+    /// Required to be `true` when the session's write policy is `confirm`;
+    /// ignored under `allow`, and cannot override `deny`. Defaults to `false`.
+    #[serde(default)]
+    pub confirm: Option<bool>,
     #[serde(default)]
     pub clear_before_write: Option<bool>,
     #[serde(default)]
