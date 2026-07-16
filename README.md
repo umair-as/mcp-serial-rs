@@ -263,6 +263,15 @@ spawns the release binary, stands up a real `socat` PTY pair, and drives
 thread that echoes whatever it receives. If `socat` is unavailable the loopback
 test skips with an install hint.
 
+## Releases
+
+Releases are created manually after the version change has merged to `main`.
+Run the `release` GitHub Actions workflow from the default branch and provide
+the version from `Cargo.toml` without the `v` prefix. The workflow reruns the
+quality gates, builds the locked release binary, creates the matching
+`vX.Y.Z` tag, and publishes a GitHub release containing a Linux x86-64 archive
+and SHA-256 checksum. It does not publish the crate to crates.io.
+
 Architecture diagrams live in `docs/mcp-serial-architecture.md`. The `rmcp`
 migration that produced the current protocol layer is recorded in
 `docs/archive/rmcp-migration-spec.md`.
