@@ -21,14 +21,22 @@
 //!   progress in parallel, same-session writes serialise, and a close
 //!   racing an in-flight read resolves deterministically.
 
+use std::collections::BTreeMap;
+use std::io;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use rmcp::ServiceExt;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream, ReadBuf,
+};
+use tokio::sync::Notify;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 use mcp_serial_rs::config::{self, DeviceProfile};
 use mcp_serial_rs::errors::SerialError;
@@ -95,6 +103,165 @@ impl SerialBackend for StubBackend {
             .push(device_side);
         Ok(manager_side)
     }
+}
+
+#[derive(Clone, Copy)]
+enum FaultBehavior {
+    PartialWriteThenError,
+    FlushError,
+    ReadThenError,
+    ReadPending,
+    WritePending,
+    FlushPending,
+}
+
+#[derive(Clone)]
+struct FaultBackend {
+    behavior: FaultBehavior,
+    written: Arc<std::sync::Mutex<Vec<u8>>>,
+    read_started: Arc<Notify>,
+}
+
+impl FaultBackend {
+    fn new(behavior: FaultBehavior) -> Self {
+        Self {
+            behavior,
+            written: Arc::new(std::sync::Mutex::new(Vec::new())),
+            read_started: Arc::new(Notify::new()),
+        }
+    }
+
+    fn written(&self) -> Vec<u8> {
+        self.written
+            .lock()
+            .expect("fault backend write evidence mutex poisoned")
+            .clone()
+    }
+
+    async fn wait_for_read(&self) {
+        timeout(Duration::from_secs(1), self.read_started.notified())
+            .await
+            .expect("fault port was never polled for read");
+    }
+}
+
+struct FaultPort {
+    behavior: FaultBehavior,
+    written: Arc<std::sync::Mutex<Vec<u8>>>,
+    read_started: Arc<Notify>,
+    write_calls: usize,
+    read_calls: usize,
+}
+
+impl AsyncRead for FaultPort {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.read_started.notify_one();
+        match self.behavior {
+            FaultBehavior::ReadThenError if self.read_calls == 0 => {
+                self.read_calls += 1;
+                buf.put_slice(b"partial-device-output");
+                Poll::Ready(Ok(()))
+            }
+            FaultBehavior::ReadThenError => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "injected read disconnect",
+            ))),
+            _ => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for FaultPort {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.behavior {
+            FaultBehavior::WritePending => Poll::Pending,
+            FaultBehavior::PartialWriteThenError if self.write_calls > 0 => Poll::Ready(Err(
+                io::Error::new(io::ErrorKind::BrokenPipe, "injected partial-write failure"),
+            )),
+            FaultBehavior::PartialWriteThenError => {
+                self.write_calls += 1;
+                let written = buf.len().min(3);
+                self.written
+                    .lock()
+                    .expect("fault backend write evidence mutex poisoned")
+                    .extend_from_slice(&buf[..written]);
+                Poll::Ready(Ok(written))
+            }
+            _ => {
+                self.written
+                    .lock()
+                    .expect("fault backend write evidence mutex poisoned")
+                    .extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.behavior {
+            FaultBehavior::FlushError => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected flush failure",
+            ))),
+            FaultBehavior::FlushPending => Poll::Pending,
+            _ => Poll::Ready(Ok(())),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl SerialBackend for FaultBackend {
+    type Port = FaultPort;
+
+    async fn open(&self, _port: &str, _baud: u32) -> Result<FaultPort, SerialError> {
+        Ok(FaultPort {
+            behavior: self.behavior,
+            written: Arc::clone(&self.written),
+            read_started: Arc::clone(&self.read_started),
+            write_calls: 0,
+            read_calls: 0,
+        })
+    }
+}
+
+fn fault_setup(
+    behavior: FaultBehavior,
+) -> (
+    McpServer<FaultBackend>,
+    Arc<SessionManager<FaultBackend>>,
+    FaultBackend,
+) {
+    let backend = FaultBackend::new(behavior);
+    let sessions = Arc::new(SessionManager::new(backend.clone()));
+    let server = McpServer::new(sessions.clone(), Arc::new(Vec::new()), None);
+    (server, sessions, backend)
+}
+
+async fn fault_server_with_open_session(
+    behavior: FaultBehavior,
+) -> (
+    McpServer<FaultBackend>,
+    Arc<SessionManager<FaultBackend>>,
+    FaultBackend,
+    String,
+) {
+    let (server, sessions, backend) = fault_setup(behavior);
+    let session_id = sessions
+        .open("/dev/ttyUSB0", 115_200, 5_000)
+        .await
+        .expect("open fault-backed session");
+    (server, sessions, backend, session_id)
 }
 
 /// Build an `McpServer` backed by [`StubBackend`] with the supplied
@@ -218,6 +385,61 @@ fn tool_error_data(resp: &Value) -> &Value {
         .unwrap_or_else(|| panic!("expected structured tool error data in {resp}"))
 }
 
+fn assert_tool_io_error(
+    resp: &Value,
+    session_id: &str,
+    command_written: bool,
+    bytes_consumed: bool,
+) {
+    let result = resp
+        .get("result")
+        .expect("I/O failure must be a tool result");
+    assert_eq!(result["isError"], true, "tool error must set isError=true");
+    let error = &result["structuredContent"]["error"];
+    assert_eq!(error["type"], "io_error");
+    assert_eq!(error["code"], -32006);
+    assert_eq!(error["retryable"], true);
+    assert_eq!(error["session_id"], session_id);
+    assert_eq!(error["command_written"], command_written);
+    assert_eq!(error["bytes_consumed"], bytes_consumed);
+    assert_eq!(error["session_usable"], false);
+}
+
+fn assert_tool_timeout_error(resp: &Value, session_id: &str, timeout_ms: u64) {
+    let result = resp
+        .get("result")
+        .expect("phase timeout must be a tool result");
+    assert_eq!(
+        result["isError"], true,
+        "tool timeout must set isError=true"
+    );
+    let error = &result["structuredContent"]["error"];
+    assert_eq!(error["type"], "timeout");
+    assert_eq!(error["code"], -32005);
+    assert_eq!(error["data"]["timeout_ms"], timeout_ms);
+    assert_eq!(error["retryable"], false);
+    assert_eq!(error["session_id"], session_id);
+    assert_eq!(error["command_written"], true);
+    assert_eq!(error["bytes_consumed"], true);
+    assert_eq!(error["session_usable"], true);
+}
+
+fn validate_tool_output(schemas: &BTreeMap<String, Value>, tool: &str, response: &Value) {
+    let schema = schemas
+        .get(tool)
+        .unwrap_or_else(|| panic!("missing advertised output schema for {tool}"));
+    jsonschema::draft202012::meta::validate(schema)
+        .unwrap_or_else(|error| panic!("{tool} advertises an invalid output schema: {error}"));
+    let validator = jsonschema::draft202012::new(schema)
+        .unwrap_or_else(|error| panic!("failed to compile {tool} output schema: {error}"));
+    let structured = response
+        .pointer("/result/structuredContent")
+        .unwrap_or_else(|| panic!("{tool} response lacks structuredContent: {response}"));
+    if let Err(error) = validator.validate(structured) {
+        panic!("{tool} structuredContent violates its output schema: {error}; response={response}");
+    }
+}
+
 // ---- lifecycle / list_ports ----------------------------------------------
 
 #[tokio::test]
@@ -332,6 +554,128 @@ async fn tools_list_contains_dotted_tools_with_input_schema() {
             "tool `{name}` destructiveHint mismatch",
         );
     }
+}
+
+#[tokio::test]
+async fn advertised_output_schemas_validate_real_success_timeout_and_error_results() {
+    let list_response = roundtrip(
+        tokio_server(),
+        &[
+            init_request(),
+            initialized_notification(),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        ],
+    )
+    .await;
+    let schemas: BTreeMap<String, Value> = list_response[1]["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|tool| {
+            (
+                tool["name"].as_str().expect("tool name").to_string(),
+                tool["outputSchema"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(schemas.len(), 11, "every advertised tool must be validated");
+
+    let list_ports = handshake_then_call(tokio_server(), "serial.list_ports", json!({})).await;
+    validate_tool_output(&schemas, "serial.list_ports", &list_ports);
+
+    let open = handshake_then_call(
+        stub_server(vec![]),
+        "serial.open",
+        json!({"port": "/dev/ttyUSB0"}),
+    )
+    .await;
+    validate_tool_output(&schemas, "serial.open", &open);
+
+    let (server, _session_id, _device) = server_with_open_session().await;
+    let sessions = handshake_then_call(server, "serial.sessions", json!({})).await;
+    validate_tool_output(&schemas, "serial.sessions", &sessions);
+
+    let (server, session_id, _device) = server_with_open_session().await;
+    let get_session = handshake_then_call(
+        server,
+        "serial.get_session",
+        json!({"session_id": session_id}),
+    )
+    .await;
+    validate_tool_output(&schemas, "serial.get_session", &get_session);
+
+    let (server, session_id, _device) = server_with_open_session().await;
+    let write = handshake_then_call(
+        server,
+        "serial.write",
+        json!({"session_id": session_id, "data": "schema-write"}),
+    )
+    .await;
+    validate_tool_output(&schemas, "serial.write", &write);
+
+    let (server, session_id, _device) = server_with_open_session().await;
+    let read_timeout = handshake_then_call(
+        server,
+        "serial.read",
+        json!({"session_id": session_id, "max_bytes": 16, "timeout_ms": 20}),
+    )
+    .await;
+    validate_tool_output(&schemas, "serial.read", &read_timeout);
+
+    let (server, session_id, _device) = server_with_open_session().await;
+    let drain = handshake_then_call(
+        server,
+        "serial.drain",
+        json!({"session_id": session_id, "max_bytes": 16}),
+    )
+    .await;
+    validate_tool_output(&schemas, "serial.drain", &drain);
+
+    let (server, session_id, _device) = server_with_open_session().await;
+    let clear = handshake_then_call(
+        server,
+        "serial.clear_input",
+        json!({"session_id": session_id, "max_bytes": 16}),
+    )
+    .await;
+    validate_tool_output(&schemas, "serial.clear_input", &clear);
+
+    let (server, session_id, _device) = server_with_open_session().await;
+    let read_until_timeout = handshake_then_call(
+        server,
+        "serial.read_until",
+        json!({"session_id": session_id, "pattern": "NEVER", "timeout_ms": 20}),
+    )
+    .await;
+    validate_tool_output(&schemas, "serial.read_until", &read_until_timeout);
+
+    let (server, session_id, _device) = server_with_open_session().await;
+    let exec_timeout = handshake_then_call(
+        server,
+        "serial.exec",
+        json!({
+            "session_id": session_id,
+            "command": "schema-exec",
+            "expect": "NEVER",
+            "timeout_ms": 20,
+        }),
+    )
+    .await;
+    validate_tool_output(&schemas, "serial.exec", &exec_timeout);
+
+    let (server, session_id, _device) = server_with_open_session().await;
+    let close =
+        handshake_then_call(server, "serial.close", json!({"session_id": session_id})).await;
+    validate_tool_output(&schemas, "serial.close", &close);
+
+    let structured_error = handshake_then_call(
+        stub_server(vec![]),
+        "serial.get_session",
+        json!({"session_id": "missing-session"}),
+    )
+    .await;
+    assert_eq!(structured_error["result"]["isError"], true);
+    validate_tool_output(&schemas, "serial.get_session", &structured_error);
 }
 
 #[tokio::test]
@@ -798,6 +1142,46 @@ async fn write_unknown_session_returns_session_not_found() {
 }
 
 #[tokio::test]
+async fn partial_write_error_reports_ambiguous_device_side_effect() {
+    let (server, _sessions, backend, session_id) =
+        fault_server_with_open_session(FaultBehavior::PartialWriteThenError).await;
+
+    let resp = handshake_then_call(
+        server,
+        "serial.write",
+        json!({"session_id": session_id, "data": "abcdef"}),
+    )
+    .await;
+
+    assert_tool_io_error(&resp, &session_id, true, false);
+    assert_eq!(
+        backend.written(),
+        b"abc",
+        "fault must occur only after a real partial write"
+    );
+}
+
+#[tokio::test]
+async fn flush_error_after_write_reports_ambiguous_device_side_effect() {
+    let (server, _sessions, backend, session_id) =
+        fault_server_with_open_session(FaultBehavior::FlushError).await;
+
+    let resp = handshake_then_call(
+        server,
+        "serial.write",
+        json!({"session_id": session_id, "data": "write-before-flush"}),
+    )
+    .await;
+
+    assert_tool_io_error(&resp, &session_id, true, false);
+    assert_eq!(
+        backend.written(),
+        b"write-before-flush",
+        "the complete payload must reach the port before flush fails"
+    );
+}
+
+#[tokio::test]
 async fn read_returns_device_side_bytes_as_utf8_lossy() {
     let (server, session_id, mut device) = server_with_open_session().await;
 
@@ -836,6 +1220,38 @@ async fn read_unknown_session_returns_session_not_found() {
     )
     .await;
     assert_eq!(rpc_error_code(&resp), -32003);
+}
+
+#[tokio::test]
+async fn read_error_after_consumption_reports_ambiguous_consumption() {
+    let (server, _sessions, _backend, session_id) =
+        fault_server_with_open_session(FaultBehavior::ReadThenError).await;
+
+    let resp = handshake_then_call(
+        server,
+        "serial.read",
+        json!({"session_id": session_id, "max_bytes": 64, "timeout_ms": 500}),
+    )
+    .await;
+
+    assert_tool_io_error(&resp, &session_id, false, true);
+}
+
+#[tokio::test]
+async fn drain_and_clear_errors_after_consumption_report_ambiguous_consumption() {
+    for tool in ["serial.drain", "serial.clear_input"] {
+        let (server, _sessions, _backend, session_id) =
+            fault_server_with_open_session(FaultBehavior::ReadThenError).await;
+
+        let resp = handshake_then_call(
+            server,
+            tool,
+            json!({"session_id": session_id, "max_bytes": 64}),
+        )
+        .await;
+
+        assert_tool_io_error(&resp, &session_id, false, true);
+    }
 }
 
 #[tokio::test]
@@ -1325,6 +1741,119 @@ async fn exec_unknown_session_returns_session_not_found() {
         tool_error_data(&resp)["session_id"].as_str(),
         Some("deadbeefdeadbeef"),
     );
+}
+
+#[tokio::test]
+async fn exec_disconnect_after_command_write_reports_ambiguous_write_and_consumption() {
+    let (server, _sessions, backend, session_id) =
+        fault_server_with_open_session(FaultBehavior::ReadThenError).await;
+    let command = "run-before-disconnect";
+
+    let resp = handshake_then_call(
+        server,
+        "serial.exec",
+        json!({
+            "session_id": session_id,
+            "command": command,
+            "expect": "NEVER_MATCH",
+            "timeout_ms": 500,
+        }),
+    )
+    .await;
+
+    assert_tool_io_error(&resp, &session_id, true, true);
+    assert_eq!(
+        backend.written(),
+        command.as_bytes(),
+        "exec command must have been written before the injected disconnect"
+    );
+}
+
+#[tokio::test]
+async fn exec_write_and_flush_deadlines_are_bounded_and_report_configured_timeout() {
+    for behavior in [FaultBehavior::WritePending, FaultBehavior::FlushPending] {
+        let (server, _sessions, backend, session_id) =
+            fault_server_with_open_session(behavior).await;
+        let configured_timeout_ms = 25;
+        let started = Instant::now();
+
+        let resp = handshake_then_call(
+            server,
+            "serial.exec",
+            json!({
+                "session_id": session_id,
+                "command": "deadline-command",
+                "expect": "NEVER_MATCH",
+                "timeout_ms": configured_timeout_ms,
+            }),
+        )
+        .await;
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "pending write/flush phase exceeded its bounded operation deadline"
+        );
+        assert_tool_timeout_error(&resp, &session_id, configured_timeout_ms);
+
+        if matches!(behavior, FaultBehavior::FlushPending) {
+            assert_eq!(
+                backend.written(),
+                b"deadline-command",
+                "flush timeout must occur after the command write"
+            );
+        } else {
+            assert!(
+                backend.written().is_empty(),
+                "pending write must not claim observed port progress"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn exec_lock_deadline_is_bounded_and_reports_configured_timeout() {
+    let (server, sessions, backend, session_id) =
+        fault_server_with_open_session(FaultBehavior::ReadPending).await;
+    let cancellation = CancellationToken::new();
+    let read_sessions = sessions.clone();
+    let read_session_id = session_id.clone();
+    let read_cancellation = cancellation.clone();
+    let read_task = tokio::spawn(async move {
+        read_sessions
+            .read_with_cancel(&read_session_id, 64, 1_000, read_cancellation)
+            .await
+    });
+    backend.wait_for_read().await;
+
+    let configured_timeout_ms = 25;
+    let started = Instant::now();
+    let resp = handshake_then_call(
+        server,
+        "serial.exec",
+        json!({
+            "session_id": session_id,
+            "command": "must-wait-for-lock",
+            "expect": "NEVER_MATCH",
+            "timeout_ms": configured_timeout_ms,
+        }),
+    )
+    .await;
+
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "lock wait exceeded its bounded operation deadline"
+    );
+    assert_tool_timeout_error(&resp, &session_id, configured_timeout_ms);
+    assert!(
+        backend.written().is_empty(),
+        "lock timeout must occur before any port write"
+    );
+
+    cancellation.cancel();
+    read_task
+        .await
+        .expect("read task join")
+        .expect("cancelled read returns a normal outcome");
 }
 
 // ---- serial.close --------------------------------------------------------
