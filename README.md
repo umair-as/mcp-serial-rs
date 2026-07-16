@@ -250,7 +250,7 @@ per-port mutex.
 ## Tests
 
 ```sh
-cargo test                          # 132 total: 85 lib unit + 3 CLI + 43 MCP wire + 1 loopback
+cargo test                          # 140 total: 85 lib unit + 3 CLI + 51 MCP wire + 1 loopback
 cargo test --test loopback          # PTY round-trip — needs `socat`
 ```
 
