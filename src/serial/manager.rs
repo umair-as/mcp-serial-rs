@@ -331,8 +331,10 @@ impl<B: SerialBackend> SessionManager<B> {
         data: &[u8],
         cancellation: CancellationToken,
     ) -> Result<usize, SerialError> {
-        let port = self.checkout_port(session_id)?;
-        let timeout_ms = config::DEFAULT_TIMEOUT_MS;
+        // `serial.write` exposes no per-call timeout, so the whole operation
+        // (lock wait, write, flush) is bounded by the session default captured
+        // at `serial.open`, not a fixed global.
+        let (port, timeout_ms) = self.checkout_port_and_timeout(session_id)?;
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let mut guard = lock_port(&port, deadline, timeout_ms, cancellation.clone()).await?;
         self.ensure_port_still_ready(session_id, &port)?;
@@ -562,6 +564,19 @@ impl<B: SerialBackend> SessionManager<B> {
     /// Returns `SessionNotFound` for unknown ids, `InvalidState` for anything
     /// other than `Ready`.
     fn checkout_port(&self, session_id: &str) -> Result<Arc<AsyncMutex<B::Port>>, SerialError> {
+        self.checkout_port_and_timeout(session_id)
+            .map(|(port, _)| port)
+    }
+
+    /// Resolve a session id to its port handle **and** its configured default
+    /// timeout in one locked snapshot, so callers without a per-call timeout
+    /// (e.g. `serial.write`) bound their operation by the session default
+    /// without a second lookup that could observe a mutated session.
+    #[allow(clippy::type_complexity)]
+    fn checkout_port_and_timeout(
+        &self,
+        session_id: &str,
+    ) -> Result<(Arc<AsyncMutex<B::Port>>, u64), SerialError> {
         let inner = lock(&self.inner);
         let Some(session) = inner.sessions.get(session_id) else {
             return Err(SerialError::SessionNotFound {
@@ -569,7 +584,7 @@ impl<B: SerialBackend> SessionManager<B> {
             });
         };
         match &session.port {
-            Some(p) => Ok(p.clone()),
+            Some(p) => Ok((p.clone(), session.default_timeout_ms)),
             None => Err(SerialError::InvalidState {
                 session_id: session_id.to_string(),
                 state: session.state.name(),
@@ -1051,6 +1066,31 @@ mod tests {
         drop(guard);
         m.close(&id).await.unwrap();
         assert_eq!(m.session_state(&id), None);
+    }
+
+    #[tokio::test]
+    async fn write_is_bounded_by_session_default_timeout_not_global() {
+        let m = mgr();
+        // Open with a short session default timeout distinct from the 5000ms
+        // global default. `serial.write` has no per-call timeout, so this must
+        // be the deadline for lock wait / write / flush.
+        let id = m.open("/dev/ttyUSB0", 115_200, 40).await.unwrap();
+        let port = m.checkout_port(&id).unwrap();
+        let guard = port.lock().await; // force write to block on lock acquisition
+
+        let started = Instant::now();
+        let err = m.write(&id, b"blocked\n").await.unwrap_err();
+        assert!(
+            matches!(err, SerialError::Timeout { timeout_ms: 40 }),
+            "write must time out at the session default (40ms), got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(config::DEFAULT_TIMEOUT_MS),
+            "write must not fall back to the global default timeout",
+        );
+
+        drop(guard);
+        m.write(&id, b"ok\n").await.unwrap();
     }
 
     #[tokio::test]
