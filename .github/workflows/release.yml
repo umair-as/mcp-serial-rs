@@ -1,0 +1,133 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without the v prefix (for example, 0.2.0)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark the GitHub release as a prerelease"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out default branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install PTY test dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes socat
+
+      - name: Validate release request
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          version_pattern='^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'
+          if [[ ! "$VERSION" =~ $version_pattern ]]; then
+            echo "Invalid release version: $VERSION" >&2
+            exit 1
+          fi
+
+          cargo_version="$(
+            cargo metadata --format-version 1 --no-deps \
+              | jq -r \
+                '.packages[] | select(.name == "mcp-serial-rs") | .version'
+          )"
+          if [[ "$VERSION" != "$cargo_version" ]]; then
+            echo "Requested version $VERSION does not match" \
+              "Cargo.toml version $cargo_version" >&2
+            exit 1
+          fi
+
+          tag="v$VERSION"
+          if git rev-parse --verify --quiet "refs/tags/$tag"; then
+            echo "Tag $tag already exists" >&2
+            exit 1
+          fi
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --all-targets
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: Package release assets
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          asset="mcp-serial-rs-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          staging="mcp-serial-rs-v${VERSION}-x86_64-unknown-linux-gnu"
+
+          mkdir "$staging"
+          cp target/release/mcp-serial-rs \
+            README.md LICENSE-MIT LICENSE-APACHE "$staging/"
+          tar -czf "$asset" "$staging"
+          sha256sum "$asset" > "${asset}.sha256"
+
+          echo "RELEASE_ASSET=$asset" >> "$GITHUB_ENV"
+
+      - name: Verify packaged binary version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          output="$(target/release/mcp-serial-rs --version)"
+          if [[ "$output" != "mcp-serial-rs $VERSION" ]]; then
+            echo "Unexpected binary version: $output" >&2
+            exit 1
+          fi
+
+      - name: Create tag and GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          args=(
+            "v$VERSION"
+            "$RELEASE_ASSET"
+            "${RELEASE_ASSET}.sha256"
+            --repo "$GITHUB_REPOSITORY"
+            --target "$GITHUB_SHA"
+            --title "mcp-serial-rs $VERSION"
+            --generate-notes
+          )
+          if [[ "$PRERELEASE" == "true" ]]; then
+            args+=(--prerelease)
+          fi
+          gh release create "${args[@]}"
