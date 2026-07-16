@@ -97,6 +97,12 @@ pub struct DeviceProfile {
     pub description: String,
     pub probe: Option<String>,
     pub tags: Vec<String>,
+    /// When true, sessions opened via this profile default to a `confirm`
+    /// write policy (writes require an explicit `confirm=true`). Use for
+    /// profiles that land on an interactive / privileged shell. A caller may
+    /// still escalate to `deny` at `serial.open`, but cannot downgrade below
+    /// `confirm`. Absent/false → `allow` default.
+    pub privileged: bool,
 }
 
 /// Raw on-disk shape — used only as a deserialisation target before
@@ -112,6 +118,8 @@ struct DeviceProfileRaw {
     probe: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    privileged: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,6 +150,7 @@ pub fn parse_devices(toml_text: &str) -> Result<Vec<DeviceProfile>, SerialError>
             description: raw.description,
             probe: raw.probe,
             tags: raw.tags,
+            privileged: raw.privileged,
         })
         .collect())
 }
@@ -227,6 +236,7 @@ mod tests {
         match_serial = "EXAMPLE001"
         baud         = 115200
         description  = "RPi 5 debug UART"
+        privileged   = true
     "#;
 
     #[test]
@@ -242,12 +252,14 @@ mod tests {
         assert_eq!(esp.description, "ESP32-C6 Zephyr DFU target");
         assert_eq!(esp.probe.as_deref(), Some("uart:~\\$"));
         assert_eq!(esp.tags, vec!["zephyr".to_string(), "dfu".to_string()]);
+        assert!(!esp.privileged, "privileged defaults to false when absent");
 
         let rpi = profiles.iter().find(|p| p.name == "rpi5").unwrap();
         assert_eq!(rpi.match_vid, None, "vid is optional");
         assert_eq!(rpi.match_pid, None);
         assert!(rpi.tags.is_empty(), "tags default to empty");
         assert_eq!(rpi.probe, None);
+        assert!(rpi.privileged, "privileged is honored when set");
     }
 
     #[test]

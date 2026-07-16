@@ -98,9 +98,19 @@ pub fn result_session_id(
 /// large data clipped + sized; everything else passes through as-is.
 pub fn call_summary(tool: &str, args: &Value) -> Value {
     match tool {
+        "serial.open" => json!({
+            // Records the requested `write_policy` for audit. `call_summary`
+            // runs on *unvalidated* args (before deserialization), so this is
+            // attacker-controlled and may not be a valid enum — clip it to a
+            // bounded string like every other field so a huge value can't bloat
+            // the row (or, past the 16 KiB row cap, drop it from the journal).
+            "write_policy": args.get("write_policy").and_then(Value::as_str).map(clipped),
+            "arg_keys": object_keys(args),
+        }),
         "serial.write" => json!({
             "session_id": optional_session_id(args),
             "bytes": byte_len(args, "data"),
+            "confirm": optional_bool(args, "confirm"),
             "arg_keys": object_keys(args),
         }),
         "serial.exec" => json!({
@@ -108,6 +118,7 @@ pub fn call_summary(tool: &str, args: &Value) -> Value {
             "command_bytes": byte_len(args, "command"),
             "expect_bytes": byte_len(args, "expect"),
             "timeout_ms": optional_u64(args, "timeout_ms"),
+            "confirm": optional_bool(args, "confirm"),
             "clear_before_write": optional_bool(args, "clear_before_write"),
             "normalize_output": optional_bool(args, "normalize_output"),
             "arg_keys": object_keys(args),
@@ -206,16 +217,38 @@ mod tests {
 
     #[test]
     fn call_summary_records_write_size_without_payload() {
-        let big = "x".repeat(200);
-        let args = json!({"session_id": "s".repeat(10_000), "data": big.clone()});
+        let big = "x".repeat(500);
+        let args = json!({"session_id": "s".repeat(10_000), "data": big.clone(), "confirm": true});
         let summary = call_summary("serial.write", &args);
-        assert_eq!(summary["bytes"], 200, "byte_len preserves the full size");
+        assert_eq!(summary["bytes"], 500, "byte_len preserves the full size");
         assert_eq!(
             summary["session_id"].as_str().unwrap().chars().count(),
             MAX_JOURNAL_FIELD_CHARS
         );
+        // `confirm` is recorded as metadata (bool), never the data payload.
+        assert_eq!(summary["confirm"], json!(true));
         assert!(summary.get("head").is_none());
+        assert!(!summary.to_string().contains(&big));
         assert!(summary.to_string().len() < big.len());
+    }
+
+    #[test]
+    fn open_call_summary_clips_write_policy() {
+        // `call_summary` runs before arg deserialization, so `write_policy` is
+        // unvalidated and attacker-controlled. It must be clipped like every
+        // other field — never passed through verbatim (which could bloat the
+        // row past the 16 KiB cap and drop the audit record).
+        let big = "z".repeat(50_000);
+        let args = json!({"port": "/dev/ttyUSB0", "write_policy": big.clone()});
+        let summary = call_summary("serial.open", &args);
+        assert_eq!(
+            summary["write_policy"].as_str().unwrap().chars().count(),
+            MAX_JOURNAL_FIELD_CHARS,
+        );
+        assert!(!summary.to_string().contains(&big));
+        // A non-string value coerces to null rather than passing through.
+        let odd = json!({"port": "/dev/ttyUSB0", "write_policy": {"nested": "x"}});
+        assert!(call_summary("serial.open", &odd)["write_policy"].is_null());
     }
 
     #[test]

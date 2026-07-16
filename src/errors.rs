@@ -48,6 +48,12 @@ pub enum SerialError {
 
     #[error("operation cancelled")]
     Cancelled,
+
+    #[error("session '{session_id}' is read-only (write_policy=deny)")]
+    WriteForbidden { session_id: String },
+
+    #[error("session '{session_id}' requires confirm=true to write (write_policy=confirm)")]
+    ConfirmationRequired { session_id: String },
 }
 
 impl SerialError {
@@ -66,6 +72,8 @@ impl SerialError {
             SerialError::DeviceNotFound { .. } => -32009,
             SerialError::PortBusy { .. } => -32010,
             SerialError::Cancelled => -32011,
+            SerialError::WriteForbidden { .. } => -32012,
+            SerialError::ConfirmationRequired { .. } => -32013,
         }
     }
 
@@ -89,6 +97,12 @@ impl SerialError {
             SerialError::InvalidParam { name, reason } => json!({ "name": name, "reason": reason }),
             SerialError::DeviceNotFound { device } => json!({ "device": device }),
             SerialError::Cancelled => json!({}),
+            SerialError::WriteForbidden { session_id } => {
+                json!({ "session_id": session_id, "write_policy": "deny" })
+            }
+            SerialError::ConfirmationRequired { session_id } => {
+                json!({ "session_id": session_id, "write_policy": "confirm" })
+            }
         }
     }
 
@@ -105,6 +119,8 @@ impl SerialError {
             SerialError::InvalidParam { .. } => "invalid_parameter",
             SerialError::DeviceNotFound { .. } => "device_not_found",
             SerialError::Cancelled => "cancelled",
+            SerialError::WriteForbidden { .. } => "write_forbidden",
+            SerialError::ConfirmationRequired { .. } => "confirmation_required",
         }
     }
 
@@ -175,6 +191,15 @@ mod tests {
             }
             .code(),
             SerialError::PortBusy { port: "p".into() }.code(),
+            SerialError::Cancelled.code(),
+            SerialError::WriteForbidden {
+                session_id: "s".into(),
+            }
+            .code(),
+            SerialError::ConfirmationRequired {
+                session_id: "s".into(),
+            }
+            .code(),
         ];
         let mut sorted = variants.to_vec();
         sorted.sort_unstable();

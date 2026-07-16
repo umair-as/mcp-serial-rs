@@ -42,7 +42,7 @@ use mcp_serial_rs::config::{self, DeviceProfile};
 use mcp_serial_rs::errors::SerialError;
 use mcp_serial_rs::mcp::McpServer;
 use mcp_serial_rs::serial::manager::{SessionManager, TokioSerialBackend};
-use mcp_serial_rs::serial::SerialBackend;
+use mcp_serial_rs::serial::{SerialBackend, WritePolicy};
 
 // ---- helpers --------------------------------------------------------------
 
@@ -258,7 +258,7 @@ async fn fault_server_with_open_session(
 ) {
     let (server, sessions, backend) = fault_setup(behavior);
     let session_id = sessions
-        .open("/dev/ttyUSB0", 115_200, 5_000)
+        .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
         .await
         .expect("open fault-backed session");
     (server, sessions, backend, session_id)
@@ -864,6 +864,7 @@ async fn open_by_device_resolves_through_profile_succeeds() {
         description: "step-7 device-resolution probe".into(),
         probe: None,
         tags: vec![],
+        privileged: false,
     };
 
     let resp = handshake_then_call(
@@ -902,9 +903,18 @@ async fn open_by_device_resolves_through_profile_succeeds() {
 /// test can read what the manager wrote / write bytes the manager will
 /// see on `serial.read`.
 async fn server_with_open_session() -> (McpServer<StubBackend>, String, DuplexStream) {
+    server_with_open_session_policy(WritePolicy::Allow).await
+}
+
+/// Like [`server_with_open_session`] but opens the out-of-band session with an
+/// explicit write policy, so wire tests can exercise the `deny` / `confirm`
+/// gate in the `write` / `exec` handlers.
+async fn server_with_open_session_policy(
+    policy: WritePolicy,
+) -> (McpServer<StubBackend>, String, DuplexStream) {
     let (server, sessions, backend) = stub_setup(vec![]);
     let session_id = sessions
-        .open("/dev/ttyUSB0", 115_200, 5_000)
+        .open("/dev/ttyUSB0", 115_200, 5_000, policy)
         .await
         .expect("open out-of-band");
     let device = backend.take_device();
@@ -992,6 +1002,235 @@ async fn write_happy_path_returns_bytes_written() {
         .expect("read timeout")
         .expect("read");
     assert_eq!(buf, payload.as_bytes());
+}
+
+// ---- write policy (deny / confirm) gating -------------------------------
+//
+// The gate lives in the `write` / `exec` handlers and runs before any bytes
+// reach the device. `deny` is a hard refusal; `confirm` needs `confirm=true`.
+
+/// Assert no byte crossed the duplex to the device. `handshake_then_call`
+/// drops the server (and the manager's port half) when it returns, so the
+/// device side is at EOF: `read` returns `Ok(0)` when nothing was written,
+/// or the written bytes first if the gate had leaked. Either way `n == 0`
+/// proves the write never reached the device.
+async fn assert_device_untouched(device: &mut DuplexStream) {
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 8];
+    let n = timeout(Duration::from_millis(200), device.read(&mut buf))
+        .await
+        .expect("device read should not hang")
+        .expect("device read");
+    assert_eq!(n, 0, "a gated write must not send any bytes to the device");
+}
+
+#[tokio::test]
+async fn write_denied_on_read_only_session_writes_no_bytes() {
+    let (server, session_id, mut device) = server_with_open_session_policy(WritePolicy::Deny).await;
+    let resp = handshake_then_call(
+        server,
+        "serial.write",
+        json!({"session_id": session_id, "data": "reboot\n"}),
+    )
+    .await;
+    assert_eq!(
+        rpc_error_code(&resp),
+        -32012,
+        "deny → write_forbidden; got {resp}"
+    );
+    let error = &resp["result"]["structuredContent"]["error"];
+    assert_eq!(error["type"], "write_forbidden");
+    assert_eq!(error["retryable"], false);
+    assert_eq!(error["command_written"], false);
+    assert_eq!(
+        error["session_usable"], true,
+        "session stays usable — only the write was gated"
+    );
+    assert_eq!(tool_error_data(&resp)["write_policy"], "deny");
+    assert_device_untouched(&mut device).await;
+}
+
+#[tokio::test]
+async fn write_deny_ignores_confirm_true() {
+    // `confirm=true` must NOT override a `deny` session — deny is a hard gate.
+    let (server, session_id, mut device) = server_with_open_session_policy(WritePolicy::Deny).await;
+    let resp = handshake_then_call(
+        server,
+        "serial.write",
+        json!({"session_id": session_id, "data": "x", "confirm": true}),
+    )
+    .await;
+    assert_eq!(
+        rpc_error_code(&resp),
+        -32012,
+        "deny ignores confirm; got {resp}"
+    );
+    assert_device_untouched(&mut device).await;
+}
+
+#[tokio::test]
+async fn exec_denied_on_read_only_session_writes_no_command() {
+    let (server, session_id, mut device) = server_with_open_session_policy(WritePolicy::Deny).await;
+    let resp = handshake_then_call(
+        server,
+        "serial.exec",
+        json!({"session_id": session_id, "command": "ls\n", "expect": "\\$"}),
+    )
+    .await;
+    assert_eq!(
+        rpc_error_code(&resp),
+        -32012,
+        "deny → write_forbidden; got {resp}"
+    );
+    let error = &resp["result"]["structuredContent"]["error"];
+    assert_eq!(error["type"], "write_forbidden");
+    assert_eq!(error["command_written"], false);
+    assert_device_untouched(&mut device).await;
+}
+
+#[tokio::test]
+async fn exec_confirm_required_without_confirm() {
+    let (server, session_id, mut device) =
+        server_with_open_session_policy(WritePolicy::Confirm).await;
+    let resp = handshake_then_call(
+        server,
+        "serial.exec",
+        json!({"session_id": session_id, "command": "ls\n", "expect": "\\$"}),
+    )
+    .await;
+    assert_eq!(
+        rpc_error_code(&resp),
+        -32013,
+        "exec confirm w/o confirm → -32013; got {resp}"
+    );
+    let error = &resp["result"]["structuredContent"]["error"];
+    assert_eq!(error["type"], "confirmation_required");
+    assert_eq!(error["command_written"], false);
+    assert_device_untouched(&mut device).await;
+}
+
+#[tokio::test]
+async fn exec_confirm_with_confirm_true_writes_command() {
+    // Confirmed exec proceeds to the write phase (then times out waiting for
+    // `expect`, which is a normal outcome). What we assert is that the command
+    // reached the device — i.e. the gate let it through.
+    let (server, session_id, mut device) =
+        server_with_open_session_policy(WritePolicy::Confirm).await;
+    let resp = handshake_then_call(
+        server,
+        "serial.exec",
+        json!({
+            "session_id": session_id,
+            "command": "probe\n",
+            "expect": "NEVER_MATCHES",
+            "timeout_ms": 200,
+            "confirm": true,
+        }),
+    )
+    .await;
+    let result = resp.get("result").expect("tools/call result");
+    assert_ne!(
+        result.get("isError"),
+        Some(&json!(true)),
+        "confirmed exec must not be gated; got {resp}"
+    );
+    let sc = &result["structuredContent"];
+    assert_eq!(
+        sc["command_written"], true,
+        "the command reached the device"
+    );
+    assert_eq!(
+        sc["status"], "timed_out",
+        "no match within the deadline is a normal outcome"
+    );
+    // The command bytes actually crossed the duplex.
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; b"probe\n".len()];
+    timeout(Duration::from_secs(2), device.read_exact(&mut buf))
+        .await
+        .expect("read timeout")
+        .expect("read");
+    assert_eq!(buf, b"probe\n");
+}
+
+#[tokio::test]
+async fn write_confirm_required_without_confirm() {
+    let (server, session_id, mut device) =
+        server_with_open_session_policy(WritePolicy::Confirm).await;
+    let resp = handshake_then_call(
+        server,
+        "serial.write",
+        json!({"session_id": session_id, "data": "x"}),
+    )
+    .await;
+    assert_eq!(
+        rpc_error_code(&resp),
+        -32013,
+        "confirm w/o confirm → -32013; got {resp}"
+    );
+    let error = &resp["result"]["structuredContent"]["error"];
+    assert_eq!(error["type"], "confirmation_required");
+    assert_eq!(error["retryable"], false);
+    assert_eq!(error["session_usable"], true);
+    assert_device_untouched(&mut device).await;
+}
+
+#[tokio::test]
+async fn write_confirm_with_confirm_true_succeeds() {
+    let (server, session_id, mut device) =
+        server_with_open_session_policy(WritePolicy::Confirm).await;
+    let payload = "hello\n";
+    let resp = handshake_then_call(
+        server,
+        "serial.write",
+        json!({"session_id": session_id, "data": payload, "confirm": true}),
+    )
+    .await;
+    let result = resp.get("result").expect("tools/call result");
+    assert_ne!(
+        result.get("isError"),
+        Some(&json!(true)),
+        "confirmed write must succeed; got {resp}"
+    );
+    assert_eq!(
+        result["structuredContent"]["bytes_written"].as_u64(),
+        Some(payload.len() as u64),
+    );
+    // The bytes actually crossed the duplex.
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; payload.len()];
+    timeout(Duration::from_secs(2), device.read_exact(&mut buf))
+        .await
+        .expect("read timeout")
+        .expect("read");
+    assert_eq!(buf, payload.as_bytes());
+}
+
+#[tokio::test]
+async fn open_applies_write_policy_param_end_to_end() {
+    // Full wire `serial.open` with a `write_policy` override, verified via the
+    // shared session manager (no hardware: StubBackend opens any allowlisted
+    // path). Covers the open handler's policy computation + snapshot exposure.
+    let (server, sessions, _backend) = stub_setup(vec![]);
+    let resp = handshake_then_call(
+        server.clone(),
+        "serial.open",
+        json!({"port": "/dev/ttyUSB0", "write_policy": "deny"}),
+    )
+    .await;
+    let session_id = resp["result"]["structuredContent"]["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+    assert_eq!(
+        sessions.write_policy(&session_id).unwrap(),
+        WritePolicy::Deny
+    );
+    assert_eq!(
+        sessions.get_session(&session_id).unwrap().write_policy,
+        WritePolicy::Deny,
+        "get_session snapshot surfaces the policy",
+    );
 }
 
 #[tokio::test]
@@ -1697,7 +1936,7 @@ async fn exec_timeout_returns_partial_output_ok_false_not_error() {
 async fn exec_uses_session_default_timeout_when_omitted() {
     let (server, sessions, backend) = stub_setup(vec![]);
     let session_id = sessions
-        .open("/dev/ttyUSB0", 115_200, 75)
+        .open("/dev/ttyUSB0", 115_200, 75, WritePolicy::Allow)
         .await
         .expect("open out-of-band");
     let _device = backend.take_device();
@@ -1994,7 +2233,7 @@ async fn journal_records_tools_call_pairs_and_skips_lifecycle() {
 
     let (server, sessions, _backend) = stub_server_with_journal(&path).await;
     let session_id = sessions
-        .open("/dev/ttyUSB0", 115_200, 5_000)
+        .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
         .await
         .expect("open out-of-band");
 
@@ -2068,7 +2307,7 @@ async fn journal_write_summary_records_size_without_payload() {
 
     let (server, sessions, _backend) = stub_server_with_journal(&path).await;
     let session_id = sessions
-        .open("/dev/ttyUSB0", 115_200, 5_000)
+        .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
         .await
         .expect("open");
 
@@ -2086,7 +2325,7 @@ async fn journal_write_summary_records_size_without_payload() {
                 "method": "tools/call",
                 "params": {
                     "name": "serial.write",
-                    "arguments": {"session_id": session_id, "data": big.clone()},
+                    "arguments": {"session_id": session_id, "data": big.clone(), "confirm": true},
                 },
             }),
         ],
@@ -2097,6 +2336,10 @@ async fn journal_write_summary_records_size_without_payload() {
     assert_eq!(entries.len(), 2);
     let call_summary = &entries[0]["summary"];
     assert_eq!(call_summary["bytes"], 200, "byte count preserved");
+    assert_eq!(
+        call_summary["confirm"], true,
+        "confirm flag recorded as metadata",
+    );
     assert_eq!(
         call_summary.get("head"),
         None,
@@ -2254,7 +2497,12 @@ async fn open_n_sessions(sessions: &SessionManager<StubBackend>, n: usize) -> Ve
     let mut ids = Vec::with_capacity(n);
     for idx in 0..n {
         let sid = sessions
-            .open(&format!("/dev/ttyUSB{idx}"), 115_200, 5_000)
+            .open(
+                &format!("/dev/ttyUSB{idx}"),
+                115_200,
+                5_000,
+                WritePolicy::Allow,
+            )
             .await
             .expect("open OOB");
         ids.push(sid);

@@ -17,6 +17,9 @@
 #   description   — human-readable label returned in list_ports
 #   probe         — regex pattern expected after opening (for future serial.identify)
 #   tags          — freeform labels for filtering and documentation
+#   privileged    — optional bool (default false). true → sessions opened via
+#                   this profile default to write_policy=confirm (writes need an
+#                   explicit confirm=true). Use for interactive/privileged shells.
 
 [devices.esp32c6]
 match_serial = "AABBCCDD00001111"
