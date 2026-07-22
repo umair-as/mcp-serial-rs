@@ -7,8 +7,10 @@ publishes in one run — no separate release branch or tag-push trigger.
 ## 1. Version bump
 
 Bump `version` in `Cargo.toml` to the target `X.Y.Z` (see "Choosing the
-version bump" below). This is a normal commit/PR to `main`, reviewed like any
-other change.
+version bump" below). No dedicated process here — bundle it into the last
+feature PR going into the release if one's still open, or push it as its own
+small commit/PR if not. This is a solo/personal project with no branch
+protection, so match whatever's lowest-overhead at the time.
 
 ## 2. Refresh CHANGELOG.md
 
