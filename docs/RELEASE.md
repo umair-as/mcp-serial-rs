@@ -14,10 +14,12 @@ other change.
 
 `CHANGELOG.md` is generated from git history via
 [git-cliff](https://github.com/orhun/git-cliff) (`cliff.toml`) and committed
-alongside the version bump — regenerate it before merging:
+alongside the version bump — regenerate it before merging, passing the
+version being released so the section is labeled `[X.Y.Z]` rather than
+`[Unreleased]` (the tag itself doesn't need to exist yet for this):
 
 ```sh
-GITHUB_REPO=umair-as/mcp-serial-rs git-cliff --config cliff.toml -o CHANGELOG.md
+GITHUB_REPO=umair-as/mcp-serial-rs git-cliff --config cliff.toml --tag vX.Y.Z -o CHANGELOG.md
 ```
 
 The release workflow uses the same `cliff.toml` to generate the GitHub
