@@ -1,6 +1,6 @@
 [package]
 name = "mcp-serial-rs"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "MCP server exposing serial-port access (open/read/write/exec/close) over stdio, with per-port async sessions."

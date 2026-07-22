@@ -15,7 +15,7 @@ history.\n
 body = """
 {% if version -%}
     ## [{{ version | trim_start_matches(pat="v") }}]\
-        {% if remote.github.owner and remote.github.repo and previous.version %} \
+        {% if remote.github.owner and remote.github.repo and previous.version %}\
             (https://github.com/{{ remote.github.owner }}/{{ remote.github.repo }}/compare/{{ previous.version }}...{{ version }})\
         {%- endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
 {% else -%}
