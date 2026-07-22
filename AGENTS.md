@@ -21,7 +21,9 @@ narrow console capability, not a full hardware-in-the-loop orchestrator.
    `serial.exec` with `clear_before_write=true` when stale prompts or boot logs
    could affect matching.
 6. Execute bounded operations with explicit `timeout_ms` and an `expect`
-   pattern.
+   pattern. For shell-like profiles, use their declared `line_ending`,
+   `echo_mode`, and `semantic_prompt` defaults; per-call overrides are explicit
+   and should be used only when the target behavior is known.
 7. Inspect `status`, `command_written`, `bytes_read`, `truncated`, and
    `session_usable` before deciding whether to retry.
 8. Close sessions with `serial.close` when finished.
@@ -46,8 +48,10 @@ and deliberate-second-step aid, not a hard gate.
 ## Output Handling
 
 Raw output is preserved. Do not assume prompts or command echoes have been
-removed. `serial.exec` can add `normalized_output` when requested, but
-`raw_output` remains the authoritative transcript fragment.
+removed. `serial.exec` can add `normalized_output` when requested and may add a
+best-effort `command_output` from declared line echo or OSC 3008 boundaries,
+but `raw_output` remains the authoritative transcript fragment. Missing or
+ambiguous semantic markers deliberately produce no semantic status claim.
 
 Timeouts are normal outcomes. A timeout does not necessarily mean the command
 failed; inspect partial output, byte counts, and whether the command was

@@ -66,14 +66,14 @@ Names and field shapes are stable — do not rename (dotted `serial.open`, never
 |---|---|---|
 | `serial.list_ports` | — | `{ports}` |
 | `serial.open` | `{port, baud?, timeout_ms?, write_policy?}` OR `{device, baud?, timeout_ms?, write_policy?}` | `{session_id}` |
-| `serial.sessions` | — | `{sessions}` (each incl. `write_policy`) |
-| `serial.get_session` | `{session_id}` | `{session}` (incl. `write_policy`) |
+| `serial.sessions` | — | `{sessions}` (each incl. policy + console settings) |
+| `serial.get_session` | `{session_id}` | `{session}` (incl. policy + console settings) |
 | `serial.write` | `{session_id, data, confirm?}` | `{bytes_written}` |
 | `serial.read` | `{session_id, max_bytes?, timeout_ms?}` | `{data, status, timed_out, bytes_read, truncated, session_usable}` |
 | `serial.drain` | `{session_id, max_bytes?}` | read-shaped result, short idle deadline |
 | `serial.clear_input` | `{session_id, max_bytes?}` | `{status, bytes_read, discarded_bytes, truncated, session_usable}` |
 | `serial.read_until` | `{session_id, pattern, timeout_ms?}` | `{data, matched, status, bytes_read, match_details?}` |
-| `serial.exec` | `{session_id, command, expect, timeout_ms?, clear_before_write?, normalize_output?, confirm?}` | rich exec result: raw output + write/consume state |
+| `serial.exec` | `{session_id, command, expect, line_ending?, echo_mode?, semantic_prompt?, timeout_ms?, clear_before_write?, normalize_output?, confirm?}` | raw + best-effort command output, semantic status, and write/consume state |
 | `serial.close` | `{session_id}` | `{ok}` |
 
 Results are rmcp structured tool results (`CallToolResult::structured`); rmcp
@@ -89,9 +89,11 @@ generates both input and output schemas from the typed structs.
 - **`serial.exec` is atomic per session**: one per-session port lock is held
   across optional clear → write → flush → read-until. This is mandatory —
   an allowlisted path can be a live privileged shell, and a response must never
-  be attributed to the wrong request. It writes `command` **verbatim (no
-  implicit newline)** and validates `expect` (non-empty + valid regex) *before*
-  writing, so a bad pattern can't mutate device state and only then error.
+  be attributed to the wrong request. It writes `command` unchanged by default;
+  only an explicit profile/per-call `line_ending` appends a terminator. The
+  final bytes pass through the same size validation and write-policy gate. It
+  validates `expect` (non-empty + valid regex) *before* writing, so a bad
+  pattern can't mutate device state and only then error. See ADR 0006.
 - **Timeouts are outcomes, not errors.** `read`/`read_until`/`exec` on deadline
   return a successful result (`timed_out=true` / `matched=false` /
   `status="timed_out"`) with whatever partial bytes accumulated. EOF is likewise
@@ -201,8 +203,11 @@ preferences:
   tasks; never `std::thread`.
 - **`rmcp` owns all MCP framing** — never hand-code JSON-RPC envelopes.
 - Keep `mcp/` and `serial/` separate; don't flatten `serial/`.
-- Don't rename tools to underscored form; don't append a newline to `exec`'s
-  `command`; don't add `hex:`/binary encoding to `write`.
+- Don't rename tools to underscored form or add `hex:`/binary encoding to
+  `write`. `serial.exec` transmits `command` unchanged when the effective
+  `line_ending` is `none` (the default); a profile or per-call `lf` / `cr` /
+  `crlf` setting explicitly authorizes the server to append that terminator.
+  Preserve this default and gate the complete write per ADR 0006.
 - Don't weaken the session-id format (32-char OS-random lowercase hex) without a
   separate decision.
 - Don't widen the audit journal back to full MCP traffic or add payload bodies —

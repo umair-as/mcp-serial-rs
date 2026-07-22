@@ -20,6 +20,9 @@
 #   privileged    — optional bool (default false). true → sessions opened via
 #                   this profile default to write_policy=confirm (writes need an
 #                   explicit confirm=true). Use for interactive/privileged shells.
+#   line_ending   — optional exec terminator: none (default), lf, cr, or crlf
+#   echo_mode     — optional echo contract: unknown (default), none, or line
+#   semantic_prompt — optional output boundary parser: none (default) or osc3008
 
 [devices.esp32c6]
 match_serial = "AABBCCDD00001111"
@@ -49,6 +52,10 @@ baud         = 115200
 description  = "Raspberry Pi 5 debug UART (WCH CH340)"
 probe        = "login:|#|\\$"
 tags         = ["linux", "rpi5", "gateway"]
+privileged   = true
+line_ending  = "lf"
+echo_mode    = "line"
+semantic_prompt = "osc3008"
 
 [devices.pico2w]
 match_serial = "EXAMPLE002"

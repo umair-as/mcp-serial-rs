@@ -7,8 +7,9 @@ server deliberately does not encode board-specific behavior into the protocol
 surface.
 
 Device profiles are optional local conveniences. They can name a known target,
-pin USB VID/PID/serial matching, and provide a default baud rate. The tools
-still operate on generic serial sessions.
+pin USB VID/PID/serial matching, provide a default baud rate, and declare
+bounded console-execution defaults. The tools still operate on generic serial
+sessions, whose defaults preserve as-is writes.
 
 ## System Overview
 
@@ -86,7 +87,7 @@ sequenceDiagram
 
     Client->>Server: serial.exec
     Server->>Sessions: lock session
-    Sessions->>Port: optional clear, write, flush, read
+    Sessions->>Port: optional clear, gated write, flush, echo-aware read
     Target-->>Port: raw console output
     Port-->>Sessions: bytes
     Sessions-->>Server: exec outcome
@@ -100,7 +101,10 @@ sequenceDiagram
 `serial.exec` is a single manager-level operation. It holds the per-session port
 lock across optional input clearing, command write, flush, and read-until. This
 prevents another same-session request from consuming or injecting bytes between
-a command and its expected response.
+a command and its expected response. The effective console settings are
+captured on open. A non-`none` line ending is appended before the final size
+check and the existing write-policy gate; line-echo mode delays regex matching
+until after the echo boundary.
 
 ## Current Tool Surface
 
@@ -147,7 +151,9 @@ output, including:
 - OSC shell-integration sequences.
 
 Normalization is explicit and additive. It may add a normalized field, but it
-must not replace raw output.
+must not replace raw output. Profile-gated OSC 3008 parsing may additionally
+surface bounded command output and status. It falls back without a status claim
+when the markers are missing or ambiguous. See ADR 0006.
 
 ## Out of Scope
 
