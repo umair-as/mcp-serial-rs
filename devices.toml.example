@@ -23,6 +23,8 @@
 #   line_ending   — optional exec terminator: none (default), lf, cr, or crlf
 #   echo_mode     — optional echo contract: unknown (default), none, or line
 #   semantic_prompt — optional output boundary parser: none (default) or osc3008
+#   deny_patterns  — optional server-owned regexes that block serial.exec
+#   allow_patterns — optional server-owned regexes; commands must match one
 
 [devices.esp32c6]
 match_serial = "AABBCCDD00001111"
@@ -56,6 +58,7 @@ privileged   = true
 line_ending  = "lf"
 echo_mode    = "line"
 semantic_prompt = "osc3008"
+deny_patterns  = ["\\b(reboot|poweroff)\\b", "\\bmkfs\\b"]
 
 [devices.pico2w]
 match_serial = "EXAMPLE002"

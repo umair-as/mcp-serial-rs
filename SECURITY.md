@@ -17,6 +17,7 @@ Primary risks:
 - Data leakage through logs or tool responses (credentials, device secrets, keys).
 - Resource exhaustion / denial of service (huge reads/writes, long timeouts, pathological patterns).
 - Protocol confusion and malformed request handling.
+- Dangerous shell commands on an otherwise writable console session.
 
 Out of scope (must be stated to users):
 
@@ -36,6 +37,16 @@ Out of scope (must be stated to users):
 - Enforce an explicit allowlist (`/dev/ttyUSB*`, `/dev/ttyACM*`, etc.).
 - Reject non-allowlisted ports with a typed error.
 - Run process as a non-root user with least privilege (only required group memberships, e.g. `dialout`).
+
+### 2a) Server-owned command policy
+
+- Profiles and the optional global deny policy can block complete `serial.exec`
+  commands before port checkout; callers can add deny rules but cannot relax
+  the policy.
+- A session with a command policy refuses raw `serial.write`, preventing a
+  caller from splitting a command across writes to bypass matching.
+- Journal records generated rule identifiers only, never command text or the
+  policy's regexes. See ADR 0007.
 
 ### 3) Resource limits and anti-DoS
 
@@ -120,6 +131,9 @@ Required before release:
 The dependency-security workflow runs both checks for dependency-policy changes
 and weekly against the default branch, so newly published RustSec advisories are
 detected without a repository change.
+
+See `docs/RELEASE.md` for the full release procedure (version bump,
+changelog generation, and the tagging workflow).
 
 Recommended:
 

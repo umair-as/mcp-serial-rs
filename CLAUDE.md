@@ -94,6 +94,11 @@ generates both input and output schemas from the typed structs.
   final bytes pass through the same size validation and write-policy gate. It
   validates `expect` (non-empty + valid regex) *before* writing, so a bad
   pattern can't mutate device state and only then error. See ADR 0006.
+- **Command policies are server-owned.** Profile/global deny and allow rules
+  are compiled at open and gate complete `serial.exec` commands before port
+  checkout. A caller may only add deny rules. A guarded session refuses raw
+  `serial.write`; never add buffering or best-effort matching to work around
+  this. See ADR 0007.
 - **Timeouts are outcomes, not errors.** `read`/`read_until`/`exec` on deadline
   return a successful result (`timed_out=true` / `matched=false` /
   `status="timed_out"`) with whatever partial bytes accumulated. EOF is likewise

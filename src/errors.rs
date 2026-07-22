@@ -54,6 +54,14 @@ pub enum SerialError {
 
     #[error("session '{session_id}' requires confirm=true to write (write_policy=confirm)")]
     ConfirmationRequired { session_id: String },
+
+    #[error("command blocked by server-owned policy rule '{rule}'")]
+    CommandBlocked { rule: String },
+
+    #[error(
+        "session '{session_id}' has a command policy; use serial.exec instead of serial.write"
+    )]
+    RawWriteForbidden { session_id: String },
 }
 
 impl SerialError {
@@ -74,6 +82,8 @@ impl SerialError {
             SerialError::Cancelled => -32011,
             SerialError::WriteForbidden { .. } => -32012,
             SerialError::ConfirmationRequired { .. } => -32013,
+            SerialError::CommandBlocked { .. } => -32014,
+            SerialError::RawWriteForbidden { .. } => -32015,
         }
     }
 
@@ -103,6 +113,10 @@ impl SerialError {
             SerialError::ConfirmationRequired { session_id } => {
                 json!({ "session_id": session_id, "write_policy": "confirm" })
             }
+            SerialError::CommandBlocked { rule } => json!({ "rule": rule }),
+            SerialError::RawWriteForbidden { session_id } => {
+                json!({ "session_id": session_id, "mutation_via_exec_only": true })
+            }
         }
     }
 
@@ -121,6 +135,8 @@ impl SerialError {
             SerialError::Cancelled => "cancelled",
             SerialError::WriteForbidden { .. } => "write_forbidden",
             SerialError::ConfirmationRequired { .. } => "confirmation_required",
+            SerialError::CommandBlocked { .. } => "command_blocked",
+            SerialError::RawWriteForbidden { .. } => "raw_write_forbidden",
         }
     }
 
@@ -197,6 +213,11 @@ mod tests {
             }
             .code(),
             SerialError::ConfirmationRequired {
+                session_id: "s".into(),
+            }
+            .code(),
+            SerialError::CommandBlocked { rule: "r".into() }.code(),
+            SerialError::RawWriteForbidden {
                 session_id: "s".into(),
             }
             .code(),

@@ -20,6 +20,7 @@ use crate::config;
 use crate::errors::SerialError;
 use crate::serial::console::{ConsoleSettings, EchoMode, LineEnding};
 use crate::serial::parser::{MatchDetails, PatternMatcher};
+use crate::serial::policy::{CommandPolicy, CommandPolicySummary};
 use crate::serial::session::{Session, WritePolicy};
 use crate::serial::SerialBackend;
 
@@ -78,6 +79,7 @@ pub struct SessionSnapshot {
     pub default_timeout_ms: u64,
     pub write_policy: WritePolicy,
     pub console_settings: ConsoleSettings,
+    pub command_policy: CommandPolicySummary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +211,16 @@ impl<B: SerialBackend> SessionManager<B> {
             })
     }
 
+    pub fn command_policy(&self, id: &str) -> Result<Arc<CommandPolicy>, SerialError> {
+        lock(&self.inner)
+            .sessions
+            .get(id)
+            .map(|session| Arc::clone(&session.command_policy))
+            .ok_or_else(|| SerialError::SessionNotFound {
+                session_id: id.to_string(),
+            })
+    }
+
     pub fn sessions(&self) -> Vec<SessionSnapshot> {
         let inner = lock(&self.inner);
         inner.sessions.values().map(snapshot).collect()
@@ -254,6 +266,26 @@ impl<B: SerialBackend> SessionManager<B> {
         write_policy: WritePolicy,
         console_settings: ConsoleSettings,
     ) -> Result<String, SerialError> {
+        self.open_with_console_and_policy(
+            port_path,
+            baud,
+            default_timeout_ms,
+            write_policy,
+            console_settings,
+            Arc::new(CommandPolicy::default()),
+        )
+        .await
+    }
+
+    pub async fn open_with_console_and_policy(
+        &self,
+        port_path: &str,
+        baud: u32,
+        default_timeout_ms: u64,
+        write_policy: WritePolicy,
+        console_settings: ConsoleSettings,
+        command_policy: Arc<CommandPolicy>,
+    ) -> Result<String, SerialError> {
         if !config::matches_allowlist(port_path) {
             return Err(SerialError::PortNotAllowed {
                 port: port_path.to_string(),
@@ -287,6 +319,7 @@ impl<B: SerialBackend> SessionManager<B> {
                     default_timeout_ms,
                     write_policy,
                     console_settings,
+                    command_policy,
                 ),
             );
             id
@@ -734,6 +767,7 @@ fn snapshot<P>(session: &Session<P>) -> SessionSnapshot {
         default_timeout_ms: session.default_timeout_ms,
         write_policy: session.write_policy,
         console_settings: session.console_settings,
+        command_policy: session.command_policy.summary(),
     }
 }
 

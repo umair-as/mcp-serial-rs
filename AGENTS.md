@@ -24,6 +24,8 @@ narrow console capability, not a full hardware-in-the-loop orchestrator.
    pattern. For shell-like profiles, use their declared `line_ending`,
    `echo_mode`, and `semantic_prompt` defaults; per-call overrides are explicit
    and should be used only when the target behavior is known.
+   A session with a command policy accepts mutations only through `serial.exec`;
+   `serial.write` is refused server-side to prevent split-command evasion.
 7. Inspect `status`, `command_written`, `bytes_read`, `truncated`, and
    `session_usable` before deciding whether to retry.
 8. Close sessions with `serial.close` when finished.

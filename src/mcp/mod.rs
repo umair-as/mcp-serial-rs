@@ -39,7 +39,14 @@ use crate::serial::journal::{JournalEntry, JournalWriter};
 use crate::serial::manager::{
     ExecOptions, ExecOutcome, ReadOutcome, SessionManager, SessionSnapshot,
 };
-use crate::serial::{SerialBackend, WritePolicy};
+use crate::serial::policy::CommandPolicy;
+use crate::serial::{ResolvedDevice, SerialBackend, WritePolicy};
+
+/// Injectable device-profile resolver. Production uses
+/// [`crate::serial::resolve_device`]; tests use this seam to cover the MCP
+/// open path without depending on the host's serial-port enumeration.
+pub type DeviceResolver =
+    dyn Fn(&str, &[DeviceProfile]) -> Result<ResolvedDevice, SerialError> + Send + Sync;
 
 /// rmcp-facing server. Holds shared references to the serial domain state
 /// — session manager, device profiles, and the audit journal handle — and
@@ -51,6 +58,7 @@ pub struct McpServer<B: SerialBackend> {
     /// open failed at startup); every dispatch then proceeds without
     /// logging. Wired through `call_tool` (spec §Journal Requirements).
     journal: Option<Arc<JournalWriter>>,
+    device_resolver: Arc<DeviceResolver>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -63,6 +71,7 @@ impl<B: SerialBackend> Clone for McpServer<B> {
             sessions: Arc::clone(&self.sessions),
             profiles: Arc::clone(&self.profiles),
             journal: self.journal.clone(),
+            device_resolver: Arc::clone(&self.device_resolver),
             tool_router: self.tool_router.clone(),
         }
     }
@@ -75,10 +84,26 @@ impl<B: SerialBackend> McpServer<B> {
         profiles: Arc<Vec<DeviceProfile>>,
         journal: Option<Arc<JournalWriter>>,
     ) -> Self {
+        Self::new_with_device_resolver(
+            sessions,
+            profiles,
+            journal,
+            Arc::new(crate::serial::resolve_device),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_device_resolver(
+        sessions: Arc<SessionManager<B>>,
+        profiles: Arc<Vec<DeviceProfile>>,
+        journal: Option<Arc<JournalWriter>>,
+        device_resolver: Arc<DeviceResolver>,
+    ) -> Self {
         Self {
             sessions,
             profiles,
             journal,
+            device_resolver,
             tool_router: Self::tool_router(),
         }
     }
@@ -135,48 +160,53 @@ impl<B: SerialBackend> McpServer<B> {
         // a bare port path implies `Allow`; a `privileged` device profile
         // implies `Confirm`. The caller's `write_policy` override is combined
         // below (most-restrictive wins).
-        let (port_path, baud, profile_policy, console_settings) = match (p.port, p.device) {
-            (Some(_), Some(_)) => {
-                return Ok(tool_error(
-                    SerialError::InvalidParam {
-                        name: "port/device".into(),
-                        reason: "specify 'device' or 'port', not both".into(),
-                    },
-                    None,
-                    false,
-                    false,
-                ));
-            }
-            (None, None) => {
-                return Ok(tool_error(
-                    SerialError::InvalidParam {
-                        name: "port/device".into(),
-                        reason: "missing required parameter: 'port' or 'device'".into(),
-                    },
-                    None,
-                    false,
-                    false,
-                ));
-            }
-            (Some(port), None) => (
-                port,
-                p.baud.unwrap_or(config::DEFAULT_BAUD),
-                WritePolicy::Allow,
-                ConsoleSettings::default(),
-            ),
-            (None, Some(device_name)) => {
-                let resolved = match crate::serial::resolve_device(&device_name, &self.profiles) {
-                    Ok(resolved) => resolved,
-                    Err(err) => return Ok(tool_error(err, None, false, false)),
-                };
-                (
-                    resolved.port_path,
-                    p.baud.unwrap_or(resolved.baud),
-                    resolved.write_policy,
-                    resolved.console_settings,
-                )
-            }
-        };
+        let (port_path, baud, profile_policy, console_settings, profile_deny, profile_allow) =
+            match (p.port, p.device) {
+                (Some(_), Some(_)) => {
+                    return Ok(tool_error(
+                        SerialError::InvalidParam {
+                            name: "port/device".into(),
+                            reason: "specify 'device' or 'port', not both".into(),
+                        },
+                        None,
+                        false,
+                        false,
+                    ));
+                }
+                (None, None) => {
+                    return Ok(tool_error(
+                        SerialError::InvalidParam {
+                            name: "port/device".into(),
+                            reason: "missing required parameter: 'port' or 'device'".into(),
+                        },
+                        None,
+                        false,
+                        false,
+                    ));
+                }
+                (Some(port), None) => (
+                    port,
+                    p.baud.unwrap_or(config::DEFAULT_BAUD),
+                    WritePolicy::Allow,
+                    ConsoleSettings::default(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                (None, Some(device_name)) => {
+                    let resolved = match (self.device_resolver)(&device_name, &self.profiles) {
+                        Ok(resolved) => resolved,
+                        Err(err) => return Ok(tool_error(err, None, false, false)),
+                    };
+                    (
+                        resolved.port_path,
+                        p.baud.unwrap_or(resolved.baud),
+                        resolved.write_policy,
+                        resolved.console_settings,
+                        resolved.deny_patterns,
+                        resolved.allow_patterns,
+                    )
+                }
+            };
 
         let timeout_ms = p
             .timeout_ms
@@ -186,10 +216,30 @@ impl<B: SerialBackend> McpServer<B> {
         // Most-restrictive wins (Allow < Confirm < Deny): a caller may escalate
         // a session's policy but never downgrade a privileged profile default.
         let write_policy = profile_policy.max(p.write_policy.unwrap_or_default());
+        let global_deny = match config::global_deny_patterns() {
+            Ok(patterns) => patterns,
+            Err(err) => return Ok(tool_error(err, None, false, false)),
+        };
+        let command_policy = match CommandPolicy::compile(
+            &global_deny,
+            &profile_deny,
+            &profile_allow,
+            p.deny_patterns.as_deref().unwrap_or_default(),
+        ) {
+            Ok(policy) => Arc::new(policy),
+            Err(err) => return Ok(tool_error(err, None, false, false)),
+        };
 
         match self
             .sessions
-            .open_with_console(&port_path, baud, timeout_ms, write_policy, console_settings)
+            .open_with_console_and_policy(
+                &port_path,
+                baud,
+                timeout_ms,
+                write_policy,
+                console_settings,
+                command_policy,
+            )
             .await
         {
             Ok(session_id) => structured(OpenResult { session_id }),
@@ -268,6 +318,9 @@ impl<B: SerialBackend> McpServer<B> {
         // Write-policy gate: refuse (deny) or require confirmation (confirm)
         // before any bytes reach the device. No side effect on rejection.
         if let Some(blocked) = self.gate_write(&p.session_id, p.confirm.unwrap_or(false)) {
+            return Ok(blocked);
+        }
+        if let Some(blocked) = self.gate_raw_write_policy(&p.session_id) {
             return Ok(blocked);
         }
 
@@ -513,6 +566,15 @@ impl<B: SerialBackend> McpServer<B> {
             ));
         }
 
+        // Both gates run before port checkout. A command policy is evaluated
+        // against the caller's complete command, never the transmitted suffix.
+        if let Some(blocked) = self.gate_write(&p.session_id, p.confirm.unwrap_or(false)) {
+            return Ok(blocked);
+        }
+        if let Some(blocked) = self.gate_command_policy(&p.session_id, &p.command) {
+            return Ok(blocked);
+        }
+
         let defaults = match self.sessions.console_settings(&p.session_id) {
             Ok(settings) => settings,
             Err(err) => return Ok(tool_error(err, Some(p.session_id), false, false)),
@@ -548,13 +610,6 @@ impl<B: SerialBackend> McpServer<B> {
                 false,
                 false,
             ));
-        }
-
-        // Write-policy gate — placed after input validation so a bad pattern
-        // still errors first, and before any write so a gated session never
-        // mutates the device (matching exec's "no side effect on bad input").
-        if let Some(blocked) = self.gate_write(&p.session_id, p.confirm.unwrap_or(false)) {
-            return Ok(blocked);
         }
 
         let timeout_ms = match self.operation_timeout_ms(&p.session_id, p.timeout_ms) {
@@ -630,6 +685,40 @@ impl<B: SerialBackend> McpServer<B> {
                 session_id: session_id.to_string(),
             },
             Ok(WritePolicy::Confirm) if !confirmed => SerialError::ConfirmationRequired {
+                session_id: session_id.to_string(),
+            },
+            Ok(_) => return None,
+        };
+        Some(tool_error(
+            blocked,
+            Some(session_id.to_string()),
+            false,
+            false,
+        ))
+    }
+
+    fn gate_command_policy(&self, session_id: &str, command: &str) -> Option<CallToolResult> {
+        let blocked = match self.sessions.command_policy(session_id) {
+            Err(err) => err,
+            Ok(policy) => {
+                let rule = policy.matched_rule(command)?;
+                SerialError::CommandBlocked {
+                    rule: rule.to_string(),
+                }
+            }
+        };
+        Some(tool_error(
+            blocked,
+            Some(session_id.to_string()),
+            false,
+            false,
+        ))
+    }
+
+    fn gate_raw_write_policy(&self, session_id: &str) -> Option<CallToolResult> {
+        let blocked = match self.sessions.command_policy(session_id) {
+            Err(err) => err,
+            Ok(policy) if !policy.is_empty() => SerialError::RawWriteForbidden {
                 session_id: session_id.to_string(),
             },
             Ok(_) => return None,
@@ -964,6 +1053,10 @@ pub struct OpenParams {
     /// downgrade a privileged profile.
     #[serde(default)]
     pub write_policy: Option<WritePolicy>,
+    /// Additional deny regexes. These only tighten the server/profile policy;
+    /// callers cannot supply allow patterns or remove existing restrictions.
+    #[serde(default)]
+    pub deny_patterns: Option<Vec<String>>,
 }
 
 /// Input for `serial.write`. `data` is UTF-8 text; binary protocols are

@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::serial::console::ConsoleSettings;
+use crate::serial::policy::CommandPolicy;
 
 /// Per-session gate on whether `serial.write` / `serial.exec` may send bytes
 /// to the device (CLAUDE.md safety model). Captured at `serial.open` and
@@ -82,6 +83,8 @@ pub struct Session<P> {
     /// Immutable profile-owned console execution defaults. Literal-port
     /// sessions use [`ConsoleSettings::default`].
     pub console_settings: ConsoleSettings,
+    /// Immutable, compiled server-owned policy for complete commands.
+    pub command_policy: Arc<CommandPolicy>,
 }
 
 impl<P> Session<P> {
@@ -95,6 +98,7 @@ impl<P> Session<P> {
         default_timeout_ms: u64,
         write_policy: WritePolicy,
         console_settings: ConsoleSettings,
+        command_policy: Arc<CommandPolicy>,
     ) -> Self {
         Self {
             id,
@@ -105,6 +109,7 @@ impl<P> Session<P> {
             default_timeout_ms,
             write_policy,
             console_settings,
+            command_policy,
         }
     }
 

@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use rmcp::handler::server::wrapper::Parameters;
 use rmcp::ServiceExt;
 use serde_json::{json, Value};
 use tokio::io::{
@@ -40,10 +41,11 @@ use tokio_util::sync::CancellationToken;
 
 use mcp_serial_rs::config::{self, DeviceProfile};
 use mcp_serial_rs::errors::SerialError;
-use mcp_serial_rs::mcp::McpServer;
+use mcp_serial_rs::mcp::{ExecParams, McpServer, OpenParams};
 use mcp_serial_rs::serial::console::{ConsoleSettings, EchoMode, LineEnding, SemanticPrompt};
 use mcp_serial_rs::serial::manager::{SessionManager, TokioSerialBackend};
-use mcp_serial_rs::serial::{SerialBackend, WritePolicy};
+use mcp_serial_rs::serial::policy::CommandPolicy;
+use mcp_serial_rs::serial::{ResolvedDevice, SerialBackend, WritePolicy};
 
 // ---- helpers --------------------------------------------------------------
 
@@ -891,6 +893,8 @@ async fn open_by_device_resolves_through_profile_succeeds() {
         tags: vec![],
         privileged: false,
         console: ConsoleSettings::default(),
+        deny_patterns: vec![],
+        allow_patterns: vec![],
     };
 
     let resp = handshake_then_call(
@@ -1117,6 +1121,355 @@ async fn exec_denied_on_read_only_session_writes_no_command() {
     assert_eq!(error["type"], "write_forbidden");
     assert_eq!(error["command_written"], false);
     assert_device_untouched(&mut device).await;
+}
+
+#[tokio::test]
+async fn command_policy_blocks_exec_before_any_device_io() {
+    let (server, sessions, backend) = stub_setup(vec![]);
+    let policy = Arc::new(
+        CommandPolicy::compile(&[], &["\\breboot\\b".into()], &[], &[])
+            .expect("compile test policy"),
+    );
+    let session_id = sessions
+        .open_with_console_and_policy(
+            "/dev/ttyUSB0",
+            115_200,
+            2_000,
+            WritePolicy::Allow,
+            ConsoleSettings::default(),
+            policy,
+        )
+        .await
+        .expect("open guarded session");
+    let mut device = backend.take_device();
+
+    let resp = handshake_then_call(
+        server,
+        "serial.exec",
+        json!({
+            "session_id": session_id,
+            "command": "reboot now",
+            "expect": "never",
+        }),
+    )
+    .await;
+    assert_eq!(rpc_error_code(&resp), -32014);
+    assert_eq!(tool_error_data(&resp)["rule"], "deny.profile.0");
+    let error = &resp["result"]["structuredContent"]["error"];
+    assert_eq!(error["command_written"], false);
+    assert_eq!(error["session_usable"], true);
+    drop(sessions);
+    assert_device_untouched(&mut device).await;
+}
+
+#[tokio::test]
+async fn command_policy_refuses_raw_write_to_prevent_split_evasion() {
+    let (server, sessions, backend) = stub_setup(vec![]);
+    let policy = Arc::new(
+        CommandPolicy::compile(&[], &["\\breboot\\b".into()], &[], &[])
+            .expect("compile test policy"),
+    );
+    let session_id = sessions
+        .open_with_console_and_policy(
+            "/dev/ttyUSB0",
+            115_200,
+            2_000,
+            WritePolicy::Allow,
+            ConsoleSettings::default(),
+            policy,
+        )
+        .await
+        .expect("open guarded session");
+    let mut device = backend.take_device();
+
+    let resp = handshake_then_call(
+        server,
+        "serial.write",
+        json!({"session_id": session_id, "data": "re"}),
+    )
+    .await;
+    assert_eq!(rpc_error_code(&resp), -32015);
+    assert_eq!(tool_error_data(&resp)["mutation_via_exec_only"], true);
+    drop(sessions);
+    assert_device_untouched(&mut device).await;
+}
+
+#[tokio::test]
+async fn command_policy_is_exposed_in_session_snapshots() {
+    let (server, sessions, _backend) = stub_setup(vec![]);
+    let policy = Arc::new(
+        CommandPolicy::compile(
+            &["reboot".into()],
+            &["mkfs".into()],
+            &["^uname".into()],
+            &[],
+        )
+        .expect("compile test policy"),
+    );
+    let session_id = sessions
+        .open_with_console_and_policy(
+            "/dev/ttyUSB0",
+            115_200,
+            2_000,
+            WritePolicy::Allow,
+            ConsoleSettings::default(),
+            policy,
+        )
+        .await
+        .expect("open guarded session");
+
+    let resp = handshake_then_call(
+        server,
+        "serial.get_session",
+        json!({"session_id": session_id}),
+    )
+    .await;
+    let summary = &resp["result"]["structuredContent"]["session"]["command_policy"];
+    assert_eq!(summary["deny_rule_count"], 2);
+    assert_eq!(summary["allow_rule_count"], 1);
+    assert_eq!(summary["mutation_via_exec_only"], true);
+}
+
+#[tokio::test]
+async fn command_policy_allows_a_non_matching_exec_command() {
+    let (server, sessions, backend) = stub_setup(vec![]);
+    let policy = Arc::new(
+        CommandPolicy::compile(&[], &["\\breboot\\b".into()], &[], &[])
+            .expect("compile test policy"),
+    );
+    let session_id = sessions
+        .open_with_console_and_policy(
+            "/dev/ttyUSB0",
+            115_200,
+            2_000,
+            WritePolicy::Allow,
+            ConsoleSettings::default(),
+            policy,
+        )
+        .await
+        .expect("open guarded session");
+    let mut device = backend.take_device();
+    let device_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt as _;
+        let mut command = vec![0; b"uname -a".len()];
+        device.read_exact(&mut command).await.expect("read command");
+        assert_eq!(command, b"uname -a");
+        device.write_all(b"OK").await.expect("write response");
+    });
+
+    let resp = handshake_then_call(
+        server,
+        "serial.exec",
+        json!({"session_id": session_id, "command": "uname -a", "expect": "OK"}),
+    )
+    .await;
+    device_task.await.expect("device task");
+    assert_eq!(resp["result"]["structuredContent"]["status"], "matched");
+}
+
+fn policy_profile() -> DeviceProfile {
+    DeviceProfile {
+        name: "policy-device".into(),
+        match_serial: "POLICY-TEST".into(),
+        match_vid: None,
+        match_pid: None,
+        baud: 115_200,
+        description: "policy test device".into(),
+        probe: None,
+        tags: vec![],
+        console: ConsoleSettings::default(),
+        privileged: false,
+        deny_patterns: vec!["profile-block".into()],
+        allow_patterns: vec!["^allowed$".into()],
+    }
+}
+
+fn policy_test_server() -> (
+    McpServer<StubBackend>,
+    Arc<SessionManager<StubBackend>>,
+    StubBackend,
+) {
+    let backend = StubBackend::new();
+    let sessions = Arc::new(SessionManager::new(backend.clone()));
+    let profiles = Arc::new(vec![policy_profile()]);
+    let resolver = Arc::new(|device: &str, profiles: &[DeviceProfile]| {
+        let profile = profiles
+            .iter()
+            .find(|profile| profile.name == device)
+            .ok_or_else(|| SerialError::DeviceNotFound {
+                device: device.into(),
+            })?;
+        Ok(ResolvedDevice {
+            port_path: "/dev/ttyUSB0".into(),
+            baud: profile.baud,
+            write_policy: WritePolicy::Allow,
+            console_settings: profile.console,
+            deny_patterns: profile.deny_patterns.clone(),
+            allow_patterns: profile.allow_patterns.clone(),
+        })
+    });
+    (
+        McpServer::new_with_device_resolver(sessions.clone(), profiles, None, resolver),
+        sessions,
+        backend,
+    )
+}
+
+#[tokio::test]
+async fn serial_open_unions_global_profile_and_caller_policy_rules() {
+    let previous = std::env::var_os("MCP_SERIAL_DENY_PATTERNS");
+    unsafe { std::env::set_var("MCP_SERIAL_DENY_PATTERNS", r#"["global-block"]"#) };
+    let (server, _sessions, _backend) = policy_test_server();
+    let params: OpenParams = serde_json::from_value(json!({
+        "device": "policy-device",
+        "deny_patterns": ["caller-block"],
+    }))
+    .expect("deserialize serial.open JSON arguments");
+    let open = server
+        .open(Parameters(params))
+        .await
+        .expect("open tool result");
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("MCP_SERIAL_DENY_PATTERNS", value),
+            None => std::env::remove_var("MCP_SERIAL_DENY_PATTERNS"),
+        }
+    }
+    let session_id = open
+        .structured_content
+        .as_ref()
+        .and_then(|value| value.get("session_id"))
+        .and_then(Value::as_str)
+        .expect("opened session")
+        .to_string();
+
+    for command in ["global-block", "profile-block", "caller-block"] {
+        let result = server
+            .exec(
+                Parameters(ExecParams {
+                    session_id: session_id.clone(),
+                    command: command.into(),
+                    expect: "never".into(),
+                    line_ending: None,
+                    echo_mode: None,
+                    semantic_prompt: None,
+                    confirm: None,
+                    clear_before_write: None,
+                    normalize_output: None,
+                    timeout_ms: None,
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("exec tool result");
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["error"]["code"],
+            -32014
+        );
+    }
+}
+
+#[tokio::test]
+async fn serial_open_rejects_bad_regex_from_global_policy_env() {
+    let previous = std::env::var_os("MCP_SERIAL_DENY_PATTERNS");
+    unsafe { std::env::set_var("MCP_SERIAL_DENY_PATTERNS", r#"["["]"#) };
+    let (server, _sessions, _backend) = policy_test_server();
+    let result = server
+        .open(Parameters(OpenParams {
+            port: Some("/dev/ttyUSB0".into()),
+            device: None,
+            baud: None,
+            timeout_ms: None,
+            write_policy: None,
+            deny_patterns: None,
+        }))
+        .await
+        .expect("open tool result");
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("MCP_SERIAL_DENY_PATTERNS", value),
+            None => std::env::remove_var("MCP_SERIAL_DENY_PATTERNS"),
+        }
+    }
+    assert_eq!(
+        result.structured_content.as_ref().unwrap()["error"]["code"],
+        -32008
+    );
+    assert_eq!(
+        result.structured_content.as_ref().unwrap()["error"]["data"]["name"],
+        "command_policy"
+    );
+}
+
+#[tokio::test]
+async fn serial_open_applies_profile_allow_patterns() {
+    let (server, _sessions, backend) = policy_test_server();
+    let open = server
+        .open(Parameters(
+            serde_json::from_value(json!({"device": "policy-device"}))
+                .expect("deserialize serial.open JSON arguments"),
+        ))
+        .await
+        .expect("open tool result");
+    let session_id = open.structured_content.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let denied = server
+        .exec(
+            Parameters(ExecParams {
+                session_id: session_id.clone(),
+                command: "not-allowed".into(),
+                expect: "never".into(),
+                line_ending: None,
+                echo_mode: None,
+                semantic_prompt: None,
+                confirm: None,
+                clear_before_write: None,
+                normalize_output: None,
+                timeout_ms: None,
+            }),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("exec tool result");
+    assert_eq!(
+        denied.structured_content.as_ref().unwrap()["error"]["data"]["rule"],
+        "allow.profile.no_match"
+    );
+
+    let mut device = backend.take_device();
+    let device_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt as _;
+        let mut command = vec![0; b"allowed".len()];
+        device.read_exact(&mut command).await.expect("read command");
+        assert_eq!(command, b"allowed");
+        device.write_all(b"OK").await.expect("write response");
+    });
+    let allowed = server
+        .exec(
+            Parameters(ExecParams {
+                session_id,
+                command: "allowed".into(),
+                expect: "OK".into(),
+                line_ending: None,
+                echo_mode: None,
+                semantic_prompt: None,
+                confirm: None,
+                clear_before_write: None,
+                normalize_output: None,
+                timeout_ms: None,
+            }),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("exec tool result");
+    device_task.await.expect("device task");
+    assert_eq!(
+        allowed.structured_content.as_ref().unwrap()["status"],
+        "matched"
+    );
 }
 
 #[tokio::test]
