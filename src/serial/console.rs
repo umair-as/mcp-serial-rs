@@ -256,10 +256,9 @@ fn parse_osc_marker(start: usize, end: usize, body: &str) -> Option<OscMarker> {
     let first = fields.next()?;
     let (kind, id) = if let Some(id) = first.strip_prefix("start=") {
         (OscKind::Start, id)
-    } else if let Some(id) = first.strip_prefix("end=") {
-        (OscKind::End, id)
     } else {
-        return None;
+        let id = first.strip_prefix("end=")?;
+        (OscKind::End, id)
     };
     if id.is_empty() || id.len() > 128 {
         return None;
