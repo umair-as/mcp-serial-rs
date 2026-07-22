@@ -14,6 +14,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::serial::console::ConsoleSettings;
+
 /// Per-session gate on whether `serial.write` / `serial.exec` may send bytes
 /// to the device (CLAUDE.md safety model). Captured at `serial.open` and
 /// immutable for the session's lifetime.
@@ -77,6 +79,9 @@ pub struct Session<P> {
     /// Resolved at `serial.open` (most-restrictive of profile default and
     /// caller override) and enforced by the `write` / `exec` handlers.
     pub write_policy: WritePolicy,
+    /// Immutable profile-owned console execution defaults. Literal-port
+    /// sessions use [`ConsoleSettings::default`].
+    pub console_settings: ConsoleSettings,
 }
 
 impl<P> Session<P> {
@@ -89,6 +94,7 @@ impl<P> Session<P> {
         baud: u32,
         default_timeout_ms: u64,
         write_policy: WritePolicy,
+        console_settings: ConsoleSettings,
     ) -> Self {
         Self {
             id,
@@ -98,6 +104,7 @@ impl<P> Session<P> {
             port: None,
             default_timeout_ms,
             write_policy,
+            console_settings,
         }
     }
 

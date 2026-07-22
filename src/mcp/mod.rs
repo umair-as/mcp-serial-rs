@@ -32,8 +32,13 @@ use tracing::instrument;
 
 use crate::config::{self, DeviceProfile};
 use crate::errors::SerialError;
+use crate::serial::console::{
+    analyze_transcript, ConsoleSettings, EchoMode, LineEnding, SemanticPrompt,
+};
 use crate::serial::journal::{JournalEntry, JournalWriter};
-use crate::serial::manager::{ExecOutcome, ReadOutcome, SessionManager, SessionSnapshot};
+use crate::serial::manager::{
+    ExecOptions, ExecOutcome, ReadOutcome, SessionManager, SessionSnapshot,
+};
 use crate::serial::{SerialBackend, WritePolicy};
 
 /// rmcp-facing server. Holds shared references to the serial domain state
@@ -130,7 +135,7 @@ impl<B: SerialBackend> McpServer<B> {
         // a bare port path implies `Allow`; a `privileged` device profile
         // implies `Confirm`. The caller's `write_policy` override is combined
         // below (most-restrictive wins).
-        let (port_path, baud, profile_policy) = match (p.port, p.device) {
+        let (port_path, baud, profile_policy, console_settings) = match (p.port, p.device) {
             (Some(_), Some(_)) => {
                 return Ok(tool_error(
                     SerialError::InvalidParam {
@@ -157,14 +162,19 @@ impl<B: SerialBackend> McpServer<B> {
                 port,
                 p.baud.unwrap_or(config::DEFAULT_BAUD),
                 WritePolicy::Allow,
+                ConsoleSettings::default(),
             ),
             (None, Some(device_name)) => {
-                let (path, profile_baud, profile_policy) =
-                    match crate::serial::resolve_device(&device_name, &self.profiles) {
-                        Ok(resolved) => resolved,
-                        Err(err) => return Ok(tool_error(err, None, false, false)),
-                    };
-                (path, p.baud.unwrap_or(profile_baud), profile_policy)
+                let resolved = match crate::serial::resolve_device(&device_name, &self.profiles) {
+                    Ok(resolved) => resolved,
+                    Err(err) => return Ok(tool_error(err, None, false, false)),
+                };
+                (
+                    resolved.port_path,
+                    p.baud.unwrap_or(resolved.baud),
+                    resolved.write_policy,
+                    resolved.console_settings,
+                )
             }
         };
 
@@ -179,7 +189,7 @@ impl<B: SerialBackend> McpServer<B> {
 
         match self
             .sessions
-            .open(&port_path, baud, timeout_ms, write_policy)
+            .open_with_console(&port_path, baud, timeout_ms, write_policy, console_settings)
             .await
         {
             Ok(session_id) => structured(OpenResult { session_id }),
@@ -426,9 +436,10 @@ impl<B: SerialBackend> McpServer<B> {
         }
     }
 
-    /// Compound write + read_until. Writes `command` verbatim (caller
-    /// controls bytes — no implicit newline, spec §Non-Goals) then
-    /// reads until `expect` matches or the operation deadline elapses.
+    /// Compound write + read_until. Writes `command` as-is by default. A
+    /// profile default or per-call `line_ending` override may append one
+    /// bounded terminator before the complete write passes through the same
+    /// write-policy gate.
     ///
     /// Validation runs **before** the write, so a bad request never
     /// mutates device state (spec §Error Semantics):
@@ -436,13 +447,14 @@ impl<B: SerialBackend> McpServer<B> {
     /// 1. `command` size ≤ [`config::MAX_WRITE_CHUNK`]
     /// 2. `expect` non-empty
     /// 3. `expect` is a valid regex
+    /// 4. `echo_mode=line` has a non-`none` line ending
     ///
     /// Returns structured `{"output": String, "ok": bool}`. `ok=false`
     /// on timeout (with partial output) is normal completion — NOT a
     /// JSON-RPC error.
     #[tool(
         name = "serial.exec",
-        description = "Atomically write a command, flush, and read until `expect` matches under one per-session lock. Raw output is preserved and may contain echoes, prompts, wrapping, ANSI/OSC controls, and untrusted text from a privileged device shell.",
+        description = "Atomically write a command, optionally append an explicit profile/per-call line ending, flush, and read until `expect` matches under one per-session lock. Echo-aware matching can exclude a declared line echo. Raw output remains authoritative and may contain echoes, prompts, wrapping, ANSI/OSC controls, and untrusted text from a privileged device shell.",
         output_schema = tool_output_schema::<ExecResult>(),
         annotations(title = "Execute serial command", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
@@ -501,6 +513,43 @@ impl<B: SerialBackend> McpServer<B> {
             ));
         }
 
+        let defaults = match self.sessions.console_settings(&p.session_id) {
+            Ok(settings) => settings,
+            Err(err) => return Ok(tool_error(err, Some(p.session_id), false, false)),
+        };
+        let line_ending = p.line_ending.unwrap_or(defaults.line_ending);
+        let echo_mode = p.echo_mode.unwrap_or(defaults.echo_mode);
+        let semantic_prompt = p.semantic_prompt.unwrap_or(defaults.semantic_prompt);
+        if echo_mode == EchoMode::Line && line_ending == LineEnding::None {
+            return Ok(tool_error(
+                SerialError::InvalidParam {
+                    name: "echo_mode".into(),
+                    reason: "`line` requires line_ending to be `lf`, `cr`, or `crlf`".into(),
+                },
+                Some(p.session_id),
+                false,
+                false,
+            ));
+        }
+        let mut transmitted_command = p.command.into_bytes();
+        line_ending.append_to(&mut transmitted_command);
+        if transmitted_command.len() > config::MAX_WRITE_CHUNK {
+            return Ok(tool_error(
+                SerialError::InvalidParam {
+                    name: "command".into(),
+                    reason: format!(
+                        "command plus {:?} line ending is {} bytes; max per write is {}",
+                        line_ending,
+                        transmitted_command.len(),
+                        config::MAX_WRITE_CHUNK
+                    ),
+                },
+                Some(p.session_id),
+                false,
+                false,
+            ));
+        }
+
         // Write-policy gate — placed after input validation so a bad pattern
         // still errors first, and before any write so a gated session never
         // mutates the device (matching exec's "no side effect on bad input").
@@ -515,17 +564,27 @@ impl<B: SerialBackend> McpServer<B> {
 
         match self
             .sessions
-            .exec(
+            .exec_with_options(
                 &p.session_id,
-                p.command.as_bytes(),
+                &transmitted_command,
                 &p.expect,
                 timeout_ms,
-                p.clear_before_write.unwrap_or(false),
+                ExecOptions {
+                    clear_before_write: p.clear_before_write.unwrap_or(false),
+                    echo_mode,
+                    line_ending,
+                },
                 cancellation,
             )
             .await
         {
-            Ok(outcome) => structured(exec_result(outcome, p.normalize_output.unwrap_or(false))),
+            Ok(outcome) => structured(exec_result(
+                outcome,
+                line_ending,
+                echo_mode,
+                semantic_prompt,
+                p.normalize_output.unwrap_or(false),
+            )),
             Err(err) => {
                 let possible_write = possible_serial_side_effect(&err);
                 Ok(tool_error(
@@ -663,6 +722,10 @@ pub struct ExecResult {
     pub output: String,
     pub raw_output: String,
     pub normalized_output: Option<String>,
+    pub command_output: Option<String>,
+    pub command_output_source: Option<&'static str>,
+    pub semantic_status: Option<&'static str>,
+    pub exit_code: Option<i32>,
     pub ok: bool,
     pub bytes_written: usize,
     pub bytes_read: usize,
@@ -810,15 +873,40 @@ fn read_until_result(outcome: ExecOutcome) -> ReadUntilResult {
     }
 }
 
-fn exec_result(outcome: ExecOutcome, normalize_output: bool) -> ExecResult {
+fn exec_result(
+    outcome: ExecOutcome,
+    line_ending: LineEnding,
+    echo_mode: EchoMode,
+    semantic_prompt: SemanticPrompt,
+    normalize_output: bool,
+) -> ExecResult {
     let raw_output = String::from_utf8_lossy(&outcome.output).into_owned();
-    let normalized_output = normalize_output.then(|| normalize_terminal_output(&raw_output));
+    let analysis = (normalize_output
+        || echo_mode != EchoMode::Unknown
+        || semantic_prompt != SemanticPrompt::None)
+        .then(|| analyze_transcript(&outcome.output, line_ending, echo_mode, semantic_prompt));
+    let normalized_output = normalize_output.then(|| {
+        analysis
+            .as_ref()
+            .map(|analysis| analysis.normalized_output.clone())
+            .unwrap_or_else(|| raw_output.clone())
+    });
     let status = outcome.status.as_str();
     ExecResult {
         status,
         output: raw_output.clone(),
         raw_output,
         normalized_output,
+        command_output: analysis
+            .as_ref()
+            .and_then(|analysis| analysis.command_output.clone()),
+        command_output_source: analysis
+            .as_ref()
+            .and_then(|analysis| analysis.command_output_source),
+        semantic_status: analysis
+            .as_ref()
+            .and_then(|analysis| analysis.semantic_status),
+        exit_code: analysis.as_ref().and_then(|analysis| analysis.exit_code),
         ok: status == "matched",
         bytes_written: outcome.bytes_written,
         bytes_read: outcome.bytes_read,
@@ -844,39 +932,6 @@ fn match_details_result(details: crate::serial::parser::MatchDetails) -> MatchDe
         start_byte: details.start_byte,
         end_byte: details.end_byte,
     }
-}
-
-fn normalize_terminal_output(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\u{1b}' {
-            match chars.peek().copied() {
-                Some(']') => {
-                    let _ = chars.next();
-                    let mut prev_esc = false;
-                    for c in chars.by_ref() {
-                        if c == '\u{7}' || (prev_esc && c == '\\') {
-                            break;
-                        }
-                        prev_esc = c == '\u{1b}';
-                    }
-                }
-                Some('[') => {
-                    let _ = chars.next();
-                    for c in chars.by_ref() {
-                        if ('@'..='~').contains(&c) {
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        } else if ch != '\r' {
-            out.push(ch);
-        }
-    }
-    out
 }
 
 /// Input for `serial.open`. The XOR between `port` and `device` is
@@ -977,15 +1032,28 @@ pub struct CloseParams {
     pub session_id: String,
 }
 
-/// Input for `serial.exec`. `command` is written verbatim (no implicit
-/// newline). `expect` is a non-empty regex compiled BEFORE the write so
-/// invalid input never mutates device state.
+/// Input for `serial.exec`. `command` is written as-is unless the session
+/// profile or this call explicitly selects a line ending. `expect` is a
+/// non-empty regex compiled BEFORE the write so invalid input never mutates
+/// device state.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExecParams {
     pub session_id: String,
     pub command: String,
     pub expect: String,
+    /// Override the session profile's command terminator. `none` preserves
+    /// the historical byte-for-byte behavior.
+    #[serde(default)]
+    pub line_ending: Option<LineEnding>,
+    /// Override the session profile's echo declaration. `line` requires a
+    /// non-`none` line ending and suppresses expect matching until the first
+    /// echoed line has completed.
+    #[serde(default)]
+    pub echo_mode: Option<EchoMode>,
+    /// Override semantic prompt parsing for this call.
+    #[serde(default)]
+    pub semantic_prompt: Option<SemanticPrompt>,
     /// Required to be `true` when the session's write policy is `confirm`;
     /// ignored under `allow`, and cannot override `deny`. Defaults to `false`.
     #[serde(default)]

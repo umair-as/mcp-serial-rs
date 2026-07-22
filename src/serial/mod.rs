@@ -8,6 +8,7 @@
 //! The [`SerialBackend`] trait lets us substitute a mock port implementation
 //! during testing — real serial ports cannot be opened in CI.
 
+pub mod console;
 pub mod journal;
 pub mod manager;
 pub mod parser;
@@ -19,6 +20,7 @@ use tokio_serial::{SerialPortInfo, SerialPortType};
 
 use crate::config::{self, DeviceProfile};
 use crate::errors::SerialError;
+use console::ConsoleSettings;
 pub use session::WritePolicy;
 
 /// JSON-serializable description of one available serial port — the shape
@@ -106,17 +108,27 @@ pub fn profile_write_policy(profile: &DeviceProfile) -> WritePolicy {
     }
 }
 
-/// Resolve a device-profile name to `(port_path, default_baud, write_policy)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDevice {
+    pub port_path: String,
+    pub baud: u32,
+    pub write_policy: WritePolicy,
+    pub console_settings: ConsoleSettings,
+}
+
+/// Resolve a device-profile name to its port path and immutable session
+/// defaults.
 /// Looks up the profile by name first — unknown names short-circuit before any
-/// host-side port enumeration. The third element is the profile's default
-/// write policy ([`profile_write_policy`]). Returns
+/// host-side port enumeration. The resolved value includes the profile's
+/// default write policy ([`profile_write_policy`]) and console defaults.
+/// Returns
 /// [`SerialError::DeviceNotFound`] when the profile is unknown or no
 /// currently-plugged allowlisted port matches the profile's `match_serial` /
 /// `match_vid` / `match_pid`.
 pub fn resolve_device(
     device_name: &str,
     profiles: &[DeviceProfile],
-) -> Result<(String, u32, WritePolicy), SerialError> {
+) -> Result<ResolvedDevice, SerialError> {
     let profile = profiles
         .iter()
         .find(|p| p.name == device_name)
@@ -134,7 +146,12 @@ pub fn resolve_device(
         .ok_or_else(|| SerialError::DeviceNotFound {
             device: device_name.to_string(),
         })?;
-    Ok((port_path, profile.baud, profile_write_policy(profile)))
+    Ok(ResolvedDevice {
+        port_path,
+        baud: profile.baud,
+        write_policy: profile_write_policy(profile),
+        console_settings: profile.console,
+    })
 }
 
 /// Pluggable opener for the underlying serial transport.
@@ -249,6 +266,7 @@ mod tests {
             description: format!("{name} test"),
             probe: None,
             tags: vec![],
+            console: ConsoleSettings::default(),
             privileged: false,
         }
     }

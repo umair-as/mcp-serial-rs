@@ -113,7 +113,13 @@ Required before release:
 - `cargo clippy -- -D warnings`
 - `cargo test`
 - `cargo build --release`
-- `cargo audit` (no unreviewed high/critical advisories)
+- `cargo audit` (no unreviewed advisories)
+- `cargo deny check bans licenses sources` (license, duplicate, and source
+  policy passes)
+
+The dependency-security workflow runs both checks for dependency-policy changes
+and weekly against the default branch, so newly published RustSec advisories are
+detected without a repository change.
 
 Recommended:
 

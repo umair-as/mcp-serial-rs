@@ -18,6 +18,7 @@ use tracing::{debug, instrument, warn};
 
 use crate::config;
 use crate::errors::SerialError;
+use crate::serial::console::{ConsoleSettings, EchoMode, LineEnding};
 use crate::serial::parser::{MatchDetails, PatternMatcher};
 use crate::serial::session::{Session, WritePolicy};
 use crate::serial::SerialBackend;
@@ -76,6 +77,7 @@ pub struct SessionSnapshot {
     pub state: &'static str,
     pub default_timeout_ms: u64,
     pub write_policy: WritePolicy,
+    pub console_settings: ConsoleSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +105,13 @@ pub struct ReadOutcome {
     pub status: ReadStatus,
     pub bytes_read: usize,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecOptions {
+    pub clear_before_write: bool,
+    pub echo_mode: EchoMode,
+    pub line_ending: LineEnding,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,6 +198,17 @@ impl<B: SerialBackend> SessionManager<B> {
             })
     }
 
+    /// Immutable console-execution defaults captured when the session opened.
+    pub fn console_settings(&self, id: &str) -> Result<ConsoleSettings, SerialError> {
+        lock(&self.inner)
+            .sessions
+            .get(id)
+            .map(|session| session.console_settings)
+            .ok_or_else(|| SerialError::SessionNotFound {
+                session_id: id.to_string(),
+            })
+    }
+
     pub fn sessions(&self) -> Vec<SessionSnapshot> {
         let inner = lock(&self.inner);
         inner.sessions.values().map(snapshot).collect()
@@ -215,6 +235,24 @@ impl<B: SerialBackend> SessionManager<B> {
         baud: u32,
         default_timeout_ms: u64,
         write_policy: WritePolicy,
+    ) -> Result<String, SerialError> {
+        self.open_with_console(
+            port_path,
+            baud,
+            default_timeout_ms,
+            write_policy,
+            ConsoleSettings::default(),
+        )
+        .await
+    }
+
+    pub async fn open_with_console(
+        &self,
+        port_path: &str,
+        baud: u32,
+        default_timeout_ms: u64,
+        write_policy: WritePolicy,
+        console_settings: ConsoleSettings,
     ) -> Result<String, SerialError> {
         if !config::matches_allowlist(port_path) {
             return Err(SerialError::PortNotAllowed {
@@ -248,6 +286,7 @@ impl<B: SerialBackend> SessionManager<B> {
                     baud,
                     default_timeout_ms,
                     write_policy,
+                    console_settings,
                 ),
             );
             id
@@ -440,8 +479,15 @@ impl<B: SerialBackend> SessionManager<B> {
         let mut guard = lock_port(&port, deadline, timeout_ms, cancellation.clone()).await?;
         self.ensure_port_still_ready(session_id, &port)?;
         let started = Instant::now();
-        let (status, bytes_read, match_details) =
-            read_until_locked(&mut *guard, &mut matcher, deadline, cancellation).await?;
+        let (status, bytes_read, match_details) = read_until_locked(
+            &mut *guard,
+            &mut matcher,
+            deadline,
+            cancellation,
+            EchoMode::Unknown,
+            LineEnding::None,
+        )
+        .await?;
         let output = matcher.into_buffer();
         Ok(ExecOutcome {
             status,
@@ -500,6 +546,40 @@ impl<B: SerialBackend> SessionManager<B> {
         clear_before_write: bool,
         cancellation: CancellationToken,
     ) -> Result<ExecOutcome, SerialError> {
+        self.exec_with_options(
+            session_id,
+            command,
+            expect,
+            timeout_ms,
+            ExecOptions {
+                clear_before_write,
+                echo_mode: EchoMode::Unknown,
+                line_ending: LineEnding::None,
+            },
+            cancellation,
+        )
+        .await
+    }
+
+    pub async fn exec_with_options(
+        &self,
+        session_id: &str,
+        command: &[u8],
+        expect: &str,
+        timeout_ms: u64,
+        options: ExecOptions,
+        cancellation: CancellationToken,
+    ) -> Result<ExecOutcome, SerialError> {
+        if command.len() > config::MAX_WRITE_CHUNK {
+            return Err(SerialError::InvalidParam {
+                name: "command".into(),
+                reason: format!(
+                    "command is {} bytes; max per write is {}",
+                    command.len(),
+                    config::MAX_WRITE_CHUNK
+                ),
+            });
+        }
         let port = self.checkout_port(session_id)?;
         let mut matcher = PatternMatcher::new(expect)?;
         if cancellation.is_cancelled() {
@@ -522,7 +602,7 @@ impl<B: SerialBackend> SessionManager<B> {
         let started = Instant::now();
         let mut command_written = false;
 
-        let cleared_before_write = if clear_before_write {
+        let cleared_before_write = if options.clear_before_write {
             let clear_deadline =
                 (Instant::now() + Duration::from_millis(DRAIN_TOTAL_MS)).min(deadline);
             Some(
@@ -565,8 +645,15 @@ impl<B: SerialBackend> SessionManager<B> {
         flush_deadline(&mut *guard, deadline, timeout_ms, cancellation.clone()).await?;
         command_written = true;
 
-        let (status, bytes_read, match_details) =
-            read_until_locked(&mut *guard, &mut matcher, deadline, cancellation).await?;
+        let (status, bytes_read, match_details) = read_until_locked(
+            &mut *guard,
+            &mut matcher,
+            deadline,
+            cancellation,
+            options.echo_mode,
+            options.line_ending,
+        )
+        .await?;
         let output = matcher.into_buffer();
 
         Ok(ExecOutcome {
@@ -646,6 +733,7 @@ fn snapshot<P>(session: &Session<P>) -> SessionSnapshot {
         state: session.state.name(),
         default_timeout_ms: session.default_timeout_ms,
         write_policy: session.write_policy,
+        console_settings: session.console_settings,
     }
 }
 
@@ -863,43 +951,78 @@ async fn read_until_locked<P>(
     matcher: &mut PatternMatcher,
     deadline: Instant,
     cancellation: CancellationToken,
+    echo_mode: EchoMode,
+    line_ending: LineEnding,
 ) -> Result<(ExecStatus, usize, Option<MatchDetails>), SerialError>
 where
     P: tokio::io::AsyncRead + Unpin,
 {
     let mut bytes_read = 0;
     let mut buf = [0u8; 4096];
+    let mut echo_boundary_seen = echo_mode != EchoMode::Line;
 
     loop {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return Ok((ExecStatus::TimedOut, bytes_read, matcher.match_details()));
+            let details = visible_match_details(matcher, echo_boundary_seen);
+            return Ok((ExecStatus::TimedOut, bytes_read, details));
         };
         tokio::select! {
             _ = cancellation.cancelled() => {
-                return Ok((ExecStatus::Cancelled, bytes_read, matcher.match_details()));
+                let details = visible_match_details(matcher, echo_boundary_seen);
+                return Ok((ExecStatus::Cancelled, bytes_read, details));
             }
             result = tokio::time::timeout(remaining, port.read(&mut buf)) => {
                 match result {
                     Ok(Ok(0)) => {
-                        let status = if matcher.is_match() {
+                        let status = if echo_boundary_seen && matcher.is_match() {
                             ExecStatus::Matched
                         } else {
                             ExecStatus::Eof
                         };
-                        return Ok((status, bytes_read, matcher.match_details()));
+                        let details = visible_match_details(matcher, echo_boundary_seen);
+                        return Ok((status, bytes_read, details));
                     }
                     Ok(Ok(n)) => {
                         bytes_read += n;
-                        if matcher.push(&buf[..n]) {
+                        let matched_before_echo_boundary = if echo_boundary_seen {
+                            matcher.push(&buf[..n])
+                        } else {
+                            matcher.push_without_matching(&buf[..n]);
+                            false
+                        };
+                        if !echo_boundary_seen {
+                            if let Some(boundary) = crate::serial::console::echo_line_boundary(
+                                matcher.buffer(),
+                                line_ending,
+                            ) {
+                                matcher.set_search_start(boundary);
+                                echo_boundary_seen = true;
+                                if matcher.is_match() {
+                                    return Ok((ExecStatus::Matched, bytes_read, matcher.match_details()));
+                                }
+                            }
+                        } else if matched_before_echo_boundary {
                             return Ok((ExecStatus::Matched, bytes_read, matcher.match_details()));
                         }
                     }
                     Ok(Err(e)) => return Err(SerialError::Io { message: format!("read: {e}") }),
-                    Err(_) => return Ok((ExecStatus::TimedOut, bytes_read, matcher.match_details())),
+                    Err(_) => {
+                        let details = visible_match_details(matcher, echo_boundary_seen);
+                        return Ok((ExecStatus::TimedOut, bytes_read, details));
+                    }
                 }
             }
         }
     }
+}
+
+fn visible_match_details(
+    matcher: &PatternMatcher,
+    echo_boundary_seen: bool,
+) -> Option<MatchDetails> {
+    echo_boundary_seen
+        .then(|| matcher.match_details())
+        .flatten()
 }
 
 /// Recover from a poisoned mutex by extracting the inner guard.

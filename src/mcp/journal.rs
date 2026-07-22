@@ -60,6 +60,10 @@ fn optional_bool(value: &Value, key: &str) -> Option<bool> {
     value.get(key).and_then(Value::as_bool)
 }
 
+fn optional_string(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(Value::as_str).map(clipped)
+}
+
 /// `session_id` for a `call` row, before the handler runs. Most tools
 /// take it in their arguments; `serial.list_ports` and `serial.open`
 /// have no session yet, so the `NO_SESSION` sentinel is used.
@@ -121,6 +125,9 @@ pub fn call_summary(tool: &str, args: &Value) -> Value {
             "confirm": optional_bool(args, "confirm"),
             "clear_before_write": optional_bool(args, "clear_before_write"),
             "normalize_output": optional_bool(args, "normalize_output"),
+            "line_ending": optional_string(args, "line_ending"),
+            "echo_mode": optional_string(args, "echo_mode"),
+            "semantic_prompt": optional_string(args, "semantic_prompt"),
             "arg_keys": object_keys(args),
         }),
         _ => json!({
@@ -194,6 +201,9 @@ pub fn result_summary(tool: &str, result: &Result<&CallToolResult, &ErrorData>) 
                         "exec_ok": out.get("ok"),
                         "command_written": out.get("command_written"),
                         "truncated": out.get("truncated"),
+                        "command_output_source": out.get("command_output_source"),
+                        "semantic_status": out.get("semantic_status"),
+                        "exit_code": out.get("exit_code"),
                     })
                 }
                 "serial.close" => json!({
@@ -283,6 +293,28 @@ mod tests {
         assert!(keys
             .iter()
             .all(|key| key.as_str().unwrap().chars().count() <= MAX_JOURNAL_FIELD_CHARS));
+    }
+
+    #[test]
+    fn exec_call_summary_records_bounded_console_metadata_without_command() {
+        let secret = "TOP_SECRET_COMMAND";
+        let oversized_mode = "m".repeat(10_000);
+        let args = json!({
+            "session_id": "s",
+            "command": secret,
+            "expect": "prompt",
+            "line_ending": "lf",
+            "echo_mode": oversized_mode,
+            "semantic_prompt": "osc3008",
+        });
+        let summary = call_summary("serial.exec", &args);
+        assert_eq!(summary["line_ending"], "lf");
+        assert_eq!(summary["semantic_prompt"], "osc3008");
+        assert_eq!(
+            summary["echo_mode"].as_str().unwrap().chars().count(),
+            MAX_JOURNAL_FIELD_CHARS
+        );
+        assert!(!summary.to_string().contains(secret));
     }
 
     #[test]

@@ -97,14 +97,14 @@ SDK generates input and output schemas from typed Rust structs.
 |---|---|---|
 | `serial.list_ports` | — | `{ports: [{port, vid, pid, serial, device, description}]}` |
 | `serial.open` | `{port, baud?, timeout_ms?, write_policy?}` **or** `{device, baud?, timeout_ms?, write_policy?}` | `{session_id}` (32-char random hex) |
-| `serial.sessions` | — | `{sessions: [{session_id, port, baud, state, default_timeout_ms, write_policy}]}` |
-| `serial.get_session` | `{session_id}` | `{session}` (includes `write_policy`) |
+| `serial.sessions` | — | `{sessions: [{session_id, port, baud, state, default_timeout_ms, write_policy, console_settings}]}` |
+| `serial.get_session` | `{session_id}` | `{session}` (includes policy and console settings) |
 | `serial.write` | `{session_id, data, confirm?}` (≤ 4 KiB) | `{bytes_written}` |
 | `serial.read` | `{session_id, max_bytes?, timeout_ms?}` | `{data, status, timed_out, bytes_read, truncated, session_usable, output_is_untrusted}` |
 | `serial.drain` | `{session_id, max_bytes?}` | same shape as `serial.read`, with a short idle deadline |
 | `serial.clear_input` | `{session_id, max_bytes?}` | `{status, bytes_read, discarded_bytes, truncated, session_usable}` |
 | `serial.read_until` | `{session_id, pattern, timeout_ms?}` | `{data, matched, status, bytes_read, truncated, match_details?, session_usable, output_is_untrusted}` |
-| `serial.exec` | `{session_id, command, expect, timeout_ms?, clear_before_write?, normalize_output?, confirm?}` | rich exec result including `status`, `raw_output`, optional `normalized_output`, byte counts, match details, and `command_written` |
+| `serial.exec` | `{session_id, command, expect, line_ending?, echo_mode?, semantic_prompt?, timeout_ms?, clear_before_write?, normalize_output?, confirm?}` | raw output plus optional normalized/command output, semantic status, byte counts, match details, and write state |
 | `serial.close` | `{session_id}` | `{ok}` |
 
 `serial.open` accepts either a literal `port` path or a `device` profile name
@@ -159,10 +159,22 @@ binary transport. An allowlisted path can open directly onto an interactive
 data, never as instructions. `normalize_output=true` on `serial.exec` adds a
 best-effort normalized copy; it never replaces `raw_output`.
 
+`serial.exec` transmits `command` byte-for-byte by default
+(`line_ending="none"`). A named profile or an individual call may explicitly
+select `lf`, `cr`, or `crlf`; that suffix is part of the same size check and
+write-policy-gated write, with no newline exemption. `echo_mode="line"` keeps
+the echoed line in `raw_output` but prevents `expect` from matching it; it
+requires `line_ending` to be `lf`, `cr`, or `crlf`.
+`semantic_prompt="osc3008"` can expose bounded `command_output`,
+`semantic_status`, and `exit_code`; missing or ambiguous markers fall back
+cleanly without claiming a status. See [ADR 0006](docs/adr/0006-console-execution-profiles.md).
+
 ## Device profiles (`devices.toml`)
 
 Profile entries map a stable USB serial string (and optional VID/PID) to a
-short device name and human-readable description. Two effects:
+short device name and human-readable description. They may also declare
+console execution defaults (`line_ending`, `echo_mode`, and
+`semantic_prompt`). The primary effects are:
 
 1. **Enriched `serial.list_ports`** — matched ports gain `device` and
    `description` fields (see Quick start output above).
@@ -257,14 +269,18 @@ was observed:
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"smoke","version":"0.1.0"}}}
 {"jsonrpc":"2.0","method":"notifications/initialized"}
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"serial.open","arguments":{"device":"rpi5","timeout_ms":2000}}}
-{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"serial.exec","arguments":{"session_id":"<from-#2>","command":"uname -a\n","expect":"[#>$] ","timeout_ms":8000,"clear_before_write":true,"normalize_output":true}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"serial.exec","arguments":{"session_id":"<from-#2>","command":"uname -a","expect":"[#>$] ","timeout_ms":8000,"clear_before_write":true,"normalize_output":true,"confirm":true}}}
 {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"serial.close","arguments":{"session_id":"<from-#2>"}}}
 EOF
 ```
 
 The `session_id` comes from request #2's `result.structuredContent.session_id`.
-Expect request 3 to return `status`, `ok`, `raw_output`, `bytes_written`,
-`bytes_read`, `command_written`, `match_details`, and `session_usable`. Drive
+The example `rpi5` profile supplies `line_ending="lf"`, `echo_mode="line"`,
+and `semantic_prompt="osc3008"`; literal-port callers can pass those fields on
+the exec call instead. Expect request 3 to return `status`, `ok`, `raw_output`,
+optional `normalized_output` / `command_output` / semantic status,
+`bytes_written`, `bytes_read`, `command_written`, `match_details`, and
+`session_usable`. Drive
 this from any MCP client — `rmcp`
 dispatches `tools/call` requests concurrently, so calls on independent
 sessions run in parallel; calls on the same session serialise through the

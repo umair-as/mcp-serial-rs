@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Dependency policy enforced by .github/workflows/dependency-security.yml.
+# RustSec advisories are checked separately by cargo-audit; cargo-deny covers
+# license, duplicate-dependency, and source policy without duplicating that
+# network-backed advisory lookup.
+
+[graph]
+all-features = true
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+]
+
+# `unescaper` predates SPDX's current `GPL-3.0-only` identifier and publishes
+# the deprecated equivalent `GPL-3.0/MIT` expression. Its dual license permits
+# the already-allowed MIT branch.
+[[licenses.clarify]]
+crate = "unescaper@0.1.8"
+expression = "GPL-3.0-only OR MIT"
+license-files = [{ path = "LICENSE-MIT", hash = 0xeb164a42 }]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

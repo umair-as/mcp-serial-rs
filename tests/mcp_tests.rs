@@ -41,6 +41,7 @@ use tokio_util::sync::CancellationToken;
 use mcp_serial_rs::config::{self, DeviceProfile};
 use mcp_serial_rs::errors::SerialError;
 use mcp_serial_rs::mcp::McpServer;
+use mcp_serial_rs::serial::console::{ConsoleSettings, EchoMode, LineEnding, SemanticPrompt};
 use mcp_serial_rs::serial::manager::{SessionManager, TokioSerialBackend};
 use mcp_serial_rs::serial::{SerialBackend, WritePolicy};
 
@@ -554,6 +555,30 @@ async fn tools_list_contains_dotted_tools_with_input_schema() {
             "tool `{name}` destructiveHint mismatch",
         );
     }
+
+    let exec = tools
+        .iter()
+        .find(|tool| tool["name"] == "serial.exec")
+        .expect("serial.exec schema");
+    let input = &exec["inputSchema"];
+    for field in ["line_ending", "echo_mode", "semantic_prompt"] {
+        assert!(
+            input["properties"].get(field).is_some(),
+            "serial.exec schema must advertise `{field}`"
+        );
+    }
+    assert_eq!(
+        input["$defs"]["LineEnding"]["enum"],
+        json!(["none", "lf", "cr", "crlf"])
+    );
+    assert_eq!(
+        input["$defs"]["EchoMode"]["enum"],
+        json!(["unknown", "none", "line"])
+    );
+    assert_eq!(
+        input["$defs"]["SemanticPrompt"]["enum"],
+        json!(["none", "osc3008"])
+    );
 }
 
 #[tokio::test]
@@ -865,6 +890,7 @@ async fn open_by_device_resolves_through_profile_succeeds() {
         probe: None,
         tags: vec![],
         privileged: false,
+        console: ConsoleSettings::default(),
     };
 
     let resp = handshake_then_call(
@@ -1074,7 +1100,12 @@ async fn exec_denied_on_read_only_session_writes_no_command() {
     let resp = handshake_then_call(
         server,
         "serial.exec",
-        json!({"session_id": session_id, "command": "ls\n", "expect": "\\$"}),
+        json!({
+            "session_id": session_id,
+            "command": "ls",
+            "expect": "\\$",
+            "line_ending": "crlf",
+        }),
     )
     .await;
     assert_eq!(
@@ -1121,10 +1152,11 @@ async fn exec_confirm_with_confirm_true_writes_command() {
         "serial.exec",
         json!({
             "session_id": session_id,
-            "command": "probe\n",
+            "command": "probe",
             "expect": "NEVER_MATCHES",
             "timeout_ms": 200,
             "confirm": true,
+            "line_ending": "lf",
         }),
     )
     .await;
@@ -1267,10 +1299,14 @@ async fn sessions_and_get_session_report_open_session_metadata() {
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0]["state"], "Ready");
     assert_eq!(sessions[0]["port"], "/dev/ttyUSB0");
+    assert_eq!(sessions[0]["console_settings"]["line_ending"], "none");
+    assert_eq!(sessions[0]["console_settings"]["echo_mode"], "unknown");
+    assert_eq!(sessions[0]["console_settings"]["semantic_prompt"], "none");
 
     let session = &responses[2]["result"]["structuredContent"]["session"];
     assert_eq!(session["state"], "Ready");
     assert_eq!(session["baud"], 115_200);
+    assert_eq!(session["console_settings"], sessions[0]["console_settings"]);
 }
 
 #[tokio::test]
@@ -1706,8 +1742,8 @@ async fn exec_happy_path_writes_command_verbatim_and_returns_ok_true() {
         .expect("device pre-write");
     device.flush().await.expect("flush");
 
-    // Drive the exec call via the wire. The command does NOT end in
-    // `\n` — exec must NOT append one (spec §Non-Goals).
+    // Drive the exec call via the wire. With no profile and no override,
+    // ADR 0006 preserves main's historical bytes exactly.
     let command = "run-thing";
     let resp = handshake_then_call(
         server,
@@ -1744,6 +1780,335 @@ async fn exec_happy_path_writes_command_verbatim_and_returns_ok_true() {
         command.as_bytes(),
         "exec must write `command` verbatim with no implicit newline",
     );
+}
+
+#[tokio::test]
+async fn exec_profile_line_ending_submits_command_and_echo_cannot_match_early() {
+    let (server, sessions, backend) = stub_setup(vec![]);
+    let session_id = sessions
+        .open_with_console(
+            "/dev/ttyUSB0",
+            115_200,
+            2_000,
+            WritePolicy::Allow,
+            ConsoleSettings {
+                line_ending: LineEnding::Lf,
+                echo_mode: EchoMode::Line,
+                semantic_prompt: SemanticPrompt::None,
+            },
+        )
+        .await
+        .expect("open line-console session");
+    let mut device = backend.take_device();
+    let device_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt as _;
+        let expected = b"echo LIVE_ECHO_MARK\n";
+        let mut command = vec![0; expected.len()];
+        device.read_exact(&mut command).await.expect("read command");
+        assert_eq!(command, expected, "profile LF must be part of the write");
+        device
+            .write_all(expected)
+            .await
+            .expect("write immediate echo");
+        device.flush().await.expect("flush echo");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        device
+            .write_all(b"actual LIVE_ECHO_MARK\r\nroot# ")
+            .await
+            .expect("write command output");
+    });
+
+    let resp = handshake_then_call(
+        server,
+        "serial.exec",
+        json!({
+            "session_id": session_id,
+            "command": "echo LIVE_ECHO_MARK",
+            "expect": "LIVE_ECHO_MARK",
+            "timeout_ms": 1000,
+            "normalize_output": true,
+        }),
+    )
+    .await;
+    device_task.await.expect("device task");
+
+    let sc = &resp["result"]["structuredContent"];
+    assert_eq!(sc["status"], "matched");
+    assert!(
+        sc["elapsed_ms"].as_u64().unwrap_or_default() >= 60,
+        "the echoed marker must not end the read: {sc}"
+    );
+    assert_eq!(sc["bytes_written"], b"echo LIVE_ECHO_MARK\n".len());
+    assert_eq!(sc["command_output"], "actual LIVE_ECHO_MARK\nroot# ");
+    assert_eq!(sc["command_output_source"], "normalized_transcript");
+    assert!(sc["raw_output"]
+        .as_str()
+        .unwrap()
+        .starts_with("echo LIVE_ECHO_MARK\n"));
+}
+
+#[tokio::test]
+async fn exec_line_echo_honors_cr_and_crlf_boundaries() {
+    for (line_ending, terminator) in [("cr", b"\r".as_slice()), ("crlf", b"\r\n".as_slice())] {
+        let (server, sessions, backend) = stub_setup(vec![]);
+        let session_id = sessions
+            .open_with_console(
+                "/dev/ttyUSB0",
+                115_200,
+                2_000,
+                WritePolicy::Allow,
+                ConsoleSettings {
+                    line_ending: if line_ending == "cr" {
+                        LineEnding::Cr
+                    } else {
+                        LineEnding::Crlf
+                    },
+                    echo_mode: EchoMode::Line,
+                    semantic_prompt: SemanticPrompt::None,
+                },
+            )
+            .await
+            .expect("open line-console session");
+        let mut device = backend.take_device();
+        let expected = [b"echo LIVE_ECHO_MARK".as_slice(), terminator].concat();
+        let device_task = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+            let mut command = vec![0; expected.len()];
+            device.read_exact(&mut command).await.expect("read command");
+            assert_eq!(command, expected);
+            device
+                .write_all(&command)
+                .await
+                .expect("write immediate echo");
+            device.flush().await.expect("flush echo");
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            device
+                .write_all(b"actual LIVE_ECHO_MARK\r\nprompt# ")
+                .await
+                .expect("write command output");
+        });
+
+        let resp = handshake_then_call(
+            server,
+            "serial.exec",
+            json!({
+                "session_id": session_id,
+                "command": "echo LIVE_ECHO_MARK",
+                "expect": "LIVE_ECHO_MARK",
+                "timeout_ms": 1000,
+                "normalize_output": true,
+            }),
+        )
+        .await;
+        device_task.await.expect("device task");
+
+        let sc = &resp["result"]["structuredContent"];
+        assert_eq!(sc["status"], "matched", "{line_ending}: {sc}");
+        assert!(
+            sc["elapsed_ms"].as_u64().unwrap_or_default() >= 60,
+            "{line_ending}: echoed marker must not end the read: {sc}"
+        );
+        assert_eq!(sc["command_output"], "actual LIVE_ECHO_MARK\nprompt# ");
+    }
+}
+
+#[tokio::test]
+async fn exec_per_call_none_overrides_profile_line_ending() {
+    let (server, sessions, backend) = stub_setup(vec![]);
+    let session_id = sessions
+        .open_with_console(
+            "/dev/ttyUSB0",
+            115_200,
+            2_000,
+            WritePolicy::Allow,
+            ConsoleSettings {
+                line_ending: LineEnding::Lf,
+                ..ConsoleSettings::default()
+            },
+        )
+        .await
+        .expect("open line-console session");
+    let mut device = backend.take_device();
+    device.write_all(b"OK").await.expect("stage response");
+
+    let resp = handshake_then_call(
+        server,
+        "serial.exec",
+        json!({
+            "session_id": session_id,
+            "command": "raw",
+            "expect": "OK",
+            "line_ending": "none",
+            "timeout_ms": 1000,
+        }),
+    )
+    .await;
+    assert_eq!(resp["result"]["structuredContent"]["status"], "matched");
+
+    use tokio::io::AsyncReadExt as _;
+    drop(sessions);
+    let mut command = Vec::new();
+    timeout(Duration::from_secs(1), device.read_to_end(&mut command))
+        .await
+        .expect("device read timeout")
+        .expect("device read");
+    assert_eq!(command, b"raw", "per-call none must suppress profile LF");
+}
+
+#[tokio::test]
+async fn exec_rejects_line_echo_without_a_line_terminator_before_writing() {
+    let (server, sessions, backend) = stub_setup(vec![]);
+    let session_id = sessions
+        .open("/dev/ttyUSB0", 115_200, 2_000, WritePolicy::Allow)
+        .await
+        .expect("open session");
+    let mut device = backend.take_device();
+
+    let resp = handshake_then_call(
+        server,
+        "serial.exec",
+        json!({
+            "session_id": session_id,
+            "command": "echo never-written",
+            "expect": "never",
+            "line_ending": "none",
+            "echo_mode": "line",
+        }),
+    )
+    .await;
+
+    assert_eq!(rpc_error_code(&resp), -32008);
+    assert_eq!(tool_error_data(&resp)["name"], "echo_mode");
+
+    use tokio::io::AsyncReadExt as _;
+    drop(sessions);
+    let mut written = Vec::new();
+    timeout(Duration::from_secs(1), device.read_to_end(&mut written))
+        .await
+        .expect("device read timeout")
+        .expect("device read");
+    assert!(
+        written.is_empty(),
+        "invalid echo configuration must not write"
+    );
+}
+
+#[tokio::test]
+async fn exec_osc3008_splits_command_output_and_parses_status_conservatively() {
+    let (server, sessions, backend) = stub_setup(vec![]);
+    let session_id = sessions
+        .open_with_console(
+            "/dev/ttyUSB0",
+            115_200,
+            2_000,
+            WritePolicy::Allow,
+            ConsoleSettings::default(),
+        )
+        .await
+        .expect("open session");
+    let mut device = backend.take_device();
+    let device_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt as _;
+        let expected = b"false\n";
+        let mut command = vec![0; expected.len()];
+        device.read_exact(&mut command).await.expect("read command");
+        assert_eq!(command, expected);
+        device
+            .write_all(
+                b"false\r\n\x1b]3008;start=live-1;type=command\x1b\\failure text\r\n\x1b]3008;end=live-1;exit=failure;status=1\x1b\\root# ",
+            )
+            .await
+            .expect("write semantic transcript");
+    });
+
+    let resp = handshake_then_call(
+        server,
+        "serial.exec",
+        json!({
+            "session_id": session_id,
+            "command": "false",
+            "expect": "root# ",
+            "line_ending": "lf",
+            "echo_mode": "line",
+            "semantic_prompt": "osc3008",
+            "normalize_output": true,
+            "timeout_ms": 1000,
+        }),
+    )
+    .await;
+    device_task.await.expect("device task");
+
+    let sc = &resp["result"]["structuredContent"];
+    assert_eq!(sc["command_output"], "failure text\n");
+    assert_eq!(sc["command_output_source"], "osc3008");
+    assert_eq!(sc["semantic_status"], "failure");
+    assert_eq!(sc["exit_code"], 1);
+    assert!(sc["raw_output"].as_str().unwrap().contains("\u{1b}]3008;"));
+}
+
+#[tokio::test]
+async fn exec_wrapped_echo_fixture_excludes_observed_echo_from_normalized_output() {
+    let (server, sessions, backend) = stub_setup(vec![]);
+    let session_id = sessions
+        .open("/dev/ttyUSB0", 115_200, 2_000, WritePolicy::Allow)
+        .await
+        .expect("open session");
+    let mut device = backend.take_device();
+    let command = "printf 'NARROW_LEN'";
+    let device_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt as _;
+        let expected = b"printf 'NARROW_LEN'\n";
+        let mut written = vec![0; expected.len()];
+        device.read_exact(&mut written).await.expect("read command");
+        assert_eq!(written, expected);
+        device
+            .write_all(b"printf 'NARROW_LE\rEN'\r\nRESULT\r\nroot# ")
+            .await
+            .expect("write wrapped-echo fixture");
+    });
+
+    let resp = handshake_then_call(
+        server,
+        "serial.exec",
+        json!({
+            "session_id": session_id,
+            "command": command,
+            "expect": "root# ",
+            "line_ending": "lf",
+            "echo_mode": "line",
+            "normalize_output": true,
+            "timeout_ms": 1000,
+        }),
+    )
+    .await;
+    device_task.await.expect("device task");
+
+    let sc = &resp["result"]["structuredContent"];
+    assert_eq!(
+        sc["raw_output"],
+        "printf 'NARROW_LE\rEN'\r\nRESULT\r\nroot# "
+    );
+    assert_eq!(sc["normalized_output"], "RESULT\nroot# ");
+    assert!(!sc["normalized_output"].as_str().unwrap().contains("LEEN"));
+}
+
+#[tokio::test]
+async fn exec_rejects_terminator_that_would_exceed_final_write_cap() {
+    let (server, session_id, mut device) = server_with_open_session().await;
+    let resp = handshake_then_call(
+        server,
+        "serial.exec",
+        json!({
+            "session_id": session_id,
+            "command": "x".repeat(config::MAX_WRITE_CHUNK),
+            "expect": "never",
+            "line_ending": "lf",
+        }),
+    )
+    .await;
+    assert_eq!(rpc_error_code(&resp), -32008);
+    assert_eq!(tool_error_data(&resp)["name"], "command");
+    assert_device_untouched(&mut device).await;
 }
 
 #[tokio::test]

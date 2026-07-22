@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::errors::SerialError;
+use crate::serial::console::{ConsoleSettings, EchoMode, LineEnding, SemanticPrompt};
 
 /// Glob patterns of serial device paths that `serial.open` will accept.
 /// Anything outside this list is rejected with `PortNotAllowed`.
@@ -97,6 +98,9 @@ pub struct DeviceProfile {
     pub description: String,
     pub probe: Option<String>,
     pub tags: Vec<String>,
+    /// Profile-owned defaults for command submission, echo handling, and
+    /// semantic-prompt parsing. All fields default to raw-compatible values.
+    pub console: ConsoleSettings,
     /// When true, sessions opened via this profile default to a `confirm`
     /// write policy (writes require an explicit `confirm=true`). Use for
     /// profiles that land on an interactive / privileged shell. A caller may
@@ -120,6 +124,12 @@ struct DeviceProfileRaw {
     tags: Vec<String>,
     #[serde(default)]
     privileged: bool,
+    #[serde(default)]
+    line_ending: LineEnding,
+    #[serde(default)]
+    echo_mode: EchoMode,
+    #[serde(default)]
+    semantic_prompt: SemanticPrompt,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,6 +160,11 @@ pub fn parse_devices(toml_text: &str) -> Result<Vec<DeviceProfile>, SerialError>
             description: raw.description,
             probe: raw.probe,
             tags: raw.tags,
+            console: ConsoleSettings {
+                line_ending: raw.line_ending,
+                echo_mode: raw.echo_mode,
+                semantic_prompt: raw.semantic_prompt,
+            },
             privileged: raw.privileged,
         })
         .collect())
@@ -237,6 +252,9 @@ mod tests {
         baud         = 115200
         description  = "RPi 5 debug UART"
         privileged   = true
+        line_ending   = "lf"
+        echo_mode     = "line"
+        semantic_prompt = "osc3008"
     "#;
 
     #[test]
@@ -252,6 +270,7 @@ mod tests {
         assert_eq!(esp.description, "ESP32-C6 Zephyr DFU target");
         assert_eq!(esp.probe.as_deref(), Some("uart:~\\$"));
         assert_eq!(esp.tags, vec!["zephyr".to_string(), "dfu".to_string()]);
+        assert_eq!(esp.console, ConsoleSettings::default());
         assert!(!esp.privileged, "privileged defaults to false when absent");
 
         let rpi = profiles.iter().find(|p| p.name == "rpi5").unwrap();
@@ -260,6 +279,9 @@ mod tests {
         assert!(rpi.tags.is_empty(), "tags default to empty");
         assert_eq!(rpi.probe, None);
         assert!(rpi.privileged, "privileged is honored when set");
+        assert_eq!(rpi.console.line_ending, LineEnding::Lf);
+        assert_eq!(rpi.console.echo_mode, EchoMode::Line);
+        assert_eq!(rpi.console.semantic_prompt, SemanticPrompt::Osc3008);
     }
 
     #[test]
