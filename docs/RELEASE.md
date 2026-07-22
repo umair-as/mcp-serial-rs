@@ -9,10 +9,7 @@ publishes in one run — no separate release branch or tag-push trigger.
 Bump `version` in `Cargo.toml` to the target `X.Y.Z` (see "Choosing the
 version bump" below). No dedicated process here — bundle it into the last
 feature PR going into the release if one's still open, or push it as its own
-small commit/PR if not. This is a solo/personal project and branch
-protection isn't currently enabled, so match whatever's lowest-overhead at
-the time; revisit if that ever changes (e.g. a second contributor, or
-protection gets turned on).
+small commit/PR if not.
 
 ## 2. Refresh CHANGELOG.md
 
