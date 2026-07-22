@@ -169,6 +169,13 @@ requires `line_ending` to be `lf`, `cr`, or `crlf`.
 `semantic_status`, and `exit_code`; missing or ambiguous markers fall back
 cleanly without claiming a status. See [ADR 0006](docs/adr/0006-console-execution-profiles.md).
 
+Profiles can also apply a server-owned command policy to complete `serial.exec`
+commands. `deny_patterns` block matches; `allow_patterns` permit only matches.
+The global `MCP_SERIAL_DENY_PATTERNS` value is a JSON array of additional deny
+regexes. A caller may add `deny_patterns` while opening a session, but cannot
+remove policy or add allow rules. Guarded sessions refuse raw `serial.write` so
+split writes cannot evade matching. See [ADR 0007](docs/adr/0007-server-owned-command-policy.md).
+
 ## Device profiles (`devices.toml`)
 
 Profile entries map a stable USB serial string (and optional VID/PID) to a

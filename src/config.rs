@@ -53,6 +53,11 @@ pub const DEFAULT_DEVICES_PATH: &str = "devices.toml";
 /// runs in degraded mode without auditing rather than failing to start.
 pub const JOURNAL_ENV: &str = "MCP_SERIAL_JOURNAL";
 
+/// JSON array of server-owned deny regexes applied to every newly opened
+/// session. Example: `["\\breboot\\b","\\bmkfs\\b"]`. Invalid JSON or
+/// regexes reject the affected `serial.open` before any port I/O.
+pub const DENY_PATTERNS_ENV: &str = "MCP_SERIAL_DENY_PATTERNS";
+
 /// Fallback default journal path when neither [`JOURNAL_ENV`] nor
 /// `XDG_STATE_HOME` can supply a user-private location.
 pub const DEFAULT_JOURNAL_PATH: &str = ".mcp-serial-rs/audit.jsonl";
@@ -85,6 +90,20 @@ pub fn journal_path() -> PathBuf {
     PathBuf::from(DEFAULT_JOURNAL_PATH)
 }
 
+pub fn global_deny_patterns() -> Result<Vec<String>, SerialError> {
+    let Ok(value) = std::env::var(DENY_PATTERNS_ENV) else {
+        return Ok(Vec::new());
+    };
+    parse_global_deny_patterns(&value)
+}
+
+fn parse_global_deny_patterns(value: &str) -> Result<Vec<String>, SerialError> {
+    serde_json::from_str(value).map_err(|error| SerialError::InvalidParam {
+        name: DENY_PATTERNS_ENV.into(),
+        reason: format!("must be a JSON array of regex strings: {error}"),
+    })
+}
+
 /// A device profile loaded from `devices.toml`. `name` is the TOML table
 /// key (e.g. `esp32c6`). Used by `serial.list_ports` to enrich port output
 /// and by `serial.open` to resolve a `{device}` param to a port path.
@@ -101,6 +120,10 @@ pub struct DeviceProfile {
     /// Profile-owned defaults for command submission, echo handling, and
     /// semantic-prompt parsing. All fields default to raw-compatible values.
     pub console: ConsoleSettings,
+    /// Server-owned deny and allow regexes for complete `serial.exec`
+    /// commands. They are compiled when the session opens.
+    pub deny_patterns: Vec<String>,
+    pub allow_patterns: Vec<String>,
     /// When true, sessions opened via this profile default to a `confirm`
     /// write policy (writes require an explicit `confirm=true`). Use for
     /// profiles that land on an interactive / privileged shell. A caller may
@@ -130,6 +153,10 @@ struct DeviceProfileRaw {
     echo_mode: EchoMode,
     #[serde(default)]
     semantic_prompt: SemanticPrompt,
+    #[serde(default)]
+    deny_patterns: Vec<String>,
+    #[serde(default)]
+    allow_patterns: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,6 +192,8 @@ pub fn parse_devices(toml_text: &str) -> Result<Vec<DeviceProfile>, SerialError>
                 echo_mode: raw.echo_mode,
                 semantic_prompt: raw.semantic_prompt,
             },
+            deny_patterns: raw.deny_patterns,
+            allow_patterns: raw.allow_patterns,
             privileged: raw.privileged,
         })
         .collect())
@@ -255,6 +284,8 @@ mod tests {
         line_ending   = "lf"
         echo_mode     = "line"
         semantic_prompt = "osc3008"
+        deny_patterns = ["\\breboot\\b"]
+        allow_patterns = ["^uname"]
     "#;
 
     #[test]
@@ -282,6 +313,20 @@ mod tests {
         assert_eq!(rpi.console.line_ending, LineEnding::Lf);
         assert_eq!(rpi.console.echo_mode, EchoMode::Line);
         assert_eq!(rpi.console.semantic_prompt, SemanticPrompt::Osc3008);
+        assert_eq!(rpi.deny_patterns, vec!["\\breboot\\b"]);
+        assert_eq!(rpi.allow_patterns, vec!["^uname"]);
+    }
+
+    #[test]
+    fn global_deny_patterns_require_a_json_array_of_strings() {
+        assert_eq!(
+            parse_global_deny_patterns("[\"reboot\"]").unwrap(),
+            ["reboot"]
+        );
+        assert!(matches!(
+            parse_global_deny_patterns("not-json"),
+            Err(SerialError::InvalidParam { name, .. }) if name == DENY_PATTERNS_ENV
+        ));
     }
 
     #[test]

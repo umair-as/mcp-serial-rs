@@ -109,6 +109,11 @@ pub fn call_summary(tool: &str, args: &Value) -> Value {
             // bounded string like every other field so a huge value can't bloat
             // the row (or, past the 16 KiB row cap, drop it from the journal).
             "write_policy": args.get("write_policy").and_then(Value::as_str).map(clipped),
+            "caller_deny_rule_count": args
+                .get("deny_patterns")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0),
             "arg_keys": object_keys(args),
         }),
         "serial.write" => json!({
@@ -154,6 +159,11 @@ pub fn result_summary(tool: &str, result: &Result<&CallToolResult, &ErrorData>) 
                     "is_error": true,
                     "error_code": error.and_then(|e| e.get("code")),
                     "error_type": error.and_then(|e| e.get("type")),
+                    "matched_rule": error
+                        .filter(|e| e.get("type").and_then(Value::as_str) == Some("command_blocked"))
+                        .and_then(|e| e.pointer("/data/rule"))
+                        .and_then(Value::as_str)
+                        .map(clipped),
                 });
             }
             match tool {
@@ -259,6 +269,33 @@ mod tests {
         // A non-string value coerces to null rather than passing through.
         let odd = json!({"port": "/dev/ttyUSB0", "write_policy": {"nested": "x"}});
         assert!(call_summary("serial.open", &odd)["write_policy"].is_null());
+    }
+
+    #[test]
+    fn command_policy_journal_fields_are_metadata_only_and_bounded() {
+        let secret = "TOP_SECRET_POLICY";
+        let args = json!({
+            "port": "/dev/ttyUSB0",
+            "deny_patterns": [secret, "other"],
+        });
+        let open = call_summary("serial.open", &args);
+        assert_eq!(open["caller_deny_rule_count"], 2);
+        assert!(!open.to_string().contains(secret));
+
+        let long_rule = "r".repeat(MAX_JOURNAL_FIELD_CHARS + 10);
+        let result = CallToolResult::structured_error(json!({
+            "error": {
+                "type": "command_blocked",
+                "code": -32014,
+                "data": {"rule": long_rule},
+            }
+        }));
+        let summary = result_summary("serial.exec", &Ok(&result));
+        assert_eq!(
+            summary["matched_rule"].as_str().unwrap().chars().count(),
+            MAX_JOURNAL_FIELD_CHARS
+        );
+        assert!(summary.get("command").is_none());
     }
 
     #[test]

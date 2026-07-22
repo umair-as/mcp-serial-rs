@@ -12,6 +12,7 @@ pub mod console;
 pub mod journal;
 pub mod manager;
 pub mod parser;
+pub mod policy;
 pub mod session;
 
 use schemars::JsonSchema;
@@ -114,6 +115,8 @@ pub struct ResolvedDevice {
     pub baud: u32,
     pub write_policy: WritePolicy,
     pub console_settings: ConsoleSettings,
+    pub deny_patterns: Vec<String>,
+    pub allow_patterns: Vec<String>,
 }
 
 /// Resolve a device-profile name to its port path and immutable session
@@ -151,6 +154,8 @@ pub fn resolve_device(
         baud: profile.baud,
         write_policy: profile_write_policy(profile),
         console_settings: profile.console,
+        deny_patterns: profile.deny_patterns.clone(),
+        allow_patterns: profile.allow_patterns.clone(),
     })
 }
 
@@ -267,6 +272,8 @@ mod tests {
             probe: None,
             tags: vec![],
             console: ConsoleSettings::default(),
+            deny_patterns: vec![],
+            allow_patterns: vec![],
             privileged: false,
         }
     }

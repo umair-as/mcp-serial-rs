@@ -104,7 +104,10 @@ prevents another same-session request from consuming or injecting bytes between
 a command and its expected response. The effective console settings are
 captured on open. A non-`none` line ending is appended before the final size
 check and the existing write-policy gate; line-echo mode delays regex matching
-until after the echo boundary.
+until after the echo boundary. A profile/global command policy is also captured
+at open and gates the complete command before port checkout. Guarded sessions
+refuse raw writes so policy matching cannot be bypassed by split input; see ADR
+0007.
 
 ## Current Tool Surface
 

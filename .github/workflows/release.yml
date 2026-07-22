@@ -112,6 +112,17 @@ jobs:
             exit 1
           fi
 
+      - name: Generate release notes
+        # v4
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5
+        with:
+          version: v2.13.1
+          config: cliff.toml
+          args: --unreleased --tag v${{ inputs.version }} --strip header
+        env:
+          OUTPUT: RELEASE_NOTES.md
+          GITHUB_REPO: ${{ github.repository }}
+
       - name: Create tag and GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -125,7 +136,7 @@ jobs:
             --repo "$GITHUB_REPOSITORY"
             --target "$GITHUB_SHA"
             --title "mcp-serial-rs $VERSION"
-            --generate-notes
+            --notes-file RELEASE_NOTES.md
           )
           if [[ "$PRERELEASE" == "true" ]]; then
             args+=(--prerelease)
