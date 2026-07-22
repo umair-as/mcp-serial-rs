@@ -700,12 +700,12 @@ impl<B: SerialBackend> McpServer<B> {
     fn gate_command_policy(&self, session_id: &str, command: &str) -> Option<CallToolResult> {
         let blocked = match self.sessions.command_policy(session_id) {
             Err(err) => err,
-            Ok(policy) => match policy.matched_rule(command) {
-                Some(rule) => SerialError::CommandBlocked {
+            Ok(policy) => {
+                let rule = policy.matched_rule(command)?;
+                SerialError::CommandBlocked {
                     rule: rule.to_string(),
-                },
-                None => return None,
-            },
+                }
+            }
         };
         Some(tool_error(
             blocked,
