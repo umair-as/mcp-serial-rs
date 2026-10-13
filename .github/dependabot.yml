@@ -1,0 +1,46 @@
+version: 2
+
+# Automated dependency-update PRs. Free on GitHub for public repos. Updates are
+# grouped per-ecosystem into a single weekly PR to keep churn low; every PR is
+# gated by CI (ci.yml build-test) before it can merge.
+updates:
+  # Rust crate dependencies (root crate). cargo-audit / cargo-deny *detect*
+  # advisory and license problems; this keeps versions current. Minor/patch
+  # bumps are grouped into one weekly PR; major bumps arrive as their own PRs
+  # so a potentially-breaking upgrade (e.g. rmcp) is reviewed on its own.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    labels: ["dependencies", "rust"]
+    # rmcp majors are a deliberate, separately-scoped migration, not a routine
+    # bump: 1.7 -> 3.0 renames core SDK types (CallToolResult -> CallToolResponse)
+    # and breaks the build. Suppress the auto-PR; the upgrade is tracked as its
+    # own task. Remove this ignore when doing the migration.
+    ignore:
+      - dependency-name: "rmcp"
+        update-types: ["version-update:semver-major"]
+    groups:
+      cargo-minor:
+        update-types: ["minor", "patch"]
+        patterns: ["*"]
+
+  # Keep the SHA-pinned GitHub Actions current (checkout, rust-toolchain,
+  # rust-cache, cargo-deny-action, audit-check, git-cliff-action). Dependabot
+  # bumps both the pinned commit SHA and its "# vX.Y.Z" comment — the intended
+  # companion to pinning, and what keeps deprecations (e.g. checkout on Node 20)
+  # from going stale.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    labels: ["ci", "dependencies"]
+    groups:
+      github-actions:
+        patterns: ["*"]
