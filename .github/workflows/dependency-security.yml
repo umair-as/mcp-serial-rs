@@ -14,8 +14,6 @@ on:
       - "Cargo.lock"
       - "deny.toml"
       - ".github/workflows/dependency-security.yml"
-  schedule:
-    - cron: "23 4 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -24,11 +22,11 @@ permissions:
 jobs:
   audit:
     name: cargo audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       checks: write
-      issues: write  # audit-check opens an issue on schedule/push runs
+      issues: write  # audit-check opens an issue on push runs
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
@@ -37,7 +35,7 @@ jobs:
 
   deny:
     name: cargo deny
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: EmbarkStudios/cargo-deny-action@0105f7c440bc8084c17cad47fe92e63049519458 # v2.0.18
