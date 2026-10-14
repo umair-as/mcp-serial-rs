@@ -40,6 +40,15 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 /// Upper clamp for any caller-supplied timeout (ms).
 pub const MAX_TIMEOUT_MS: u64 = 30_000;
 
+/// Maximum source length (bytes) of any regex: `read_until` patterns, `exec`
+/// `expect`, and command-policy rules.
+pub const MAX_PATTERN_LEN: usize = 1024;
+
+/// Compiled-program and lazy-DFA cache limits for every regex. Well below the
+/// `regex` crate defaults so one pattern cannot claim tens of MiB.
+pub const REGEX_SIZE_LIMIT: usize = 1 << 20;
+pub const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20;
+
 /// Env var pointing at the device-profile TOML file. Missing file is not
 /// an error — profiles are optional. See [`load_devices`].
 pub const DEVICES_ENV: &str = "MCP_SERIAL_DEVICES";

@@ -66,7 +66,13 @@ Out of scope (must be stated to users):
   conservative side-effect metadata.
 - Cap read buffer and write chunk sizes.
 - Limit concurrent sessions.
-- Bound regex pattern size/complexity for `read_until` to avoid pathological behavior.
+- Bound every regex (`read_until` pattern, `exec` `expect`, command-policy
+  rules): source at most 1 KiB, compiled program and lazy-DFA cache at most
+  1 MiB each. The `regex` crate matches in linear time, so there is no
+  backtracking ReDoS.
+- Each read chunk re-scans the bounded 64 KiB match window once, without
+  per-byte allocation. Worst-case CPU per `read_until`/`exec` is therefore
+  bounded by the window size and the 30 s timeout cap.
 
 ### 4) Data handling and leak prevention
 

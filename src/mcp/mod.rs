@@ -595,11 +595,11 @@ impl<B: SerialBackend> McpServer<B> {
                 false,
             ));
         }
-        if let Err(e) = regex::Regex::new(&p.expect) {
+        if let Err(reason) = crate::serial::parser::bounded_regex(&p.expect) {
             return Ok(tool_error(
                 SerialError::InvalidParam {
                     name: "expect".into(),
-                    reason: format!("invalid regex: {e}"),
+                    reason,
                 },
                 Some(p.session_id),
                 false,

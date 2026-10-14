@@ -19,6 +19,7 @@ use regex::Regex;
 
 use crate::errors::SerialError;
 use crate::serial::console::LineEnding;
+use crate::serial::parser::bounded_regex;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct CommandPolicySummary {
@@ -110,14 +111,14 @@ fn compile_rules(prefix: &str, patterns: &[String]) -> Result<Vec<Rule>, SerialE
         .iter()
         .enumerate()
         .map(|(index, pattern)| {
-            Regex::new(pattern)
+            bounded_regex(pattern)
                 .map(|regex| Rule {
                     name: format!("{}.{index}", prefix),
                     regex,
                 })
                 .map_err(|error| SerialError::InvalidParam {
                     name: "command_policy".into(),
-                    reason: format!("invalid {prefix} regex at index {index}: {error}"),
+                    reason: format!("{prefix} regex at index {index}: {error}"),
                 })
         })
         .collect()

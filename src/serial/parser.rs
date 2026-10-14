@@ -17,10 +17,29 @@
 //! so the physical Vec is bounded at `2 * max_buffer` and per-byte cost is
 //! O(1) amortized — important for long-running prompt-watching sessions.
 
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 
 use crate::config;
 use crate::errors::SerialError;
+
+/// Compile `pattern` within [`config::MAX_PATTERN_LEN`],
+/// [`config::REGEX_SIZE_LIMIT`], and [`config::REGEX_DFA_SIZE_LIMIT`]. Every
+/// regex the server builds goes through here. The error is a caller-facing
+/// reason; callers wrap it in their own `InvalidParam`.
+pub fn bounded_regex(pattern: &str) -> Result<Regex, String> {
+    if pattern.len() > config::MAX_PATTERN_LEN {
+        return Err(format!(
+            "regex is {} bytes; max is {}",
+            pattern.len(),
+            config::MAX_PATTERN_LEN
+        ));
+    }
+    RegexBuilder::new(pattern)
+        .size_limit(config::REGEX_SIZE_LIMIT)
+        .dfa_size_limit(config::REGEX_DFA_SIZE_LIMIT)
+        .build()
+        .map_err(|e| format!("invalid regex: {e}"))
+}
 
 #[derive(Debug)]
 pub struct PatternMatcher {
@@ -60,9 +79,9 @@ impl PatternMatcher {
                 reason: "must not be empty".into(),
             });
         }
-        let regex = Regex::new(pattern).map_err(|e| SerialError::InvalidParam {
+        let regex = bounded_regex(pattern).map_err(|reason| SerialError::InvalidParam {
             name: "pattern".into(),
-            reason: format!("invalid regex: {e}"),
+            reason,
         })?;
         Ok(Self {
             regex,
@@ -108,10 +127,23 @@ impl PatternMatcher {
 
     pub fn match_details(&self) -> Option<MatchDetails> {
         let live = self.live();
-        let decoded = LossyText::decode(live);
-        let search_start = decoded.byte_boundary(self.search_start.min(live.len()));
+        // Fast path: a valid UTF-8 window is its own lossy decoding, so raw and
+        // text offsets coincide and no boundary table is needed. This runs on
+        // every push, so avoiding the per-byte allocation matters.
+        if let Ok(text) = std::str::from_utf8(live) {
+            let mut search_start = self.search_start.min(text.len());
+            while !text.is_char_boundary(search_start) {
+                search_start += 1;
+            }
+            return self.find_from(text, search_start);
+        }
+        let (text, search_start) = decode_lossy_at(live, self.search_start);
+        self.find_from(&text, search_start)
+    }
+
+    fn find_from(&self, text: &str, search_start: usize) -> Option<MatchDetails> {
         self.regex
-            .find(&decoded.text[search_start..])
+            .find(&text[search_start..])
             .map(|m| MatchDetails {
                 text: m.as_str().to_string(),
                 start_byte: search_start + m.start(),
@@ -143,70 +175,39 @@ impl PatternMatcher {
     }
 }
 
-/// One lossless mapping from raw input boundaries to the byte offsets of the
-/// exact `String::from_utf8_lossy` representation returned to MCP callers.
-/// A boundary inside a malformed or multi-byte sequence advances to the next
-/// string character boundary so regex slicing always remains valid.
-struct LossyText {
-    text: String,
-    boundaries: Vec<usize>,
-}
-
-impl LossyText {
-    fn decode(raw: &[u8]) -> Self {
-        let text = String::from_utf8_lossy(raw).into_owned();
-        let mut boundaries = vec![0; raw.len() + 1];
-        let mut raw_start = 0;
-        let mut text_start = 0;
-
-        while raw_start < raw.len() {
-            match std::str::from_utf8(&raw[raw_start..]) {
-                Ok(valid) => {
-                    map_valid_boundaries(&mut boundaries, raw_start, text_start, valid.as_bytes());
-                    raw_start = raw.len();
-                }
-                Err(error) => {
-                    let valid_len = error.valid_up_to();
-                    let valid = &raw[raw_start..raw_start + valid_len];
-                    map_valid_boundaries(&mut boundaries, raw_start, text_start, valid);
-                    raw_start += valid_len;
-                    text_start += valid_len;
-
-                    let invalid_len = error.error_len().unwrap_or(raw.len() - raw_start);
-                    let replacement_end = text_start + '\u{fffd}'.len_utf8();
-                    for boundary in &mut boundaries[raw_start..=raw_start + invalid_len] {
-                        *boundary = replacement_end;
-                    }
-                    raw_start += invalid_len;
-                    text_start = replacement_end;
-                }
+/// Decode `raw` exactly as `String::from_utf8_lossy` does (the text returned
+/// to MCP callers) and map one raw byte offset into it. An offset inside a
+/// multi-byte character, or at or inside a malformed sequence, advances to the
+/// next character boundary so regex slicing always remains valid. Only the
+/// single offset is mapped: this runs on every push, and a per-byte boundary
+/// table made a hostile byte-at-a-time stream quadratic in allocations.
+fn decode_lossy_at(raw: &[u8], raw_offset: usize) -> (String, usize) {
+    let raw_offset = raw_offset.min(raw.len());
+    let mut text = String::with_capacity(raw.len());
+    let mut mapped = None;
+    let mut raw_pos = 0;
+    for chunk in raw.utf8_chunks() {
+        let valid = chunk.valid();
+        if mapped.is_none() && raw_offset < raw_pos + valid.len() {
+            let mut offset = raw_offset - raw_pos;
+            while !valid.is_char_boundary(offset) {
+                offset += 1;
             }
+            mapped = Some(text.len() + offset);
         }
-        boundaries[raw.len()] = text.len();
-        Self { text, boundaries }
-    }
-
-    fn byte_boundary(&self, raw_offset: usize) -> usize {
-        self.boundaries[raw_offset.min(self.boundaries.len() - 1)]
-    }
-}
-
-fn map_valid_boundaries(
-    boundaries: &mut [usize],
-    raw_start: usize,
-    text_start: usize,
-    valid: &[u8],
-) {
-    let Ok(valid) = std::str::from_utf8(valid) else {
-        return;
-    };
-    for (index, ch) in valid.char_indices() {
-        let end = index + ch.len_utf8();
-        boundaries[raw_start + index] = text_start + index;
-        for boundary in &mut boundaries[raw_start + index + 1..=raw_start + end] {
-            *boundary = text_start + end;
+        text.push_str(valid);
+        raw_pos += valid.len();
+        let invalid = chunk.invalid();
+        if !invalid.is_empty() {
+            text.push('\u{fffd}');
+            if mapped.is_none() && raw_offset <= raw_pos + invalid.len() {
+                mapped = Some(text.len());
+            }
+            raw_pos += invalid.len();
         }
     }
+    let mapped = mapped.unwrap_or(text.len());
+    (text, mapped)
 }
 
 #[cfg(test)]
@@ -345,6 +346,38 @@ mod tests {
         let output = String::from_utf8_lossy(m.buffer());
         assert_eq!(details.start_byte, '\u{fffd}'.len_utf8());
         assert_eq!(&output[details.start_byte..details.end_byte], "READY");
+    }
+
+    #[test]
+    fn search_start_inside_multibyte_char_advances_on_valid_utf8() {
+        // "é" is two bytes; a raw offset of 1 lands inside it.
+        let mut m = PatternMatcher::new("^.").unwrap();
+        m.push_without_matching("éa".as_bytes());
+        m.set_search_start(1);
+        let details = m.match_details().unwrap();
+        assert_eq!((details.text.as_str(), details.start_byte), ("a", 2));
+    }
+
+    #[test]
+    fn decode_lossy_at_rounds_offsets_past_malformed_and_partial_sequences() {
+        // a, lone 0xFF, b, truncated 3-byte sequence. Text: a + U+FFFD + b + U+FFFD.
+        let raw = b"a\xFFb\xE2\x82";
+        let expected = String::from_utf8_lossy(raw);
+        for (offset, mapped) in [(0, 0), (1, 4), (2, 4), (3, 8), (4, 8), (5, 8), (9, 8)] {
+            let (text, at) = decode_lossy_at(raw, offset);
+            assert_eq!(text, expected);
+            assert_eq!(at, mapped, "raw offset {offset}");
+        }
+    }
+
+    #[test]
+    fn bounded_regex_rejects_long_or_oversized_patterns() {
+        let long = "a".repeat(config::MAX_PATTERN_LEN + 1);
+        assert!(bounded_regex(&long).unwrap_err().contains("max is"));
+        assert!(bounded_regex(&"a".repeat(config::MAX_PATTERN_LEN)).is_ok());
+        // Short source, huge compiled program.
+        let err = bounded_regex(r"\w{1000}\w{1000}\w{1000}").unwrap_err();
+        assert!(err.contains("invalid regex"), "{err}");
     }
 
     #[test]
