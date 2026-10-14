@@ -187,7 +187,7 @@ impl<B: SerialBackend> McpServer<B> {
         // profile implies `Confirm`, whether opened by `device` or by the
         // literal path of a port that profile matches. The caller's `write_policy` override is combined
         // below (most-restrictive wins).
-        let (port_path, baud, profile_policy, console_settings, profile_deny, profile_allow) =
+        let (port_path, baud, profile_policy, mut console_settings, profile_deny, profile_allow) =
             match (p.port, p.device) {
                 (Some(_), Some(_)) => {
                     return Ok(tool_error(
@@ -246,6 +246,9 @@ impl<B: SerialBackend> McpServer<B> {
                 }
             };
 
+        if let Some(line_ending) = p.line_ending {
+            console_settings.line_ending = line_ending;
+        }
         let timeout_ms = p
             .timeout_ms
             .unwrap_or(config::DEFAULT_TIMEOUT_MS)
@@ -609,14 +612,18 @@ impl<B: SerialBackend> McpServer<B> {
         if let Some(blocked) = self.gate_write(&p.session_id, p.confirm.unwrap_or(false)) {
             return Ok(blocked);
         }
-        if let Some(blocked) = self.gate_command_policy(&p.session_id, &p.command) {
-            return Ok(blocked);
-        }
-
         let defaults = match self.sessions.console_settings(&p.session_id) {
             Ok(settings) => settings,
             Err(err) => return Ok(tool_error(err, Some(p.session_id), false, false)),
         };
+        let line_ending_overridden = p
+            .line_ending
+            .is_some_and(|line_ending| line_ending != defaults.line_ending);
+        if let Some(blocked) =
+            self.gate_command_policy(&p.session_id, &p.command, line_ending_overridden)
+        {
+            return Ok(blocked);
+        }
         let line_ending = p.line_ending.unwrap_or(defaults.line_ending);
         let echo_mode = p.echo_mode.unwrap_or(defaults.echo_mode);
         let semantic_prompt = p.semantic_prompt.unwrap_or(defaults.semantic_prompt);
@@ -735,11 +742,16 @@ impl<B: SerialBackend> McpServer<B> {
         ))
     }
 
-    fn gate_command_policy(&self, session_id: &str, command: &str) -> Option<CallToolResult> {
+    fn gate_command_policy(
+        &self,
+        session_id: &str,
+        command: &str,
+        line_ending_overridden: bool,
+    ) -> Option<CallToolResult> {
         let blocked = match self.sessions.command_policy(session_id) {
             Err(err) => err,
             Ok(policy) => {
-                let rule = policy.matched_rule(command)?;
+                let rule = policy.check(command, line_ending_overridden)?;
                 SerialError::CommandBlocked {
                     rule: rule.to_string(),
                 }
@@ -1095,6 +1107,12 @@ pub struct OpenParams {
     /// callers cannot supply allow patterns or remove existing restrictions.
     #[serde(default)]
     pub deny_patterns: Option<Vec<String>>,
+    /// Session default line ending for `serial.exec` (`none`, `lf`, `cr`,
+    /// `crlf`). Overrides the profile default. On a session with a command
+    /// policy it is fixed for the session: an `exec` asking for a different
+    /// ending is blocked.
+    #[serde(default)]
+    pub line_ending: Option<LineEnding>,
 }
 
 /// Input for `serial.write`. `data` is UTF-8 text; binary protocols are

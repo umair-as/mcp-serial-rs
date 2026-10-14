@@ -1388,6 +1388,7 @@ async fn serial_open_rejects_bad_regex_from_global_policy_env() {
             timeout_ms: None,
             write_policy: None,
             deny_patterns: None,
+            line_ending: None,
         }))
         .await
         .expect("open tool result");
@@ -3629,4 +3630,120 @@ async fn serial_open_by_unprofiled_port_keeps_unguarded_defaults() {
     assert_eq!(snapshot.write_policy, WritePolicy::Allow);
     assert_eq!(snapshot.baud, config::DEFAULT_BAUD);
     assert_eq!(snapshot.command_policy.allow_rule_count, 0);
+}
+
+// ---- H2 / M1: guarded exec cannot assemble a command across calls --------
+
+fn guarded_exec(session_id: &str, command: &str, line_ending: Option<LineEnding>) -> ExecParams {
+    ExecParams {
+        session_id: session_id.into(),
+        command: command.into(),
+        expect: "OK".into(),
+        line_ending,
+        echo_mode: None,
+        semantic_prompt: None,
+        confirm: None,
+        clear_before_write: None,
+        normalize_output: None,
+        timeout_ms: Some(200),
+    }
+}
+
+#[tokio::test]
+async fn guarded_exec_blocks_split_and_multiline_commands() {
+    let (server, sessions, backend) = policy_test_server();
+    let session_id = {
+        let _env = GLOBAL_POLICY_ENV.lock().await;
+        let open = server
+            .open(Parameters(
+                serde_json::from_value(json!({
+                    "device": "policy-device",
+                    "deny_patterns": [r"\breboot\b"],
+                    "line_ending": "lf",
+                }))
+                .expect("deserialize serial.open JSON arguments"),
+            ))
+            .await
+            .expect("open tool result");
+        open.structured_content.as_ref().unwrap()["session_id"]
+            .as_str()
+            .expect("opened session")
+            .to_string()
+    };
+    let snapshot = sessions.get_session(&session_id).expect("snapshot");
+    assert_eq!(snapshot.console_settings.line_ending, LineEnding::Lf);
+
+    for (command, line_ending, rule) in [
+        ("reb", Some(LineEnding::None), "shape.line_ending_override"),
+        ("reb", Some(LineEnding::Crlf), "shape.line_ending_override"),
+        ("reb\\", None, "shape.line_continuation"),
+        ("allowed\nreboot", None, "shape.control_char"),
+        ("allowed\r", None, "shape.control_char"),
+    ] {
+        let result = server
+            .exec(
+                Parameters(guarded_exec(&session_id, command, line_ending)),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("exec tool result");
+        let error = &result.structured_content.as_ref().unwrap()["error"];
+        assert_eq!(error["code"], -32014, "{command:?}");
+        assert_eq!(error["data"]["rule"], rule, "{command:?}");
+        assert_eq!(error["command_written"], false);
+    }
+
+    // Restating the session's own line ending is not an override.
+    let mut device = backend.take_device();
+    let device_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt as _;
+        let mut command = vec![0; b"allowed\n".len()];
+        device.read_exact(&mut command).await.expect("read command");
+        assert_eq!(command, b"allowed\n");
+        device.write_all(b"OK").await.expect("write response");
+    });
+    let allowed = server
+        .exec(
+            Parameters(guarded_exec(&session_id, "allowed", Some(LineEnding::Lf))),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("exec tool result");
+    device_task.await.expect("device task");
+    assert_eq!(allowed.structured_content.as_ref().unwrap()["ok"], true);
+}
+
+#[tokio::test]
+async fn unguarded_exec_keeps_per_call_line_ending_and_raw_command() {
+    let (server, session_id, mut device) = {
+        let (server, backend) = stub_server_with_backend(Vec::new());
+        let open = server
+            .open(Parameters(
+                serde_json::from_value(json!({"port": "/dev/ttyUSB0"}))
+                    .expect("deserialize serial.open JSON arguments"),
+            ))
+            .await
+            .expect("open tool result");
+        let session_id = open.structured_content.as_ref().unwrap()["session_id"]
+            .as_str()
+            .expect("opened session")
+            .to_string();
+        (server, session_id, backend.take_device())
+    };
+    let device_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt as _;
+        let mut command = vec![0; b"a\nb\\\r\n".len()];
+        device.read_exact(&mut command).await.expect("read command");
+        assert_eq!(command, b"a\nb\\\r\n");
+        device.write_all(b"OK").await.expect("write response");
+    });
+    let result = server
+        .exec(
+            Parameters(guarded_exec(&session_id, "a\nb\\", Some(LineEnding::Crlf))),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("exec tool result");
+    device_task.await.expect("device task");
+    assert_eq!(result.structured_content.as_ref().unwrap()["ok"], true);
 }

@@ -45,6 +45,13 @@ Out of scope (must be stated to users):
   the policy.
 - A session with a command policy refuses raw `serial.write`, preventing a
   caller from splitting a command across writes to bypass matching.
+- Guarded `serial.exec` commands are single lines: control characters, a
+  trailing backslash, and a per-call `line_ending` different from the
+  session's are blocked, so fragments cannot be joined across calls.
+- Deny rules are defence in depth, not a hard gate: shell quoting and
+  expansion can express a denied command a regex does not match. Prefer allow
+  rules anchored with `\A…\z` over a narrow character set, and use
+  `write_policy = "deny"` where no mutation should be possible.
 - Journal records generated rule identifiers only, never command text or the
   policy's regexes. See ADR 0007.
 
@@ -128,9 +135,9 @@ Required before release:
 - `cargo deny check bans licenses sources` (license, duplicate, and source
   policy passes)
 
-The dependency-security workflow runs both checks for dependency-policy changes
-and weekly against the default branch, so newly published RustSec advisories are
-detected without a repository change.
+The dependency-security workflow runs both checks when dependency policy or
+lockfiles change. There is no scheduled run; newly published RustSec advisories
+against existing dependencies surface through GitHub Dependabot security alerts.
 
 See `docs/RELEASE.md` for the full release procedure (version bump,
 changelog generation, and the tagging workflow).
