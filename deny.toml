@@ -17,6 +17,7 @@ allow = [
     "MPL-2.0",
     "Unicode-3.0",
     "Unlicense",
+    "Zlib",
 ]
 
 # `unescaper` predates SPDX's current `GPL-3.0-only` identifier and publishes
