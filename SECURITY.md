@@ -88,7 +88,12 @@ Out of scope (must be stated to users):
 - Store the default audit journal in a user-private state directory, not a
   shared `/tmp` path. On Unix, create the parent directory `0700` and file
   `0600`, reject final-component symlinks, and reject non-regular journal
-  files. Journal I/O must have bounded lock/write/flush deadlines.
+  files. An existing parent that is world-writable without the sticky bit is
+  refused; a group-writable one logs a warning. Journal I/O must have bounded
+  lock/write/flush deadlines. Intermediate path components are not checked
+  for symlinks.
+- `serial.open` journal rows record the requested `port` / `device` and
+  `line_ending` (clipped), so an audit can tell which hardware was opened.
 
 ### 5) Session lifecycle safety
 

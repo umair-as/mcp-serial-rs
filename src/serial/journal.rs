@@ -67,6 +67,31 @@ impl JournalEntry {
     }
 }
 
+/// Anyone who can write the journal's directory can rename or replace the
+/// journal file. A world-writable directory without the sticky bit is refused
+/// (degraded mode); a group-writable one only warns, because a umask of 002
+/// makes that common for a user's own directories.
+#[cfg(unix)]
+async fn check_existing_parent(parent: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = tokio::fs::metadata(parent).await?.permissions().mode();
+    let sticky = mode & 0o1000 != 0;
+    if mode & 0o002 != 0 && !sticky {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "journal directory is world-writable without the sticky bit",
+        ));
+    }
+    if mode & 0o020 != 0 && !sticky {
+        warn!(
+            path = %parent.display(),
+            mode = format!("{:o}", mode & 0o7777),
+            "journal directory is group-writable; group members could replace the journal"
+        );
+    }
+    Ok(())
+}
+
 fn clip_identifier(value: &str) -> String {
     value.chars().take(MAX_IDENTIFIER_CHARS).collect()
 }
@@ -90,7 +115,9 @@ impl JournalWriter {
             let parent_existed = tokio::fs::symlink_metadata(parent).await.is_ok();
             tokio::fs::create_dir_all(parent).await?;
             #[cfg(unix)]
-            if !parent_existed {
+            if parent_existed {
+                check_existing_parent(parent).await?;
+            } else {
                 use std::os::unix::fs::PermissionsExt;
                 tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await?;
             }
@@ -366,6 +393,30 @@ mod tests {
         let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700);
         assert_eq!(file_mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writer_checks_existing_parent_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let set_mode = |mode| {
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let path = temp.path().join("audit.jsonl");
+
+        set_mode(0o777);
+        let err = JournalWriter::open(&path).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!path.exists(), "refused before creating the journal");
+
+        // Sticky (like /tmp) and group-writable (umask 002) parents are usable.
+        set_mode(0o1777);
+        JournalWriter::open(&path).await.unwrap();
+        set_mode(0o770);
+        JournalWriter::open(&path).await.unwrap();
+        set_mode(0o700);
     }
 
     #[cfg(unix)]
