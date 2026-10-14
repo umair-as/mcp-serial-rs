@@ -26,9 +26,10 @@ narrow console capability, not a full hardware-in-the-loop orchestrator.
    and should be used only when the target behavior is known.
    A session with a command policy accepts mutations only through `serial.exec`;
    `serial.write` is refused server-side to prevent split-command evasion.
-   Such a session also runs one line per call: no control characters or
-   trailing `\` in `command`, and no per-call `line_ending` that differs from
-   the session's (set it at `serial.open` if the profile has none). A
+   Such a session also runs one terminated line per call: no control
+   characters or trailing `\` in `command`, no per-call `line_ending` that
+   differs from the session's, and the session must have one (pass
+   `line_ending` to `serial.open` if the profile has none). A
    `command_blocked` refusal is a policy decision; do not try to rephrase
    around it.
 7. Inspect `status`, `command_written`, `bytes_read`, `truncated`, and

@@ -1136,7 +1136,10 @@ async fn command_policy_blocks_exec_before_any_device_io() {
             115_200,
             2_000,
             WritePolicy::Allow,
-            ConsoleSettings::default(),
+            ConsoleSettings {
+                line_ending: LineEnding::Lf,
+                ..ConsoleSettings::default()
+            },
             policy,
         )
         .await
@@ -1243,7 +1246,10 @@ async fn command_policy_allows_a_non_matching_exec_command() {
             115_200,
             2_000,
             WritePolicy::Allow,
-            ConsoleSettings::default(),
+            ConsoleSettings {
+                line_ending: LineEnding::Lf,
+                ..ConsoleSettings::default()
+            },
             policy,
         )
         .await
@@ -1251,9 +1257,9 @@ async fn command_policy_allows_a_non_matching_exec_command() {
     let mut device = backend.take_device();
     let device_task = tokio::spawn(async move {
         use tokio::io::AsyncReadExt as _;
-        let mut command = vec![0; b"uname -a".len()];
+        let mut command = vec![0; b"uname -a\n".len()];
         device.read_exact(&mut command).await.expect("read command");
-        assert_eq!(command, b"uname -a");
+        assert_eq!(command, b"uname -a\n");
         device.write_all(b"OK").await.expect("write response");
     });
 
@@ -1277,7 +1283,11 @@ fn policy_profile() -> DeviceProfile {
         description: "policy test device".into(),
         probe: None,
         tags: vec![],
-        console: ConsoleSettings::default(),
+        // Guarded sessions must terminate each line (ADR 0007 amendment).
+        console: ConsoleSettings {
+            line_ending: LineEnding::Lf,
+            ..ConsoleSettings::default()
+        },
         privileged: false,
         deny_patterns: vec!["profile-block".into()],
         allow_patterns: vec!["^allowed$".into()],
@@ -1449,9 +1459,9 @@ async fn serial_open_applies_profile_allow_patterns() {
     let mut device = backend.take_device();
     let device_task = tokio::spawn(async move {
         use tokio::io::AsyncReadExt as _;
-        let mut command = vec![0; b"allowed".len()];
+        let mut command = vec![0; b"allowed\n".len()];
         device.read_exact(&mut command).await.expect("read command");
-        assert_eq!(command, b"allowed");
+        assert_eq!(command, b"allowed\n");
         device.write_all(b"OK").await.expect("write response");
     });
     let allowed = server
@@ -3746,4 +3756,36 @@ async fn unguarded_exec_keeps_per_call_line_ending_and_raw_command() {
         .expect("exec tool result");
     device_task.await.expect("device task");
     assert_eq!(result.structured_content.as_ref().unwrap()["ok"], true);
+}
+
+#[tokio::test]
+async fn guarded_exec_without_line_ending_is_refused_before_device_io() {
+    let (server, sessions, backend) = stub_setup(vec![]);
+    let policy = Arc::new(
+        CommandPolicy::compile(&[], &["\\breboot\\b".into()], &[], &[])
+            .expect("compile test policy"),
+    );
+    let session_id = sessions
+        .open_with_console_and_policy(
+            "/dev/ttyUSB0",
+            115_200,
+            2_000,
+            WritePolicy::Allow,
+            ConsoleSettings::default(),
+            policy,
+        )
+        .await
+        .expect("open guarded session");
+    let mut device = backend.take_device();
+
+    let resp = handshake_then_call(
+        server,
+        "serial.exec",
+        json!({"session_id": session_id, "command": "reb", "expect": "never"}),
+    )
+    .await;
+    assert_eq!(rpc_error_code(&resp), -32014);
+    assert_eq!(tool_error_data(&resp)["rule"], "shape.no_line_ending");
+    drop(sessions);
+    assert_device_untouched(&mut device).await;
 }

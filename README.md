@@ -175,9 +175,9 @@ The global `MCP_SERIAL_DENY_PATTERNS` value is a JSON array of additional deny
 regexes. A caller may add `deny_patterns` while opening a session, but cannot
 remove policy or add allow rules. Guarded sessions refuse raw `serial.write` so
 split writes cannot evade matching, and run one line per `serial.exec`: control
-characters, a trailing `\`, and a per-call `line_ending` that differs from the
-session's are blocked. `serial.open` accepts `line_ending` for sessions whose
-profile does not set one. Deny rules are defence in depth; anchored allow rules
+characters, a trailing `\`, a per-call `line_ending` that differs from the
+session's, and a session line ending of `none` are blocked. `serial.open`
+accepts `line_ending` for sessions whose profile does not set one. Deny rules are defence in depth; anchored allow rules
 and `write_policy="deny"` are the strong controls. See
 [ADR 0007](docs/adr/0007-server-owned-command-policy.md).
 

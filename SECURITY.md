@@ -45,9 +45,10 @@ Out of scope (must be stated to users):
   the policy.
 - A session with a command policy refuses raw `serial.write`, preventing a
   caller from splitting a command across writes to bypass matching.
-- Guarded `serial.exec` commands are single lines: control characters, a
-  trailing backslash, and a per-call `line_ending` different from the
-  session's are blocked, so fragments cannot be joined across calls.
+- Guarded `serial.exec` commands are single terminated lines: control
+  characters, a trailing backslash, a per-call `line_ending` different from
+  the session's, and sessions with no line ending are blocked, so fragments
+  cannot be joined across calls or sessions.
 - Deny rules are defence in depth, not a hard gate: shell quoting and
   expansion can express a denied command a regex does not match. Prefer allow
   rules anchored with `\A…\z` over a narrow character set, and use

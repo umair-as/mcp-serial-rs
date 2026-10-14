@@ -98,9 +98,9 @@ generates both input and output schemas from the typed structs.
   are compiled at open and gate complete `serial.exec` commands before port
   checkout. A caller may only add deny rules. A guarded session refuses raw
   `serial.write`; never add buffering or best-effort matching to work around
-  this. Guarded `exec` is one line per call: control chars, a trailing `\`,
-  and a per-call `line_ending` that differs from the session's are blocked
-  (`shape.*` rule ids). A literal-port open of a profiled device gets that
+  this. Guarded `exec` is one terminated line per call: control chars, a
+  trailing `\`, a per-call `line_ending` that differs from the session's, and
+  a session ending of `none` are blocked (`shape.*` rule ids). A literal-port open of a profiled device gets that
   profile's controls. See ADR 0005/0007 amendments.
 - **Timeouts are outcomes, not errors.** `read`/`read_until`/`exec` on deadline
   return a successful result (`timed_out=true` / `matched=false` /

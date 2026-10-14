@@ -9,13 +9,16 @@
 //! Regexes judge one command line, so a guarded command must also be unable to
 //! reach any *other* line: [`CommandPolicy::check`] first rejects control
 //! characters (an embedded newline, CR, or line-editing key), a trailing
-//! backslash (shell line continuation), and a per-call line ending that differs
-//! from the session's (`none` then `lf` would join fragments across calls).
+//! backslash (shell line continuation), a per-call line ending that differs
+//! from the session's, and any transmission without a terminator. Unterminated
+//! fragments would sit in the shell's line buffer until a later call or session
+//! submitted them as one line.
 //! Deny rules remain defence in depth; see ADR 0007.
 
 use regex::Regex;
 
 use crate::errors::SerialError;
+use crate::serial::console::LineEnding;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct CommandPolicySummary {
@@ -55,14 +58,22 @@ impl CommandPolicy {
 
     /// Gate a complete `serial.exec` command. Returns the generated id of the
     /// structural check or rule that blocks it, or `None` when it may run.
-    /// `line_ending_overridden` is true when the call asks for a line ending
-    /// other than the session's. An empty policy imposes nothing.
-    pub fn check(&self, command: &str, line_ending_overridden: bool) -> Option<&str> {
+    /// `session_line_ending` is the session default; `requested` is the
+    /// per-call `line_ending`, if any. An empty policy imposes nothing.
+    pub fn check(
+        &self,
+        command: &str,
+        session_line_ending: LineEnding,
+        requested: Option<LineEnding>,
+    ) -> Option<&str> {
         if self.is_empty() {
             return None;
         }
-        if line_ending_overridden {
+        if requested.is_some_and(|line_ending| line_ending != session_line_ending) {
             return Some("shape.line_ending_override");
+        }
+        if session_line_ending == LineEnding::None {
+            return Some("shape.no_line_ending");
         }
         if command.chars().any(char::is_control) {
             return Some("shape.control_char");
@@ -141,29 +152,23 @@ mod tests {
     #[test]
     fn check_rejects_commands_that_can_reach_another_line() {
         let policy = CommandPolicy::compile(&[], &[], &["^uname".into()], &[]).unwrap();
-        assert_eq!(policy.check("uname -a", false), None);
+        let check = |command| policy.check(command, LineEnding::Lf, None);
+        assert_eq!(check("uname -a"), None);
         // An anchored allow rule must not admit a second line.
+        assert_eq!(check("uname -a\nreboot"), Some("shape.control_char"));
+        assert_eq!(check("uname\r"), Some("shape.control_char"));
+        assert_eq!(check("uname\t"), Some("shape.control_char"));
+        assert_eq!(check("uname\u{1b}[A"), Some("shape.control_char"));
+        assert_eq!(check("uname\u{9b}A"), Some("shape.control_char"));
+        assert_eq!(check("uname \\"), Some("shape.line_continuation"));
         assert_eq!(
-            policy.check("uname -a\nreboot", false),
-            Some("shape.control_char")
-        );
-        assert_eq!(policy.check("uname\r", false), Some("shape.control_char"));
-        assert_eq!(policy.check("uname\t", false), Some("shape.control_char"));
-        assert_eq!(
-            policy.check("uname\u{1b}[A", false),
-            Some("shape.control_char")
-        );
-        assert_eq!(
-            policy.check("uname\u{9b}A", false),
-            Some("shape.control_char")
-        );
-        assert_eq!(
-            policy.check("uname \\", false),
-            Some("shape.line_continuation")
-        );
-        assert_eq!(
-            policy.check("uname -a", true),
+            policy.check("uname -a", LineEnding::Lf, Some(LineEnding::None)),
             Some("shape.line_ending_override")
+        );
+        // Restating the session's own ending is not an override.
+        assert_eq!(
+            policy.check("uname -a", LineEnding::Lf, Some(LineEnding::Lf)),
+            None
         );
     }
 
@@ -172,20 +177,32 @@ mod tests {
         let policy = CommandPolicy::compile(&[r"\breboot\b".into()], &[], &[], &[]).unwrap();
         // Fragments pass the regex individually; the shape gates stop the join.
         assert_eq!(
-            policy.check("reb", true),
+            policy.check("reb", LineEnding::Lf, Some(LineEnding::None)),
             Some("shape.line_ending_override")
         );
+        // An unterminated session cannot leave fragments in the line buffer
+        // for a later call or session to submit.
         assert_eq!(
-            policy.check("reb\\", false),
+            policy.check("reb", LineEnding::None, None),
+            Some("shape.no_line_ending")
+        );
+        assert_eq!(
+            policy.check("reb\\", LineEnding::Lf, None),
             Some("shape.line_continuation")
         );
-        assert_eq!(policy.check("reboot", false), Some("deny.global.0"));
+        assert_eq!(
+            policy.check("reboot", LineEnding::Lf, None),
+            Some("deny.global.0")
+        );
     }
 
     #[test]
     fn check_imposes_nothing_without_a_policy() {
         let policy = CommandPolicy::default();
-        assert_eq!(policy.check("a\nb\\", true), None);
+        assert_eq!(
+            policy.check("a\nb\\", LineEnding::None, Some(LineEnding::Crlf)),
+            None
+        );
     }
 
     #[test]

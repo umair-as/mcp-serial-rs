@@ -616,12 +616,12 @@ impl<B: SerialBackend> McpServer<B> {
             Ok(settings) => settings,
             Err(err) => return Ok(tool_error(err, Some(p.session_id), false, false)),
         };
-        let line_ending_overridden = p
-            .line_ending
-            .is_some_and(|line_ending| line_ending != defaults.line_ending);
-        if let Some(blocked) =
-            self.gate_command_policy(&p.session_id, &p.command, line_ending_overridden)
-        {
+        if let Some(blocked) = self.gate_command_policy(
+            &p.session_id,
+            &p.command,
+            defaults.line_ending,
+            p.line_ending,
+        ) {
             return Ok(blocked);
         }
         let line_ending = p.line_ending.unwrap_or(defaults.line_ending);
@@ -746,12 +746,13 @@ impl<B: SerialBackend> McpServer<B> {
         &self,
         session_id: &str,
         command: &str,
-        line_ending_overridden: bool,
+        session_line_ending: LineEnding,
+        requested_line_ending: Option<LineEnding>,
     ) -> Option<CallToolResult> {
         let blocked = match self.sessions.command_policy(session_id) {
             Err(err) => err,
             Ok(policy) => {
-                let rule = policy.check(command, line_ending_overridden)?;
+                let rule = policy.check(command, session_line_ending, requested_line_ending)?;
                 SerialError::CommandBlocked {
                     rule: rule.to_string(),
                 }
