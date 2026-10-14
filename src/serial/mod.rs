@@ -119,6 +119,18 @@ pub struct ResolvedDevice {
     pub allow_patterns: Vec<String>,
 }
 
+/// Session defaults a matched profile implies for `port_path`.
+fn resolved_from_profile(profile: &DeviceProfile, port_path: String) -> ResolvedDevice {
+    ResolvedDevice {
+        port_path,
+        baud: profile.baud,
+        write_policy: profile_write_policy(profile),
+        console_settings: profile.console,
+        deny_patterns: profile.deny_patterns.clone(),
+        allow_patterns: profile.allow_patterns.clone(),
+    }
+}
+
 /// Resolve a device-profile name to its port path and immutable session
 /// defaults.
 /// Looks up the profile by name first — unknown names short-circuit before any
@@ -149,14 +161,72 @@ pub fn resolve_device(
         .ok_or_else(|| SerialError::DeviceNotFound {
             device: device_name.to_string(),
         })?;
-    Ok(ResolvedDevice {
-        port_path,
-        baud: profile.baud,
-        write_policy: profile_write_policy(profile),
-        console_settings: profile.console,
-        deny_patterns: profile.deny_patterns.clone(),
-        allow_patterns: profile.allow_patterns.clone(),
-    })
+    Ok(resolved_from_profile(profile, port_path))
+}
+
+/// Find the profile governing a literal port path, if any.
+///
+/// `ports` must already carry comparable (canonical) paths. Matching uses the
+/// same first-match rule as [`enrich_with_profiles`], so the profile applied
+/// at open is the one `serial.list_ports` advertised for that port. The
+/// returned `port_path` is the caller's `port_path`, unchanged.
+pub fn match_port_profile(
+    port_path: &str,
+    ports: &[PortDescriptor],
+    profiles: &[DeviceProfile],
+) -> Option<ResolvedDevice> {
+    let port = ports.iter().find(|port| port.port == port_path)?;
+    profiles
+        .iter()
+        .find(|profile| profile_matches_port(profile, port))
+        .map(|profile| resolved_from_profile(profile, port_path.to_string()))
+}
+
+/// Resolve the device profile, if any, whose USB identity matches the port
+/// behind a literal `serial.open {port}` path.
+///
+/// Profile controls (privileged write policy, console settings, command
+/// policy) belong to the hardware, not to the way it was named, so a
+/// literal-path open must not skip them (ADR 0005). Paths are canonicalized
+/// on both sides so a udev symlink alias resolves to the same profile, even
+/// when the allowlist names only the alias.
+/// Returns `Ok(None)` for ports no profile claims — virtual PTYs and
+/// unprofiled hardware open exactly as before. With no profiles configured
+/// the host is not enumerated at all. Enumeration failure is an error
+/// (fail closed): opening without knowing whether a profile applies could
+/// silently drop a privileged default.
+pub fn resolve_port_profile(
+    port_path: &str,
+    profiles: &[DeviceProfile],
+) -> Result<Option<ResolvedDevice>, SerialError> {
+    if profiles.is_empty() {
+        return Ok(None);
+    }
+    let raw = tokio_serial::available_ports().map_err(|e| SerialError::Io {
+        message: format!("available_ports: {e}"),
+    })?;
+    let canonical = |path: &str| {
+        std::fs::canonicalize(path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path.to_string())
+    };
+    // No allowlist filter here: the allowlist may name aliases (for example
+    // `/dev/serial/by-id/*`) that the kernel node names never match, and the
+    // opened path is allowlist-checked by the session manager anyway.
+    let ports: Vec<PortDescriptor> = raw
+        .into_iter()
+        .map(PortDescriptor::from)
+        .map(|mut port| {
+            port.port = canonical(&port.port);
+            port
+        })
+        .collect();
+    Ok(
+        match_port_profile(&canonical(port_path), &ports, profiles).map(|mut resolved| {
+            resolved.port_path = port_path.to_string();
+            resolved
+        }),
+    )
 }
 
 /// Pluggable opener for the underlying serial transport.
@@ -362,6 +432,54 @@ mod tests {
             filter_allowlisted(vec![other_port("/dev/ttyACM0", SerialPortType::PciPort)]);
         enrich_with_profiles(&mut ports, &[p]);
         assert_eq!(ports[0].device, None);
+    }
+
+    #[test]
+    fn port_profile_applies_privileged_defaults_to_literal_path() {
+        let mut p = profile("rpi5", "RPI-UART-SERIAL", Some(0x1A86), None);
+        p.privileged = true;
+        p.deny_patterns = vec![r"\breboot\b".into()];
+        let ports = filter_allowlisted(vec![
+            usb_port("/dev/ttyACM0", 0x1A86, 0x55D3, Some("RPI-UART-SERIAL")),
+            usb_port("/dev/ttyUSB0", 0x0403, 0x6015, Some("FTDI-UART-SERIAL")),
+        ]);
+        let resolved = match_port_profile("/dev/ttyACM0", &ports, &[p]).expect("profiled");
+        assert_eq!(resolved.port_path, "/dev/ttyACM0");
+        assert_eq!(resolved.write_policy, WritePolicy::Confirm);
+        assert_eq!(resolved.deny_patterns, vec![r"\breboot\b".to_string()]);
+    }
+
+    #[test]
+    fn port_profile_none_for_unprofiled_or_unenumerated_paths() {
+        let p = profile("rpi5", "RPI-UART-SERIAL", None, None);
+        let ports = filter_allowlisted(vec![usb_port(
+            "/dev/ttyUSB0",
+            0x0403,
+            0x6015,
+            Some("FTDI-UART-SERIAL"),
+        )]);
+        let profiles = [p];
+        assert_eq!(match_port_profile("/dev/ttyUSB0", &ports, &profiles), None);
+        // Virtual PTYs never appear in USB enumeration.
+        assert_eq!(match_port_profile("/tmp/vtty0", &ports, &profiles), None);
+    }
+
+    #[test]
+    fn port_profile_without_profiles_skips_enumeration() {
+        assert!(matches!(
+            resolve_port_profile("/dev/ttyUSB0", &[]),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn port_profile_first_match_wins_like_list_ports() {
+        let a = profile("first", "ABC123", None, None);
+        let mut b = profile("second", "ABC123", None, None);
+        b.privileged = true;
+        let ports = filter_allowlisted(vec![usb_port("/dev/ttyUSB0", 1, 2, Some("ABC123"))]);
+        let resolved = match_port_profile("/dev/ttyUSB0", &ports, &[a, b]).expect("profiled");
+        assert_eq!(resolved.write_policy, WritePolicy::Allow);
     }
 
     #[test]

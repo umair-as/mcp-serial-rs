@@ -109,6 +109,11 @@ pub fn call_summary(tool: &str, args: &Value) -> Value {
             // bounded string like every other field so a huge value can't bloat
             // the row (or, past the 16 KiB row cap, drop it from the journal).
             "write_policy": args.get("write_policy").and_then(Value::as_str).map(clipped),
+            // Which hardware was opened: a device path or profile name, not
+            // payload. Clipped like every attacker-controlled string.
+            "port": optional_string(args, "port"),
+            "device": optional_string(args, "device"),
+            "line_ending": optional_string(args, "line_ending"),
             "caller_deny_rule_count": args
                 .get("deny_patterns")
                 .and_then(Value::as_array)
@@ -269,6 +274,25 @@ mod tests {
         // A non-string value coerces to null rather than passing through.
         let odd = json!({"port": "/dev/ttyUSB0", "write_policy": {"nested": "x"}});
         assert!(call_summary("serial.open", &odd)["write_policy"].is_null());
+    }
+
+    #[test]
+    fn open_call_summary_records_target_and_clips_it() {
+        let summary = call_summary(
+            "serial.open",
+            &json!({"port": "/dev/ttyACM0", "line_ending": "lf"}),
+        );
+        assert_eq!(summary["port"], "/dev/ttyACM0");
+        assert!(summary["device"].is_null());
+        assert_eq!(summary["line_ending"], "lf");
+
+        let big = "d".repeat(50_000);
+        let summary = call_summary("serial.open", &json!({"device": big.clone()}));
+        assert_eq!(
+            summary["device"].as_str().unwrap().chars().count(),
+            MAX_JOURNAL_FIELD_CHARS,
+        );
+        assert!(!summary.to_string().contains(&big));
     }
 
     #[test]

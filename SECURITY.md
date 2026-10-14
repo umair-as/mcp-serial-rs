@@ -45,6 +45,14 @@ Out of scope (must be stated to users):
   the policy.
 - A session with a command policy refuses raw `serial.write`, preventing a
   caller from splitting a command across writes to bypass matching.
+- Guarded `serial.exec` commands are single terminated lines: control
+  characters, a trailing backslash, a per-call `line_ending` different from
+  the session's, and sessions with no line ending are blocked, so fragments
+  cannot be joined across calls or sessions.
+- Deny rules are defence in depth, not a hard gate: shell quoting and
+  expansion can express a denied command a regex does not match. Prefer allow
+  rules anchored with `\A…\z` over a narrow character set, and use
+  `write_policy = "deny"` where no mutation should be possible.
 - Journal records generated rule identifiers only, never command text or the
   policy's regexes. See ADR 0007.
 
@@ -58,7 +66,13 @@ Out of scope (must be stated to users):
   conservative side-effect metadata.
 - Cap read buffer and write chunk sizes.
 - Limit concurrent sessions.
-- Bound regex pattern size/complexity for `read_until` to avoid pathological behavior.
+- Bound every regex (`read_until` pattern, `exec` `expect`, command-policy
+  rules): source at most 1 KiB, compiled program and lazy-DFA cache at most
+  1 MiB each. The `regex` crate matches in linear time, so there is no
+  backtracking ReDoS.
+- Each read chunk re-scans the bounded 64 KiB match window once, without
+  per-byte allocation. Worst-case CPU per `read_until`/`exec` is therefore
+  bounded by the window size and the 30 s timeout cap.
 
 ### 4) Data handling and leak prevention
 
@@ -74,7 +88,12 @@ Out of scope (must be stated to users):
 - Store the default audit journal in a user-private state directory, not a
   shared `/tmp` path. On Unix, create the parent directory `0700` and file
   `0600`, reject final-component symlinks, and reject non-regular journal
-  files. Journal I/O must have bounded lock/write/flush deadlines.
+  files. An existing parent that is world-writable without the sticky bit is
+  refused; a group-writable one logs a warning. Journal I/O must have bounded
+  lock/write/flush deadlines. Intermediate path components are not checked
+  for symlinks.
+- `serial.open` journal rows record the requested `port` / `device` and
+  `line_ending` (clipped), so an audit can tell which hardware was opened.
 
 ### 5) Session lifecycle safety
 
@@ -128,9 +147,9 @@ Required before release:
 - `cargo deny check bans licenses sources` (license, duplicate, and source
   policy passes)
 
-The dependency-security workflow runs both checks for dependency-policy changes
-and weekly against the default branch, so newly published RustSec advisories are
-detected without a repository change.
+The dependency-security workflow runs both checks when dependency policy or
+lockfiles change. There is no scheduled run; newly published RustSec advisories
+against existing dependencies surface through GitHub Dependabot security alerts.
 
 See `docs/RELEASE.md` for the full release procedure (version bump,
 changelog generation, and the tagging workflow).

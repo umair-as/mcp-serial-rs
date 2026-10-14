@@ -48,6 +48,12 @@ use crate::serial::{ResolvedDevice, SerialBackend, WritePolicy};
 pub type DeviceResolver =
     dyn Fn(&str, &[DeviceProfile]) -> Result<ResolvedDevice, SerialError> + Send + Sync;
 
+/// Injectable literal-port profile resolver. Production uses
+/// [`crate::serial::resolve_port_profile`]; `Ok(None)` means no profile
+/// claims the port.
+pub type PortProfileResolver =
+    dyn Fn(&str, &[DeviceProfile]) -> Result<Option<ResolvedDevice>, SerialError> + Send + Sync;
+
 /// rmcp-facing server. Holds shared references to the serial domain state
 /// — session manager, device profiles, and the audit journal handle — and
 /// registers the `serial.*` tools with the `rmcp` SDK.
@@ -59,6 +65,7 @@ pub struct McpServer<B: SerialBackend> {
     /// logging. Wired through `call_tool` (spec §Journal Requirements).
     journal: Option<Arc<JournalWriter>>,
     device_resolver: Arc<DeviceResolver>,
+    port_profile_resolver: Arc<PortProfileResolver>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -72,6 +79,7 @@ impl<B: SerialBackend> Clone for McpServer<B> {
             profiles: Arc::clone(&self.profiles),
             journal: self.journal.clone(),
             device_resolver: Arc::clone(&self.device_resolver),
+            port_profile_resolver: Arc::clone(&self.port_profile_resolver),
             tool_router: self.tool_router.clone(),
         }
     }
@@ -99,11 +107,29 @@ impl<B: SerialBackend> McpServer<B> {
         journal: Option<Arc<JournalWriter>>,
         device_resolver: Arc<DeviceResolver>,
     ) -> Self {
+        Self::new_with_resolvers(
+            sessions,
+            profiles,
+            journal,
+            device_resolver,
+            Arc::new(crate::serial::resolve_port_profile),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_resolvers(
+        sessions: Arc<SessionManager<B>>,
+        profiles: Arc<Vec<DeviceProfile>>,
+        journal: Option<Arc<JournalWriter>>,
+        device_resolver: Arc<DeviceResolver>,
+        port_profile_resolver: Arc<PortProfileResolver>,
+    ) -> Self {
         Self {
             sessions,
             profiles,
             journal,
             device_resolver,
+            port_profile_resolver,
             tool_router: Self::tool_router(),
         }
     }
@@ -157,10 +183,11 @@ impl<B: SerialBackend> McpServer<B> {
         // here — that maps to -32602 and is reserved for JSON-RPC envelope
         // / params-deserialization failures.
         // `profile_policy` is the write policy the resolution path implies:
-        // a bare port path implies `Allow`; a `privileged` device profile
-        // implies `Confirm`. The caller's `write_policy` override is combined
+        // an unprofiled port path implies `Allow`; a `privileged` device
+        // profile implies `Confirm`, whether opened by `device` or by the
+        // literal path of a port that profile matches. The caller's `write_policy` override is combined
         // below (most-restrictive wins).
-        let (port_path, baud, profile_policy, console_settings, profile_deny, profile_allow) =
+        let (port_path, baud, profile_policy, mut console_settings, profile_deny, profile_allow) =
             match (p.port, p.device) {
                 (Some(_), Some(_)) => {
                     return Ok(tool_error(
@@ -184,14 +211,25 @@ impl<B: SerialBackend> McpServer<B> {
                         false,
                     ));
                 }
-                (Some(port), None) => (
-                    port,
-                    p.baud.unwrap_or(config::DEFAULT_BAUD),
-                    WritePolicy::Allow,
-                    ConsoleSettings::default(),
-                    Vec::new(),
-                    Vec::new(),
-                ),
+                (Some(port), None) => match (self.port_profile_resolver)(&port, &self.profiles) {
+                    Ok(Some(resolved)) => (
+                        port,
+                        p.baud.unwrap_or(resolved.baud),
+                        resolved.write_policy,
+                        resolved.console_settings,
+                        resolved.deny_patterns,
+                        resolved.allow_patterns,
+                    ),
+                    Ok(None) => (
+                        port,
+                        p.baud.unwrap_or(config::DEFAULT_BAUD),
+                        WritePolicy::Allow,
+                        ConsoleSettings::default(),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                    Err(err) => return Ok(tool_error(err, None, false, false)),
+                },
                 (None, Some(device_name)) => {
                     let resolved = match (self.device_resolver)(&device_name, &self.profiles) {
                         Ok(resolved) => resolved,
@@ -229,6 +267,28 @@ impl<B: SerialBackend> McpServer<B> {
             Ok(policy) => Arc::new(policy),
             Err(err) => return Ok(tool_error(err, None, false, false)),
         };
+        // A guarded profile's line ending is part of its policy: letting a
+        // caller pick a terminator the console ignores would let fragments
+        // pile up for a later session to submit. Callers choose only where the
+        // profile has none.
+        if let Some(line_ending) = p.line_ending {
+            let profile_line_ending = console_settings.line_ending;
+            if !command_policy.is_empty()
+                && profile_line_ending != LineEnding::None
+                && line_ending != profile_line_ending
+            {
+                return Ok(tool_error(
+                    SerialError::InvalidParam {
+                        name: "line_ending".into(),
+                        reason: "cannot override a guarded profile's line_ending".into(),
+                    },
+                    None,
+                    false,
+                    false,
+                ));
+            }
+            console_settings.line_ending = line_ending;
+        }
 
         match self
             .sessions
@@ -554,11 +614,11 @@ impl<B: SerialBackend> McpServer<B> {
                 false,
             ));
         }
-        if let Err(e) = regex::Regex::new(&p.expect) {
+        if let Err(reason) = crate::serial::parser::bounded_regex(&p.expect) {
             return Ok(tool_error(
                 SerialError::InvalidParam {
                     name: "expect".into(),
-                    reason: format!("invalid regex: {e}"),
+                    reason,
                 },
                 Some(p.session_id),
                 false,
@@ -571,14 +631,18 @@ impl<B: SerialBackend> McpServer<B> {
         if let Some(blocked) = self.gate_write(&p.session_id, p.confirm.unwrap_or(false)) {
             return Ok(blocked);
         }
-        if let Some(blocked) = self.gate_command_policy(&p.session_id, &p.command) {
-            return Ok(blocked);
-        }
-
         let defaults = match self.sessions.console_settings(&p.session_id) {
             Ok(settings) => settings,
             Err(err) => return Ok(tool_error(err, Some(p.session_id), false, false)),
         };
+        if let Some(blocked) = self.gate_command_policy(
+            &p.session_id,
+            &p.command,
+            defaults.line_ending,
+            p.line_ending,
+        ) {
+            return Ok(blocked);
+        }
         let line_ending = p.line_ending.unwrap_or(defaults.line_ending);
         let echo_mode = p.echo_mode.unwrap_or(defaults.echo_mode);
         let semantic_prompt = p.semantic_prompt.unwrap_or(defaults.semantic_prompt);
@@ -697,11 +761,17 @@ impl<B: SerialBackend> McpServer<B> {
         ))
     }
 
-    fn gate_command_policy(&self, session_id: &str, command: &str) -> Option<CallToolResult> {
+    fn gate_command_policy(
+        &self,
+        session_id: &str,
+        command: &str,
+        session_line_ending: LineEnding,
+        requested_line_ending: Option<LineEnding>,
+    ) -> Option<CallToolResult> {
         let blocked = match self.sessions.command_policy(session_id) {
             Err(err) => err,
             Ok(policy) => {
-                let rule = policy.matched_rule(command)?;
+                let rule = policy.check(command, session_line_ending, requested_line_ending)?;
                 SerialError::CommandBlocked {
                     rule: rule.to_string(),
                 }
@@ -1037,8 +1107,9 @@ pub struct OpenParams {
     /// with `port`.
     #[serde(default)]
     pub device: Option<String>,
-    /// Override the baud rate. Defaults to the profile baud (device
-    /// path) or `config::DEFAULT_BAUD` (port path).
+    /// Override the baud rate. Defaults to the matching profile's baud
+    /// (opened by `device`, or by the `port` of a profiled device), else
+    /// `config::DEFAULT_BAUD`.
     #[serde(default)]
     pub baud: Option<u32>,
     /// Per-session default operation timeout in milliseconds. Clamped
@@ -1057,6 +1128,12 @@ pub struct OpenParams {
     /// callers cannot supply allow patterns or remove existing restrictions.
     #[serde(default)]
     pub deny_patterns: Option<Vec<String>>,
+    /// Session default line ending for `serial.exec` (`none`, `lf`, `cr`,
+    /// `crlf`). Overrides the profile default. On a session with a command
+    /// policy it is fixed for the session: an `exec` asking for a different
+    /// ending is blocked.
+    #[serde(default)]
+    pub line_ending: Option<LineEnding>,
 }
 
 /// Input for `serial.write`. `data` is UTF-8 text; binary protocols are
