@@ -3810,3 +3810,31 @@ async fn guarded_exec_without_line_ending_is_refused_before_device_io() {
     drop(sessions);
     assert_device_untouched(&mut device).await;
 }
+
+#[tokio::test]
+async fn serial_open_refuses_overriding_a_guarded_profile_line_ending() {
+    let (server, sessions, _backend) = policy_test_server();
+    let _env = GLOBAL_POLICY_ENV.lock().await;
+    let open = |line_ending: &str| {
+        serde_json::from_value::<OpenParams>(
+            json!({"device": "policy-device", "line_ending": line_ending}),
+        )
+        .expect("deserialize serial.open JSON arguments")
+    };
+
+    let refused = server
+        .open(Parameters(open("cr")))
+        .await
+        .expect("open tool result");
+    let error = &refused.structured_content.as_ref().unwrap()["error"];
+    assert_eq!(error["code"], -32008);
+    assert_eq!(error["data"]["name"], "line_ending");
+    assert!(sessions.sessions().is_empty(), "no session on refusal");
+
+    // Restating the profile's own ending is fine.
+    let opened = server
+        .open(Parameters(open("lf")))
+        .await
+        .expect("open tool result");
+    assert!(opened.structured_content.as_ref().unwrap()["session_id"].is_string());
+}

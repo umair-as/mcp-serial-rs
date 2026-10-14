@@ -188,6 +188,11 @@ fn loopback_rmcp_open_write_echo_read_until_close() {
     let allowlist = format!("/tmp/mcp-loopback-{pid}-*");
     let mut child = Command::new(bin)
         .env("MCP_SERIAL_ALLOWLIST", &allowlist)
+        // Ignore any host devices.toml so opens never enumerate host ports.
+        .env(
+            "MCP_SERIAL_DEVICES",
+            format!("/tmp/mcp-loopback-{pid}-no-devices.toml"),
+        )
         // Disable the journal for this test — `try_open_arc` would
         // otherwise lock-step against the default per-user journal path
         // and we don't need audit rows for the loopback assertion.

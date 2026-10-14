@@ -45,7 +45,8 @@ On a session with any command policy, `serial.exec` now also refuses, with
 - `shape.line_ending_override`: a per-call `line_ending` that differs from the
   session's. The line ending is fixed per guarded session; `serial.open` gains
   an optional `line_ending` so a session without a profile default can choose
-  one. Restating the session's own ending is allowed.
+  one. It cannot override a guarded profile's own ending (`InvalidParam`).
+  Restating the session's own ending is allowed.
 - `shape.no_line_ending`: any `exec` on a guarded session whose line ending is
   `none`. Unterminated fragments would otherwise sit in the shell's line
   buffer, where a later call, or a later session opened with a terminator,
@@ -60,15 +61,17 @@ sessions without a policy, including multi-line commands. A guarded session
 must have a terminator: set `line_ending` in the profile's `console` table or
 on the `serial.open` call, or every `exec` is refused.
 
-**Limits.** These checks keep each guarded call to exactly one line. They do not
-make *deny* rules a complete gate: shell quoting and expansion (`r''eboot`,
-`$(printf reboot)`, `/sbin/re*t`) can still express a denied command a regex
-does not match, and bytes left in the shell's line buffer by an earlier
-*unguarded* session are not visible to the policy. Deny rules are defence in
-depth. An allow list anchored at
-both ends over a narrow character set (`\A(uname|uptime)( -[a-z]+)?\z`) is
-the strong form of command policy, and `write_policy = "deny"` remains the only
-model-proof control.
+**Limits.** These checks keep each guarded call to one terminated line as the
+server sees it. They do not make *deny* rules a complete gate: shell quoting
+and expansion (`r''eboot`, `$(printf reboot)`, `/sbin/re*t`) can still express
+a denied command a regex does not match, and an unclosed quote, heredoc, or
+compound statement makes the shell itself continue a line across calls
+(`uname '` then `'; reboot`). Bytes left in the shell's line buffer by an
+earlier *unguarded* session are not visible to the policy. Deny rules are
+defence in depth. An allow list anchored at both ends over a narrow character
+set (`\A(uname|uptime)( -[a-z]+)?\z`) defeats all of these and is the strong
+form of command policy; `write_policy = "deny"` remains the only model-proof
+control.
 
 ## Consequences
 

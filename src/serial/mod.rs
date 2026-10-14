@@ -188,7 +188,8 @@ pub fn match_port_profile(
 /// Profile controls (privileged write policy, console settings, command
 /// policy) belong to the hardware, not to the way it was named, so a
 /// literal-path open must not skip them (ADR 0005). Paths are canonicalized
-/// on both sides so a udev symlink alias resolves to the same profile.
+/// on both sides so a udev symlink alias resolves to the same profile, even
+/// when the allowlist names only the alias.
 /// Returns `Ok(None)` for ports no profile claims — virtual PTYs and
 /// unprofiled hardware open exactly as before. With no profiles configured
 /// the host is not enumerated at all. Enumeration failure is an error
@@ -209,8 +210,12 @@ pub fn resolve_port_profile(
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| path.to_string())
     };
-    let ports: Vec<PortDescriptor> = filter_allowlisted(raw)
+    // No allowlist filter here: the allowlist may name aliases (for example
+    // `/dev/serial/by-id/*`) that the kernel node names never match, and the
+    // opened path is allowlist-checked by the session manager anyway.
+    let ports: Vec<PortDescriptor> = raw
         .into_iter()
+        .map(PortDescriptor::from)
         .map(|mut port| {
             port.port = canonical(&port.port);
             port

@@ -246,9 +246,6 @@ impl<B: SerialBackend> McpServer<B> {
                 }
             };
 
-        if let Some(line_ending) = p.line_ending {
-            console_settings.line_ending = line_ending;
-        }
         let timeout_ms = p
             .timeout_ms
             .unwrap_or(config::DEFAULT_TIMEOUT_MS)
@@ -270,6 +267,28 @@ impl<B: SerialBackend> McpServer<B> {
             Ok(policy) => Arc::new(policy),
             Err(err) => return Ok(tool_error(err, None, false, false)),
         };
+        // A guarded profile's line ending is part of its policy: letting a
+        // caller pick a terminator the console ignores would let fragments
+        // pile up for a later session to submit. Callers choose only where the
+        // profile has none.
+        if let Some(line_ending) = p.line_ending {
+            let profile_line_ending = console_settings.line_ending;
+            if !command_policy.is_empty()
+                && profile_line_ending != LineEnding::None
+                && line_ending != profile_line_ending
+            {
+                return Ok(tool_error(
+                    SerialError::InvalidParam {
+                        name: "line_ending".into(),
+                        reason: "cannot override a guarded profile's line_ending".into(),
+                    },
+                    None,
+                    false,
+                    false,
+                ));
+            }
+            console_settings.line_ending = line_ending;
+        }
 
         match self
             .sessions
