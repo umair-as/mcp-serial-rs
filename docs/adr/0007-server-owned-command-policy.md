@@ -30,7 +30,7 @@ complete-command `serial.exec` path.
 feature must use a different code than the provisional number in its planning
 specification.
 
-## Amendment (2026-10-14): guarded commands are single lines
+## Amendment (#19): guarded commands are single lines
 
 A regex judges one `exec` call's `command`, but a shell judges *lines*. Refusing
 raw `serial.write` alone did not stop a caller from assembling a line across

@@ -50,7 +50,7 @@ session (e.g. force `deny` on any port) but may **not downgrade** a `privileged`
 device-profile default. Device profiles gain an optional boolean `privileged`;
 `privileged = true` implies a `confirm` default.
 
-**Amendment (2026-10-14).** The profile follows the hardware, not the name used
+**Amendment (#19).** The profile follows the hardware, not the name used
 to open it. A literal `serial.open {port}` whose path (canonicalized, so udev
 symlink aliases count) is the enumerated port a profile matches receives that
 profile's write-policy default, console settings, command policy, and default
