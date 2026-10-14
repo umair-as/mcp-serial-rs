@@ -1284,6 +1284,10 @@ fn policy_profile() -> DeviceProfile {
     }
 }
 
+/// Serializes tests that set `MCP_SERIAL_DENY_PATTERNS` with tests whose
+/// `serial.open` must not observe another test's temporary value.
+static GLOBAL_POLICY_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn policy_test_server() -> (
     McpServer<StubBackend>,
     Arc<SessionManager<StubBackend>>,
@@ -1317,6 +1321,7 @@ fn policy_test_server() -> (
 
 #[tokio::test]
 async fn serial_open_unions_global_profile_and_caller_policy_rules() {
+    let _env = GLOBAL_POLICY_ENV.lock().await;
     let previous = std::env::var_os("MCP_SERIAL_DENY_PATTERNS");
     unsafe { std::env::set_var("MCP_SERIAL_DENY_PATTERNS", r#"["global-block"]"#) };
     let (server, _sessions, _backend) = policy_test_server();
@@ -1371,6 +1376,7 @@ async fn serial_open_unions_global_profile_and_caller_policy_rules() {
 
 #[tokio::test]
 async fn serial_open_rejects_bad_regex_from_global_policy_env() {
+    let _env = GLOBAL_POLICY_ENV.lock().await;
     let previous = std::env::var_os("MCP_SERIAL_DENY_PATTERNS");
     unsafe { std::env::set_var("MCP_SERIAL_DENY_PATTERNS", r#"["["]"#) };
     let (server, _sessions, _backend) = policy_test_server();
@@ -3539,4 +3545,88 @@ async fn concurrent_tool_calls_produce_valid_non_interleaved_journal_rows() {
         .count();
     assert_eq!(calls, N);
     assert_eq!(results, N);
+}
+
+// ---- H1: literal-port opens inherit the matching profile's controls ------
+
+/// Server whose port-profile resolver claims `/dev/ttyACM0` for a privileged,
+/// policy-bearing profile and leaves every other path unprofiled.
+fn port_profile_test_server() -> (McpServer<StubBackend>, Arc<SessionManager<StubBackend>>) {
+    let backend = StubBackend::new();
+    let sessions = Arc::new(SessionManager::new(backend));
+    let device_resolver = Arc::new(|device: &str, _: &[DeviceProfile]| {
+        Err(SerialError::DeviceNotFound {
+            device: device.into(),
+        })
+    });
+    let port_resolver = Arc::new(|port: &str, _: &[DeviceProfile]| {
+        Ok((port == "/dev/ttyACM0").then(|| ResolvedDevice {
+            port_path: port.into(),
+            baud: 57_600,
+            write_policy: WritePolicy::Confirm,
+            console_settings: ConsoleSettings::default(),
+            deny_patterns: vec![r"\breboot\b".into()],
+            allow_patterns: Vec::new(),
+        }))
+    });
+    (
+        McpServer::new_with_resolvers(
+            sessions.clone(),
+            Arc::new(Vec::new()),
+            None,
+            device_resolver,
+            port_resolver,
+        ),
+        sessions,
+    )
+}
+
+async fn open_by_port(server: &McpServer<StubBackend>, args: Value) -> String {
+    let _env = GLOBAL_POLICY_ENV.lock().await;
+    let result = server
+        .open(Parameters(
+            serde_json::from_value(args).expect("deserialize serial.open JSON arguments"),
+        ))
+        .await
+        .expect("open tool result");
+    result.structured_content.as_ref().unwrap()["session_id"]
+        .as_str()
+        .expect("opened session")
+        .to_string()
+}
+
+#[tokio::test]
+async fn serial_open_by_port_of_profiled_device_applies_profile_controls() {
+    let (server, sessions) = port_profile_test_server();
+    let session_id = open_by_port(&server, json!({"port": "/dev/ttyACM0"})).await;
+    let snapshot = sessions.get_session(&session_id).expect("snapshot");
+    assert_eq!(snapshot.write_policy, WritePolicy::Confirm);
+    assert_eq!(snapshot.baud, 57_600);
+    // `>=`: concurrent tests may briefly set global MCP_SERIAL_DENY_PATTERNS.
+    assert!(snapshot.command_policy.deny_rule_count >= 1);
+    assert!(snapshot.command_policy.mutation_via_exec_only);
+}
+
+#[tokio::test]
+async fn serial_open_by_port_cannot_downgrade_privileged_profile() {
+    let (server, sessions) = port_profile_test_server();
+    let session_id = open_by_port(
+        &server,
+        json!({"port": "/dev/ttyACM0", "write_policy": "allow", "baud": 115_200}),
+    )
+    .await;
+    let snapshot = sessions.get_session(&session_id).expect("snapshot");
+    assert_eq!(snapshot.write_policy, WritePolicy::Confirm);
+    // Caller baud still overrides the profile default, as with `device`.
+    assert_eq!(snapshot.baud, 115_200);
+}
+
+#[tokio::test]
+async fn serial_open_by_unprofiled_port_keeps_unguarded_defaults() {
+    let (server, sessions) = port_profile_test_server();
+    let session_id = open_by_port(&server, json!({"port": "/dev/ttyUSB0"})).await;
+    let snapshot = sessions.get_session(&session_id).expect("snapshot");
+    assert_eq!(snapshot.write_policy, WritePolicy::Allow);
+    assert_eq!(snapshot.baud, config::DEFAULT_BAUD);
+    assert_eq!(snapshot.command_policy.allow_rule_count, 0);
 }

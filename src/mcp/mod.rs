@@ -48,6 +48,12 @@ use crate::serial::{ResolvedDevice, SerialBackend, WritePolicy};
 pub type DeviceResolver =
     dyn Fn(&str, &[DeviceProfile]) -> Result<ResolvedDevice, SerialError> + Send + Sync;
 
+/// Injectable literal-port profile resolver. Production uses
+/// [`crate::serial::resolve_port_profile`]; `Ok(None)` means no profile
+/// claims the port.
+pub type PortProfileResolver =
+    dyn Fn(&str, &[DeviceProfile]) -> Result<Option<ResolvedDevice>, SerialError> + Send + Sync;
+
 /// rmcp-facing server. Holds shared references to the serial domain state
 /// — session manager, device profiles, and the audit journal handle — and
 /// registers the `serial.*` tools with the `rmcp` SDK.
@@ -59,6 +65,7 @@ pub struct McpServer<B: SerialBackend> {
     /// logging. Wired through `call_tool` (spec §Journal Requirements).
     journal: Option<Arc<JournalWriter>>,
     device_resolver: Arc<DeviceResolver>,
+    port_profile_resolver: Arc<PortProfileResolver>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -72,6 +79,7 @@ impl<B: SerialBackend> Clone for McpServer<B> {
             profiles: Arc::clone(&self.profiles),
             journal: self.journal.clone(),
             device_resolver: Arc::clone(&self.device_resolver),
+            port_profile_resolver: Arc::clone(&self.port_profile_resolver),
             tool_router: self.tool_router.clone(),
         }
     }
@@ -99,11 +107,29 @@ impl<B: SerialBackend> McpServer<B> {
         journal: Option<Arc<JournalWriter>>,
         device_resolver: Arc<DeviceResolver>,
     ) -> Self {
+        Self::new_with_resolvers(
+            sessions,
+            profiles,
+            journal,
+            device_resolver,
+            Arc::new(crate::serial::resolve_port_profile),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_resolvers(
+        sessions: Arc<SessionManager<B>>,
+        profiles: Arc<Vec<DeviceProfile>>,
+        journal: Option<Arc<JournalWriter>>,
+        device_resolver: Arc<DeviceResolver>,
+        port_profile_resolver: Arc<PortProfileResolver>,
+    ) -> Self {
         Self {
             sessions,
             profiles,
             journal,
             device_resolver,
+            port_profile_resolver,
             tool_router: Self::tool_router(),
         }
     }
@@ -157,8 +183,9 @@ impl<B: SerialBackend> McpServer<B> {
         // here — that maps to -32602 and is reserved for JSON-RPC envelope
         // / params-deserialization failures.
         // `profile_policy` is the write policy the resolution path implies:
-        // a bare port path implies `Allow`; a `privileged` device profile
-        // implies `Confirm`. The caller's `write_policy` override is combined
+        // an unprofiled port path implies `Allow`; a `privileged` device
+        // profile implies `Confirm`, whether opened by `device` or by the
+        // literal path of a port that profile matches. The caller's `write_policy` override is combined
         // below (most-restrictive wins).
         let (port_path, baud, profile_policy, console_settings, profile_deny, profile_allow) =
             match (p.port, p.device) {
@@ -184,14 +211,25 @@ impl<B: SerialBackend> McpServer<B> {
                         false,
                     ));
                 }
-                (Some(port), None) => (
-                    port,
-                    p.baud.unwrap_or(config::DEFAULT_BAUD),
-                    WritePolicy::Allow,
-                    ConsoleSettings::default(),
-                    Vec::new(),
-                    Vec::new(),
-                ),
+                (Some(port), None) => match (self.port_profile_resolver)(&port, &self.profiles) {
+                    Ok(Some(resolved)) => (
+                        port,
+                        p.baud.unwrap_or(resolved.baud),
+                        resolved.write_policy,
+                        resolved.console_settings,
+                        resolved.deny_patterns,
+                        resolved.allow_patterns,
+                    ),
+                    Ok(None) => (
+                        port,
+                        p.baud.unwrap_or(config::DEFAULT_BAUD),
+                        WritePolicy::Allow,
+                        ConsoleSettings::default(),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                    Err(err) => return Ok(tool_error(err, None, false, false)),
+                },
                 (None, Some(device_name)) => {
                     let resolved = match (self.device_resolver)(&device_name, &self.profiles) {
                         Ok(resolved) => resolved,
