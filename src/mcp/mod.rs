@@ -1088,8 +1088,9 @@ pub struct OpenParams {
     /// with `port`.
     #[serde(default)]
     pub device: Option<String>,
-    /// Override the baud rate. Defaults to the profile baud (device
-    /// path) or `config::DEFAULT_BAUD` (port path).
+    /// Override the baud rate. Defaults to the matching profile's baud
+    /// (opened by `device`, or by the `port` of a profiled device), else
+    /// `config::DEFAULT_BAUD`.
     #[serde(default)]
     pub baud: Option<u32>,
     /// Per-session default operation timeout in milliseconds. Clamped

@@ -53,8 +53,8 @@ device-profile default. Device profiles gain an optional boolean `privileged`;
 **Amendment (2026-10-14).** The profile follows the hardware, not the name used
 to open it. A literal `serial.open {port}` whose path (canonicalized, so udev
 symlink aliases count) is the enumerated port a profile matches receives that
-profile's write-policy default, console settings, and command policy, exactly as
-`{device}` would. Matching is first-match, the same rule `serial.list_ports`
+profile's write-policy default, console settings, command policy, and default
+baud, exactly as `{device}` would. Matching is first-match, the same rule `serial.list_ports`
 uses to advertise `device`. Ports no profile claims (unprofiled hardware,
 virtual PTYs) keep the `allow` default. With profiles configured, a failed
 port enumeration fails the open rather than silently skipping the profile.

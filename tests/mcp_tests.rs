@@ -267,13 +267,28 @@ async fn fault_server_with_open_session(
     (server, sessions, backend, session_id)
 }
 
+/// Stub servers never consult the host's real port enumeration for literal-port
+/// opens; profile-by-port matching is unit-tested in `serial::tests`.
+fn stub_mcp_server(
+    sessions: Arc<SessionManager<StubBackend>>,
+    profiles: Vec<DeviceProfile>,
+) -> McpServer<StubBackend> {
+    McpServer::new_with_resolvers(
+        sessions,
+        Arc::new(profiles),
+        None,
+        Arc::new(mcp_serial_rs::serial::resolve_device),
+        Arc::new(|_: &str, _: &[DeviceProfile]| Ok(None)),
+    )
+}
+
 /// Build an `McpServer` backed by [`StubBackend`] with the supplied
 /// device profiles. Returns the server and a handle to the backend so
 /// read/read_until tests can pop the device side after `serial.open`.
 fn stub_server_with_backend(profiles: Vec<DeviceProfile>) -> (McpServer<StubBackend>, StubBackend) {
     let backend = StubBackend::new();
     let sessions = Arc::new(SessionManager::new(backend.clone()));
-    let server = McpServer::new(sessions, Arc::new(profiles), None);
+    let server = stub_mcp_server(sessions, profiles);
     (server, backend)
 }
 
@@ -964,7 +979,7 @@ fn stub_setup(
 ) {
     let backend = StubBackend::new();
     let sessions = Arc::new(SessionManager::new(backend.clone()));
-    let server = McpServer::new(sessions.clone(), Arc::new(profiles), None);
+    let server = stub_mcp_server(sessions.clone(), profiles);
     (server, sessions, backend)
 }
 
@@ -1323,7 +1338,13 @@ fn policy_test_server() -> (
         })
     });
     (
-        McpServer::new_with_device_resolver(sessions.clone(), profiles, None, resolver),
+        McpServer::new_with_resolvers(
+            sessions.clone(),
+            profiles,
+            None,
+            resolver,
+            Arc::new(|_: &str, _: &[DeviceProfile]| Ok(None)),
+        ),
         sessions,
         backend,
     )
