@@ -703,7 +703,7 @@ name = "mcp-serial-rs"
 version = "0.3.0"
 dependencies = [
  "assert_matches",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "jsonschema",
  "libc",
  "regex",
