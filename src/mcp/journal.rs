@@ -13,7 +13,7 @@
 //! bounded field names, byte counts, statuses, and error codes, but not raw
 //! command or device-output text.
 
-use rmcp::model::CallToolResult;
+use rmcp::model::{CallToolResponse, CallToolResult};
 use rmcp::ErrorData;
 use serde_json::{json, Value};
 
@@ -21,6 +21,18 @@ use crate::serial::journal::JournalEntry;
 
 const MAX_ARG_KEYS: usize = 16;
 const MAX_JOURNAL_FIELD_CHARS: usize = 128;
+
+/// Metadata-only label for a non-`Complete` `tools/call` response. This
+/// server never produces these (ADR 0008), so the label exists only so
+/// a future MRTR/Tasks path cannot escape the journal unnoticed.
+pub fn response_kind(response: &CallToolResponse) -> &'static str {
+    match response {
+        CallToolResponse::Complete(_) => "complete",
+        CallToolResponse::InputRequired(_) => "input_required",
+        CallToolResponse::Task(_) => "task",
+        _ => "unknown",
+    }
+}
 
 fn clipped(value: &str) -> String {
     value.chars().take(MAX_JOURNAL_FIELD_CHARS).collect()

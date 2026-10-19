@@ -458,6 +458,24 @@ fn validate_tool_output(schemas: &BTreeMap<String, Value>, tool: &str, response:
     }
 }
 
+/// The per-request `_meta` a 2026-07-28 client attaches instead of an
+/// `initialize` handshake (SEP-2575). `protocolVersion` and
+/// `clientCapabilities` are the keys rmcp requires before it selects
+/// the stateless lifecycle.
+fn stateless_meta() -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "mcp-tests", "version": "0.0.1"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+    })
+}
+
+/// A stateless (2026-07-28) request: no `initialize`, inline `_meta`.
+fn stateless_request(id: u64, method: &str, mut params: Value) -> Value {
+    params["_meta"] = stateless_meta();
+    json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+}
+
 // ---- lifecycle / list_ports ----------------------------------------------
 
 #[tokio::test]
@@ -474,6 +492,155 @@ async fn initialize_advertises_tools_capability_and_server_info() {
         result["capabilities"].get("tools").is_some(),
         "capabilities.tools must be present so clients know tools/list is supported; got {result:?}",
     );
+}
+
+#[tokio::test]
+async fn legacy_initialize_negotiates_2025_11_25_and_carries_instructions() {
+    // A 2025-11-25 client still gets a classic handshake reply from the
+    // rmcp 3.x server (ADR 0008): the negotiated version is the one it
+    // asked for, never the stateless 2026-07-28 revision which has no
+    // `initialize`, and the AGENTS.md guidance rides along as
+    // `instructions` so a binary-only install still receives it.
+    let responses = roundtrip(tokio_server(), &[init_request()]).await;
+    let result = &responses[0]["result"];
+    assert_eq!(result["protocolVersion"], "2025-11-25");
+    let instructions = result["instructions"]
+        .as_str()
+        .expect("initialize result must carry instructions");
+    assert_eq!(instructions, mcp_serial_rs::mcp::SERVER_INSTRUCTIONS);
+    for needle in [
+        "serial.list_ports",
+        "write_policy",
+        "untrusted",
+        "serial.close",
+    ] {
+        assert!(
+            instructions.contains(needle),
+            "instructions should mention `{needle}`"
+        );
+    }
+}
+
+#[tokio::test]
+async fn legacy_tools_list_omits_cache_hints() {
+    // `ttlMs` / `cacheScope` are 2026-07-28 fields; a 2025-11-25 client
+    // must not see them.
+    let responses = roundtrip(
+        tokio_server(),
+        &[
+            init_request(),
+            initialized_notification(),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        ],
+    )
+    .await;
+    let result = &responses[1]["result"];
+    assert!(
+        result.get("ttlMs").is_none(),
+        "legacy tools/list leaked ttlMs: {result}"
+    );
+    assert!(
+        result.get("cacheScope").is_none(),
+        "legacy tools/list leaked cacheScope: {result}"
+    );
+}
+
+#[tokio::test]
+async fn stateless_discover_advertises_versions_tools_and_instructions() {
+    // 2026-07-28 bootstrap probe: no handshake, `server/discover` returns
+    // every revision the server speaks plus the same capabilities and
+    // instructions a legacy `initialize` would.
+    let responses = roundtrip(
+        tokio_server(),
+        &[stateless_request(1, "server/discover", json!({}))],
+    )
+    .await;
+    let result = &responses[0]["result"];
+    let versions = result["supportedVersions"]
+        .as_array()
+        .expect("supportedVersions");
+    for v in ["2026-07-28", "2025-11-25"] {
+        assert!(
+            versions.iter().any(|x| x == v),
+            "missing {v} in {versions:?}"
+        );
+    }
+    assert!(result["capabilities"].get("tools").is_some(), "{result}");
+    assert_eq!(
+        result["instructions"],
+        mcp_serial_rs::mcp::SERVER_INSTRUCTIONS
+    );
+    assert_eq!(
+        result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "mcp-serial-rs"
+    );
+}
+
+#[tokio::test]
+async fn stateless_tools_list_without_initialize_carries_cache_hints() {
+    // Stateless lifecycle: the very first message is `tools/list` with
+    // inline `_meta`. The static list is marked cacheable for the
+    // documented TTL and in deterministic order.
+    let responses = roundtrip(
+        tokio_server(),
+        &[
+            stateless_request(1, "tools/list", json!({})),
+            stateless_request(2, "tools/list", json!({})),
+        ],
+    )
+    .await;
+    let result = &responses[0]["result"];
+    assert_eq!(result["ttlMs"], mcp_serial_rs::mcp::TOOLS_LIST_TTL_MS);
+    assert_eq!(result["cacheScope"], "public");
+    let names: Vec<&str> = result["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|t| t["name"].as_str().expect("name"))
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        names, sorted,
+        "cacheable list must be in a deterministic (sorted) order"
+    );
+    assert_eq!(names.len(), 11, "{names:?}");
+    assert_eq!(
+        responses[1]["result"]["tools"], result["tools"],
+        "order must be stable"
+    );
+}
+
+#[tokio::test]
+async fn stateless_tools_call_runs_without_initialize() {
+    let responses = roundtrip(
+        tokio_server(),
+        &[stateless_request(
+            1,
+            "tools/call",
+            json!({"name": "serial.list_ports", "arguments": {}}),
+        )],
+    )
+    .await;
+    let result = &responses[0]["result"];
+    assert!(result["structuredContent"]["ports"].is_array(), "{result}");
+    assert_ne!(result["isError"], true);
+}
+
+#[tokio::test]
+async fn stateless_request_without_meta_is_a_protocol_error() {
+    // Neither an `initialize` nor the required `_meta` keys: rmcp must
+    // answer with a JSON-RPC error, not dispatch the tool.
+    let responses = roundtrip(
+        tokio_server(),
+        &[json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "serial.list_ports", "arguments": {}},
+        })],
+    )
+    .await;
+    assert!(responses[0].get("error").is_some(), "{:?}", responses[0]);
+    assert!(responses[0].get("result").is_none());
 }
 
 #[tokio::test]

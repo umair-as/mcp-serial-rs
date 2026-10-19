@@ -5,6 +5,11 @@
 `mcp-serial-rs` exposes local serial-console access through MCP tools. It is a
 narrow console capability, not a full hardware-in-the-loop orchestrator.
 
+A condensed copy of this guide is also delivered over the wire as the MCP
+server `instructions` (`initialize` / `server/discover`), so a host that only
+installs the binary receives it. The source of that copy is
+`mcp::SERVER_INSTRUCTIONS` in `src/mcp/mod.rs`; keep the two in sync.
+
 ## Safe Workflow
 
 1. Discover ports with `serial.list_ports`.

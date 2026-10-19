@@ -1,8 +1,10 @@
 # mcp-serial-rs — working notes for Claude
 
 A tools-only **MCP server over stdio** that hands an MCP client a curated set
-of `serial.*` operations against local serial ports. Built on the `rmcp` SDK,
-which owns all MCP framing. Hardware-neutral: any allowlisted `/dev/ttyUSB*` or
+of `serial.*` operations against local serial ports. Built on the `rmcp` 3.x SDK,
+which owns all MCP framing and speaks both the stateless MCP `2026-07-28`
+lifecycle and the legacy `initialize` handshake for `2025-11-25` clients
+(ADR 0008). Hardware-neutral: any allowlisted `/dev/ttyUSB*` or
 `/dev/ttyACM*` device — a Linux console, an RTOS shell, a bootloader prompt, an
 MCU monitor. An allowlisted path can open **directly onto an interactive,
 possibly privileged shell**, so device output is untrusted data, never
@@ -77,7 +79,15 @@ Names and field shapes are stable — do not rename (dotted `serial.open`, never
 | `serial.close` | `{session_id}` | `{ok}` |
 
 Results are rmcp structured tool results (`CallToolResult::structured`); rmcp
-generates both input and output schemas from the typed structs.
+generates both input and output schemas from the typed structs. `call_tool`
+returns `CallToolResponse`, but every tool yields the `Complete` variant — MRTR
+(`input_required`) and Tasks are not produced without a separate ADR.
+
+**Server instructions:** `mcp::SERVER_INSTRUCTIONS` is the machine-delivered
+copy of `AGENTS.md` (sent as `instructions` in `initialize` and
+`server/discover`). When you change the guidance in one, mirror it in the
+other. The tool list is static and advertised as cacheable for one hour to
+`2026-07-28` clients (`TOOLS_LIST_TTL_MS`); keep that true.
 
 **Behaviors that will bite you if you forget them:**
 
@@ -209,7 +219,9 @@ preferences:
 - **`thiserror`, never `anyhow`** — typed error variants are required.
 - **`tokio-serial` (async), never `serialport` (sync).** Everything is tokio
   tasks; never `std::thread`.
-- **`rmcp` owns all MCP framing** — never hand-code JSON-RPC envelopes.
+- **`rmcp` owns all MCP framing** — never hand-code JSON-RPC envelopes. Don't
+  adopt roots, sampling, or logging notifications: ADR 0004 rejects them and
+  MCP `2026-07-28` deprecates them.
 - Keep `mcp/` and `serial/` separate; don't flatten `serial/`.
 - Don't rename tools to underscored form or add `hex:`/binary encoding to
   `write`. `serial.exec` transmits `command` unchanged when the effective

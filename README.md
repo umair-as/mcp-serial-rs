@@ -26,9 +26,10 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-MSRV 1.85. Edition 2021. The 1.85 floor is required by `rmcp` 1.7
-(which is built with edition 2024). See `CLAUDE.md §1–2` for the
-dependency rationale. The protocol layer is the `rmcp` SDK over its
+MSRV 1.88. Edition 2021. The 1.88 floor is required by `rmcp` 3.x,
+which implements MCP `2026-07-28` while still negotiating the legacy
+`initialize` handshake with `2025-11-25` clients (see ADR 0008). See
+`CLAUDE.md §1–2` for the dependency rationale. The protocol layer is the `rmcp` SDK over its
 stdio transport; this crate owns the serial domain (sessions, the
 device-profile registry, the allowlist, the audit journal) and
 registers the `serial.*` tools with the SDK.
@@ -49,13 +50,21 @@ return `PortBusy`, and the default journal is metadata-only. Regenerate strict c
 # Optional: load device profiles so list_ports is enriched.
 cp devices.toml.example devices.toml && edit devices.toml
 
-# Drive the server with an MCP handshake, then call a tool.
+# Drive the server with a legacy (2025-11-25) MCP handshake, then call a tool.
 (
   echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"demo","version":"0.1.0"}}}'
   echo '{"jsonrpc":"2.0","method":"notifications/initialized"}'
   echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"serial.list_ports","arguments":{}}}'
 ) | ./target/release/mcp-serial-rs
+
+# Or, as a stateless MCP 2026-07-28 client: no handshake, per-request `_meta`.
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"serial.list_ports","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}' \
+  | ./target/release/mcp-serial-rs
 ```
+
+The `initialize` and `server/discover` results both carry `instructions` —
+the safe-workflow and trust-boundary rules from `AGENTS.md` — so an MCP host
+that only installs the binary still receives them.
 
 Every `serial.*` operation goes through a `tools/call` envelope. Successful
 calls return an MCP tool result whose parsed payload lives under
@@ -335,8 +344,11 @@ are recorded under `docs/adr/`.
 
 The `serial.*` MVP and the `rmcp` SDK adoption are complete:
 
-- MCP lifecycle (`initialize`, `tools/list`, `notifications/initialized`) and
-  `tools/call` dispatch handled by the `rmcp` SDK over stdio.
+- MCP lifecycle — the legacy `initialize` handshake for `2025-11-25` clients
+  and the stateless `2026-07-28` lifecycle (`server/discover`, per-request
+  `_meta`) — and `tools/call` dispatch handled by the `rmcp` 3.x SDK over
+  stdio. `tools/list` carries cache hints for `2026-07-28` clients.
+- Server `instructions` delivering the `AGENTS.md` guidance to every client.
 - The `serial.*` tool set, with `rmcp`-generated input/output schemas and
   structured tool results.
 - Device profiles and named-device open.

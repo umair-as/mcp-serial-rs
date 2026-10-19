@@ -2,19 +2,24 @@
 
 # MCP Conformance Findings
 
-Date: 2026-07-15
+Date: 2026-07-15 (re-baselined 2026-10-19 for MCP `2026-07-28`)
 
-Scope: review of `mcp-serial-rs` against the MCP `2025-11-25` tools model,
-the exact local `rmcp = 1.7` API, repository tests/docs, and a live probe of
-the installed MCP server against `/dev/ttyACM0`.
+Scope: review of `mcp-serial-rs` against the MCP `2026-07-28` tools model
+(with `2025-11-25` compatibility), the exact local `rmcp = 3.5` API,
+repository tests/docs, and a live probe of the installed MCP server against
+`/dev/ttyACM0`. The original review targeted `2025-11-25` on `rmcp 1.7`; the
+revision-specific changes are recorded in ADR 0008.
 
 ## Current MCP Surface
 
 The server intentionally implements a narrow tools-only MCP surface over stdio:
 
-- lifecycle negotiation delegated to `rmcp`;
-- `notifications/initialized`;
-- `tools/list`;
+- lifecycle delegated to `rmcp`: the legacy `initialize` /
+  `notifications/initialized` handshake for `2025-11-25` and older clients, and
+  the stateless `2026-07-28` lifecycle (per-request `_meta`, `server/discover`);
+- `instructions` carrying the `AGENTS.md` safe-workflow guidance in both the
+  `initialize` and `server/discover` results;
+- `tools/list` with version-gated cache hints (`ttlMs`, `cacheScope`);
 - `tools/call`;
 - generated input schemas;
 - generated output schemas;
@@ -22,9 +27,10 @@ The server intentionally implements a narrow tools-only MCP surface over stdio:
 - static tool list with no list-change notification.
 
 This is MCP-compliant as a tools-only server. Resources, prompts, progress,
-completion, elicitation, tasks, and logging notifications are optional protocol
+completion, MRTR/elicitation, and the tasks extension are optional protocol
 features and are tracked below as deferred enhancements, not compliance
-failures.
+failures. Roots, sampling, and logging are deprecated in `2026-07-28` and are
+intentionally not implemented.
 
 ## Live Probe Evidence
 
@@ -127,16 +133,20 @@ Durable artifacts:
 
 ### 5. Static tool list
 
-Disposition: verified.
+Disposition: verified; cache hints implemented.
 
 The server has a static tool list and does not advertise tool-list change
 support. This is correct. Dynamic list-change notifications are rejected for the
-current tool surface.
+current tool surface. Under `2026-07-28` the list is advertised as cacheable
+(`ttlMs = 3600000`, `cacheScope = "public"`) in sorted order; legacy clients
+never see the fields.
 
 Durable artifacts:
 
 - `src/mcp/mod.rs`
+- `tests/mcp_tests.rs`
 - `docs/adr/0004-defer-optional-mcp-features.md`
+- `docs/adr/0008-mcp-2026-07-28-and-server-instructions.md`
 
 ### 6. Resources
 
@@ -168,32 +178,73 @@ Durable artifacts:
 
 Disposition: deferred.
 
-Progress and experimental tasks may fit future long-running capture or reboot
-waits. Current tools remain bounded synchronous operations.
+Progress and the `io.modelcontextprotocol/tasks` extension may fit future
+long-running capture or reboot waits. Current tools remain bounded synchronous
+operations; `call_tool` only ever returns `CallToolResponse::Complete`, and the
+journal would record any other variant.
 
 Durable artifacts:
 
 - `docs/adr/0004-defer-optional-mcp-features.md`
 
-### 9. Elicitation and completion
+### 9. Elicitation (MRTR) and completion
 
-Disposition: deferred.
+Disposition: deferred; next planned step.
 
-Elicitation could help ambiguous device selection or destructive-action
-confirmation; completion could help device/profile/session IDs. Both depend on
-client support and are less urgent than explicit structured errors and policy.
+Under `2026-07-28`, elicitation is delivered through Multi Round-Trip Requests:
+a tool returns `resultType: "input_required"` and the client retries with
+`inputResponses`. This is the intended mechanism for turning
+`write_policy = "confirm"` into a human-supplied confirmation rather than a
+model-supplied `confirm: true` (ADR 0005 calls the current form a tripwire).
+It needs its own ADR and a fallback for clients without elicitation support.
+Completion could help device/profile/session IDs and remains deferred.
 
 Durable artifacts:
 
 - `docs/adr/0004-defer-optional-mcp-features.md`
+- `docs/adr/0008-mcp-2026-07-28-and-server-instructions.md`
 
-### 10. Sampling and roots
+### 10. Sampling, roots, and logging
 
-Disposition: rejected for this server.
+Disposition: rejected for this server; deprecated by the protocol.
 
 Sampling would blur the trust boundary by letting the serial server ask a model
 to interpret device output. The MCP client already owns reasoning. Roots are
-irrelevant because this server does not need client filesystem access.
+irrelevant because this server does not need client filesystem access. Logging
+notifications were never adopted; diagnostics go to stderr via `tracing`. All
+three are deprecated in `2026-07-28`.
+
+### 11. Server instructions
+
+Disposition: implemented.
+
+`initialize.instructions` and `server/discover.instructions` carry
+`mcp::SERVER_INSTRUCTIONS`, a condensed copy of `AGENTS.md`, so a host that
+only installs the binary receives the safe-workflow and trust-boundary rules.
+
+Durable artifacts:
+
+- `src/mcp/mod.rs`
+- `tests/mcp_tests.rs`
+- `AGENTS.md`
+- `docs/adr/0008-mcp-2026-07-28-and-server-instructions.md`
+
+### 12. Stateless lifecycle
+
+Disposition: implemented via `rmcp` 3.x.
+
+A `2026-07-28` client may open with `server/discover`, `tools/list`, or
+`tools/call` carrying `io.modelcontextprotocol/protocolVersion` and
+`io.modelcontextprotocol/clientCapabilities` in `_meta`; a request with neither
+an `initialize` nor that metadata is answered with a JSON-RPC error. A
+`2025-11-25` client still negotiates its own version through `initialize`.
+Wire tests cover both lifecycles.
+
+Durable artifacts:
+
+- `src/mcp/mod.rs`
+- `tests/mcp_tests.rs`
+- `docs/adr/0008-mcp-2026-07-28-and-server-instructions.md`
 
 Durable artifacts:
 
@@ -202,6 +253,7 @@ Durable artifacts:
 ## Remaining Verification Gaps
 
 - Add golden tests for exact tool descriptions and annotations.
+- Keep `AGENTS.md` and `mcp::SERVER_INSTRUCTIONS` in sync (currently by hand).
 - Add schema validation of successful `structuredContent` against every
   advertised output schema, beyond presence checks.
 - Add wire tests for invalid MCP framing and unknown methods/tools if not fully
