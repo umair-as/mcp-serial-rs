@@ -29,7 +29,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use rmcp::handler::server::tool::InputResponses as ToolInputResponses;
 use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{CallToolResponse, CallToolResult, NumberOrString};
+use rmcp::service::{serve_directly, RequestContext, RoleServer};
 use rmcp::ServiceExt;
 use serde_json::{json, Value};
 use tokio::io::{
@@ -474,6 +477,76 @@ fn stateless_meta() -> Value {
 fn stateless_request(id: u64, method: &str, mut params: Value) -> Value {
     params["_meta"] = stateless_meta();
     json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+}
+
+/// A stateless request from a client that declares the elicitation
+/// capability, which is what lets the server answer `tools/call` with an
+/// MRTR `input_required` round (ADR 0009).
+fn stateless_request_eliciting(id: u64, method: &str, mut params: Value) -> Value {
+    let mut meta = stateless_meta();
+    meta["io.modelcontextprotocol/clientCapabilities"] = json!({"elicitation": {"form": {}}});
+    params["_meta"] = meta;
+    json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+}
+
+/// Drive the server with a request, then a second request built from the
+/// first response (MRTR retries need the server-assigned request key).
+async fn roundtrip_then<B: SerialBackend>(
+    server: McpServer<B>,
+    first: Value,
+    next: impl FnOnce(&Value) -> Value,
+) -> (Value, Value) {
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server_task = tokio::spawn(async move {
+        let svc = server.serve(server_io).await.expect("serve start");
+        let _ = svc.waiting().await;
+    });
+    let (client_read, mut client_write) = tokio::io::split(client_io);
+    let mut reader = BufReader::new(client_read);
+
+    let mut send_recv = async |req: Value| -> Value {
+        let mut line = serde_json::to_vec(&req).expect("encode request");
+        line.push(b'\n');
+        client_write.write_all(&line).await.expect("write request");
+        client_write.flush().await.expect("flush");
+        let mut buf = String::new();
+        let n = timeout(Duration::from_secs(5), reader.read_line(&mut buf))
+            .await
+            .expect("response timeout")
+            .expect("read line");
+        assert!(n > 0, "EOF before response arrived");
+        serde_json::from_str(buf.trim_end()).expect("response JSON")
+    };
+    let first_resp = send_recv(first).await;
+    let second = next(&first_resp);
+    let second_resp = send_recv(second).await;
+
+    drop(client_write);
+    drop(reader);
+    let _ = timeout(Duration::from_secs(2), server_task).await;
+    (first_resp, second_resp)
+}
+
+/// A legacy (`initialize`-style) request context for calling `#[tool]`
+/// handlers directly: no inline `_meta`, no peer info, so the server treats
+/// the caller as a pre-2026 client without elicitation. The returned stream
+/// keeps the backing transport alive for the context's lifetime.
+fn direct_context() -> (RequestContext<RoleServer>, DuplexStream) {
+    let (server_io, client_io) = tokio::io::duplex(1024);
+    let running = serve_directly::<RoleServer, _, _, _, _>(stub_server(vec![]), server_io, None);
+    let ctx = RequestContext::new(NumberOrString::Number(1), running.peer().clone());
+    tokio::spawn(async move {
+        let _ = running.waiting().await;
+    });
+    (ctx, client_io)
+}
+
+/// Unwrap the `Complete` variant of a direct handler call.
+fn complete(response: CallToolResponse) -> CallToolResult {
+    match response {
+        CallToolResponse::Complete(result) => result,
+        other => panic!("expected a complete tool result, got {other:?}"),
+    }
 }
 
 // ---- lifecycle / list_ports ----------------------------------------------
@@ -1519,6 +1592,7 @@ fn policy_test_server() -> (
 
 #[tokio::test]
 async fn serial_open_unions_global_profile_and_caller_policy_rules() {
+    let (ctx, _transport) = direct_context();
     let _env = GLOBAL_POLICY_ENV.lock().await;
     let previous = std::env::var_os("MCP_SERIAL_DENY_PATTERNS");
     unsafe { std::env::set_var("MCP_SERIAL_DENY_PATTERNS", r#"["global-block"]"#) };
@@ -1561,9 +1635,12 @@ async fn serial_open_unions_global_profile_and_caller_policy_rules() {
                     normalize_output: None,
                     timeout_ms: None,
                 }),
+                ctx.clone(),
+                ToolInputResponses(None),
                 CancellationToken::new(),
             )
             .await
+            .map(complete)
             .expect("exec tool result");
         assert_eq!(
             result.structured_content.as_ref().unwrap()["error"]["code"],
@@ -1608,6 +1685,7 @@ async fn serial_open_rejects_bad_regex_from_global_policy_env() {
 
 #[tokio::test]
 async fn serial_open_applies_profile_allow_patterns() {
+    let (ctx, _transport) = direct_context();
     let (server, _sessions, backend) = policy_test_server();
     let open = server
         .open(Parameters(
@@ -1635,9 +1713,12 @@ async fn serial_open_applies_profile_allow_patterns() {
                 normalize_output: None,
                 timeout_ms: None,
             }),
+            ctx.clone(),
+            ToolInputResponses(None),
             CancellationToken::new(),
         )
         .await
+        .map(complete)
         .expect("exec tool result");
     assert_eq!(
         denied.structured_content.as_ref().unwrap()["error"]["data"]["rule"],
@@ -1666,9 +1747,12 @@ async fn serial_open_applies_profile_allow_patterns() {
                 normalize_output: None,
                 timeout_ms: None,
             }),
+            ctx.clone(),
+            ToolInputResponses(None),
             CancellationToken::new(),
         )
         .await
+        .map(complete)
         .expect("exec tool result");
     device_task.await.expect("device task");
     assert_eq!(
@@ -1741,6 +1825,289 @@ async fn exec_confirm_with_confirm_true_writes_command() {
         .expect("read timeout")
         .expect("read");
     assert_eq!(buf, b"probe\n");
+}
+
+// ---- elicitation-backed confirm (ADR 0009) ------------------------------
+
+fn exec_args(session_id: &str, command: &str) -> Value {
+    json!({
+        "session_id": session_id,
+        "command": command,
+        "expect": "NEVER_MATCHES",
+        "timeout_ms": 200,
+        "line_ending": "lf",
+    })
+}
+
+/// The single confirmation key and its elicitation from an `input_required`
+/// response.
+fn confirmation_request(resp: &Value) -> (String, Value) {
+    let result = &resp["result"];
+    assert_eq!(result["resultType"], "input_required", "{resp}");
+    let requests = result["inputRequests"].as_object().expect("inputRequests");
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    let (key, request) = requests.iter().next().expect("one request");
+    assert!(key.starts_with("confirm_write:"), "{key}");
+    (key.clone(), request.clone())
+}
+
+fn retry_with_answer(session_id: &str, command: &str, key: &str, answer: Value) -> Value {
+    let mut params = json!({"name": "serial.exec", "arguments": exec_args(session_id, command)});
+    params["inputResponses"] = json!({ key: answer });
+    stateless_request_eliciting(2, "tools/call", params)
+}
+
+#[tokio::test]
+async fn confirm_exec_from_eliciting_client_asks_the_person_first() {
+    // A 2026-07-28 client with elicitation: `confirm: true` from the model
+    // is *not* enough. The server answers with one form elicitation that
+    // shows the exact bytes, and nothing reaches the device.
+    let (server, session_id, mut device) =
+        server_with_open_session_policy(WritePolicy::Confirm).await;
+    let mut args = exec_args(&session_id, "probe");
+    args["confirm"] = json!(true);
+    let responses = roundtrip(
+        server,
+        &[stateless_request_eliciting(
+            1,
+            "tools/call",
+            json!({"name": "serial.exec", "arguments": args}),
+        )],
+    )
+    .await;
+    let (_, request) = confirmation_request(&responses[0]);
+    assert_eq!(request["method"], "elicitation/create");
+    assert_eq!(request["params"]["mode"], "form");
+    let message = request["params"]["message"].as_str().expect("message");
+    assert!(message.contains(&session_id), "{message}");
+    assert!(message.contains("/dev/ttyUSB0"), "{message}");
+    assert!(
+        message.contains("\"probe\\n\""),
+        "excerpt is {{:?}}-escaped: {message}"
+    );
+    assert_eq!(
+        request["params"]["requestedSchema"]["required"],
+        json!(["confirm"])
+    );
+    assert_eq!(
+        request["params"]["requestedSchema"]["properties"]["confirm"]["type"],
+        "boolean"
+    );
+    assert_device_untouched(&mut device).await;
+}
+
+#[tokio::test]
+async fn confirm_exec_accepted_by_person_writes_the_command() {
+    let (server, session_id, mut device) =
+        server_with_open_session_policy(WritePolicy::Confirm).await;
+    let sid = session_id.clone();
+    let (first, second) = roundtrip_then(
+        server,
+        stateless_request_eliciting(
+            1,
+            "tools/call",
+            json!({"name": "serial.exec", "arguments": exec_args(&session_id, "probe")}),
+        ),
+        move |resp| {
+            let (key, _) = confirmation_request(resp);
+            retry_with_answer(
+                &sid,
+                "probe",
+                &key,
+                json!({"action": "accept", "content": {"confirm": true}}),
+            )
+        },
+    )
+    .await;
+    assert_eq!(first["result"]["resultType"], "input_required");
+    let sc = &second["result"]["structuredContent"];
+    assert_ne!(second["result"]["isError"], true, "{second}");
+    assert_eq!(sc["command_written"], true, "{second}");
+    assert_eq!(sc["status"], "timed_out");
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; b"probe\n".len()];
+    timeout(Duration::from_secs(2), device.read_exact(&mut buf))
+        .await
+        .expect("read timeout")
+        .expect("read");
+    assert_eq!(buf, b"probe\n");
+}
+
+#[tokio::test]
+async fn confirm_exec_declined_by_person_is_a_tool_error() {
+    for (answer, action) in [
+        (json!({"action": "decline"}), "decline"),
+        (json!({"action": "cancel"}), "cancel"),
+        (
+            json!({"action": "accept", "content": {"confirm": false}}),
+            "accept_without_confirm",
+        ),
+        (json!({"garbage": true}), "invalid"),
+    ] {
+        let (server, session_id, mut device) =
+            server_with_open_session_policy(WritePolicy::Confirm).await;
+        let sid = session_id.clone();
+        let (_, second) = roundtrip_then(
+            server,
+            stateless_request_eliciting(
+                1,
+                "tools/call",
+                json!({"name": "serial.exec", "arguments": exec_args(&session_id, "probe")}),
+            ),
+            move |resp| {
+                let (key, _) = confirmation_request(resp);
+                retry_with_answer(&sid, "probe", &key, answer)
+            },
+        )
+        .await;
+        assert_eq!(rpc_error_code(&second), -32016, "{action}: {second}");
+        let error = &second["result"]["structuredContent"]["error"];
+        assert_eq!(error["type"], "confirmation_declined");
+        assert_eq!(error["data"]["elicitation"], action);
+        assert_eq!(error["retryable"], false);
+        assert_eq!(error["command_written"], false);
+        assert_device_untouched(&mut device).await;
+    }
+}
+
+#[tokio::test]
+async fn confirm_answer_is_bound_to_the_exact_bytes_shown() {
+    // Reusing the person's "yes" for different bytes must not work: the
+    // key is a digest of the payload, so a changed command elicits again.
+    let (server, session_id, mut device) =
+        server_with_open_session_policy(WritePolicy::Confirm).await;
+    let sid = session_id.clone();
+    let (_, second) = roundtrip_then(
+        server,
+        stateless_request_eliciting(
+            1,
+            "tools/call",
+            json!({"name": "serial.exec", "arguments": exec_args(&session_id, "ls")}),
+        ),
+        move |resp| {
+            let (key, _) = confirmation_request(resp);
+            retry_with_answer(
+                &sid,
+                "rm -rf /",
+                &key,
+                json!({"action": "accept", "content": {"confirm": true}}),
+            )
+        },
+    )
+    .await;
+    let (key2, request) = confirmation_request(&second);
+    assert!(request["params"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("rm -rf /"));
+    let _ = key2;
+    assert_device_untouched(&mut device).await;
+}
+
+#[tokio::test]
+async fn confirm_write_from_eliciting_client_is_elicited_too() {
+    let (server, session_id, mut device) =
+        server_with_open_session_policy(WritePolicy::Confirm).await;
+    let responses = roundtrip(
+        server,
+        &[stateless_request_eliciting(
+            1,
+            "tools/call",
+            json!({"name": "serial.write", "arguments": {"session_id": session_id, "data": "x"}}),
+        )],
+    )
+    .await;
+    let (_, request) = confirmation_request(&responses[0]);
+    assert!(request["params"]["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("serial.write on serial session"));
+    assert_device_untouched(&mut device).await;
+}
+
+#[tokio::test]
+async fn confirm_exec_from_stateless_client_without_elicitation_keeps_tripwire() {
+    // 2026-07-28 client that declares no elicitation capability: the
+    // ADR 0005 behaviour stands — `confirm: true` proceeds, its absence
+    // is -32013.
+    let (server, session_id, mut device) =
+        server_with_open_session_policy(WritePolicy::Confirm).await;
+    let responses = roundtrip(
+        server,
+        &[stateless_request(
+            1,
+            "tools/call",
+            json!({"name": "serial.exec", "arguments": exec_args(&session_id, "probe")}),
+        )],
+    )
+    .await;
+    assert_eq!(rpc_error_code(&responses[0]), -32013, "{:?}", responses[0]);
+    assert_device_untouched(&mut device).await;
+
+    let (server, session_id, mut device) =
+        server_with_open_session_policy(WritePolicy::Confirm).await;
+    let mut args = exec_args(&session_id, "probe");
+    args["confirm"] = json!(true);
+    let responses = roundtrip(
+        server,
+        &[stateless_request(
+            1,
+            "tools/call",
+            json!({"name": "serial.exec", "arguments": args}),
+        )],
+    )
+    .await;
+    assert_eq!(
+        responses[0]["result"]["structuredContent"]["command_written"],
+        true
+    );
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; b"probe\n".len()];
+    timeout(Duration::from_secs(2), device.read_exact(&mut buf))
+        .await
+        .expect("read timeout")
+        .expect("read");
+    assert_eq!(buf, b"probe\n");
+}
+
+#[tokio::test]
+async fn confirm_exec_from_legacy_eliciting_client_keeps_tripwire() {
+    // A 2025-11-25 client may declare elicitation, but MRTR does not exist
+    // on that revision, so the server must not answer `input_required`.
+    let (server, session_id, mut device) =
+        server_with_open_session_policy(WritePolicy::Confirm).await;
+    let mut init = init_request();
+    init["params"]["capabilities"] = json!({"elicitation": {"form": {}}});
+    let responses = roundtrip(
+        server,
+        &[
+            init,
+            initialized_notification(),
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "serial.exec", "arguments": exec_args(&session_id, "probe")},
+            }),
+        ],
+    )
+    .await;
+    assert_eq!(rpc_error_code(&responses[1]), -32013, "{:?}", responses[1]);
+    assert_device_untouched(&mut device).await;
+}
+
+#[tokio::test]
+async fn deny_session_is_not_elicited() {
+    let (server, session_id, mut device) = server_with_open_session_policy(WritePolicy::Deny).await;
+    let responses = roundtrip(
+        server,
+        &[stateless_request_eliciting(
+            1,
+            "tools/call",
+            json!({"name": "serial.exec", "arguments": exec_args(&session_id, "probe")}),
+        )],
+    )
+    .await;
+    assert_eq!(rpc_error_code(&responses[0]), -32012, "{:?}", responses[0]);
+    assert_device_untouched(&mut device).await;
 }
 
 #[tokio::test]
@@ -3849,6 +4216,7 @@ fn guarded_exec(session_id: &str, command: &str, line_ending: Option<LineEnding>
 
 #[tokio::test]
 async fn guarded_exec_blocks_split_and_multiline_commands() {
+    let (ctx, _transport) = direct_context();
     let (server, sessions, backend) = policy_test_server();
     let session_id = {
         let _env = GLOBAL_POLICY_ENV.lock().await;
@@ -3881,9 +4249,12 @@ async fn guarded_exec_blocks_split_and_multiline_commands() {
         let result = server
             .exec(
                 Parameters(guarded_exec(&session_id, command, line_ending)),
+                ctx.clone(),
+                ToolInputResponses(None),
                 CancellationToken::new(),
             )
             .await
+            .map(complete)
             .expect("exec tool result");
         let error = &result.structured_content.as_ref().unwrap()["error"];
         assert_eq!(error["code"], -32014, "{command:?}");
@@ -3903,9 +4274,12 @@ async fn guarded_exec_blocks_split_and_multiline_commands() {
     let allowed = server
         .exec(
             Parameters(guarded_exec(&session_id, "allowed", Some(LineEnding::Lf))),
+            ctx.clone(),
+            ToolInputResponses(None),
             CancellationToken::new(),
         )
         .await
+        .map(complete)
         .expect("exec tool result");
     device_task.await.expect("device task");
     assert_eq!(allowed.structured_content.as_ref().unwrap()["ok"], true);
@@ -3913,6 +4287,7 @@ async fn guarded_exec_blocks_split_and_multiline_commands() {
 
 #[tokio::test]
 async fn unguarded_exec_keeps_per_call_line_ending_and_raw_command() {
+    let (ctx, _transport) = direct_context();
     let (server, session_id, mut device) = {
         let (server, backend) = stub_server_with_backend(Vec::new());
         let open = server
@@ -3938,9 +4313,12 @@ async fn unguarded_exec_keeps_per_call_line_ending_and_raw_command() {
     let result = server
         .exec(
             Parameters(guarded_exec(&session_id, "a\nb\\", Some(LineEnding::Crlf))),
+            ctx.clone(),
+            ToolInputResponses(None),
             CancellationToken::new(),
         )
         .await
+        .map(complete)
         .expect("exec tool result");
     device_task.await.expect("device task");
     assert_eq!(result.structured_content.as_ref().unwrap()["ok"], true);

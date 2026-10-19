@@ -80,8 +80,9 @@ Names and field shapes are stable — do not rename (dotted `serial.open`, never
 
 Results are rmcp structured tool results (`CallToolResult::structured`); rmcp
 generates both input and output schemas from the typed structs. `call_tool`
-returns `CallToolResponse`, but every tool yields the `Complete` variant — MRTR
-(`input_required`) and Tasks are not produced without a separate ADR.
+returns `CallToolResponse`; the only non-`Complete` variant this server
+produces is the ADR 0009 confirmation elicitation (`input_required`) from
+`write`/`exec`. Tasks are not produced without a separate ADR.
 
 **Server instructions:** `mcp::SERVER_INSTRUCTIONS` is the machine-delivered
 copy of `AGENTS.md` (sent as `instructions` in `initialize` and
@@ -130,9 +131,15 @@ other. The tool list is static and advertised as cacheable for one hour to
 - **Write policy (per session, set at `open`, enforced in `write`/`exec`):**
   `allow` (default) | `confirm` | `deny`. `deny` refuses writes server-side →
   `WriteForbidden` (-32012); a hard, model-proof read-only session (reads /
-  `drain` / `clear_input` still allowed). `confirm` needs `confirm: true` on the
-  call → else `ConfirmationRequired` (-32013); a tripwire/audit seam, **not** a
-  hard gate (a caller can self-confirm) — `deny` is the guarantee. Effective
+  `drain` / `clear_input` still allowed). `confirm` has two shapes (ADR 0009):
+  on a 2026-07-28 client that declares elicitation, `gate_write` returns an
+  MRTR `input_required` elicitation keyed by a digest of (session, tool,
+  exact bytes) and the model's `confirm: true` is ignored; the retry's answer
+  must be `accept` + `confirm: true`, else `ConfirmationDeclined` (-32016,
+  not retryable). On any other client it is the tripwire: `confirm: true` on
+  the call, else `ConfirmationRequired` (-32013) — `deny` is the guarantee.
+  All cheaper refusals (size, `expect`, raw-write, command policy) run
+  *before* the person is asked; never reorder them after it. Effective
   policy = most-restrictive of the caller's `write_policy` and any `privileged`
   device-profile default (`Allow < Confirm < Deny`): callers may escalate, never
   downgrade a privileged profile. Both errors are tool errors with

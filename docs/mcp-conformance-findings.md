@@ -180,8 +180,9 @@ Disposition: deferred.
 
 Progress and the `io.modelcontextprotocol/tasks` extension may fit future
 long-running capture or reboot waits. Current tools remain bounded synchronous
-operations; `call_tool` only ever returns `CallToolResponse::Complete`, and the
-journal would record any other variant.
+operations; the only non-`Complete` response the server produces is the
+confirmation elicitation of finding 9, which the journal records as
+`result_type: "input_required"`.
 
 Durable artifacts:
 
@@ -189,20 +190,24 @@ Durable artifacts:
 
 ### 9. Elicitation (MRTR) and completion
 
-Disposition: deferred; next planned step.
+Disposition: elicitation implemented for `write_policy = "confirm"`;
+completion deferred.
 
 Under `2026-07-28`, elicitation is delivered through Multi Round-Trip Requests:
 a tool returns `resultType: "input_required"` and the client retries with
-`inputResponses`. This is the intended mechanism for turning
-`write_policy = "confirm"` into a human-supplied confirmation rather than a
-model-supplied `confirm: true` (ADR 0005 calls the current form a tripwire).
-It needs its own ADR and a fallback for clients without elicitation support.
-Completion could help device/profile/session IDs and remains deferred.
+`inputResponses`. `serial.write` / `serial.exec` on a `confirm` session now use
+this to ask the person through the client, bound to the exact bytes shown; the
+model's own `confirm: true` is ignored on that path and a refusal is
+`ConfirmationDeclined` (`-32016`). Clients without elicitation, or on an
+older revision, keep the ADR 0005 tripwire. Completion could help
+device/profile/session IDs and remains deferred.
 
 Durable artifacts:
 
-- `docs/adr/0004-defer-optional-mcp-features.md`
-- `docs/adr/0008-mcp-2026-07-28-and-server-instructions.md`
+- `src/mcp/mod.rs`
+- `src/errors.rs`
+- `tests/mcp_tests.rs`
+- `docs/adr/0009-elicitation-backed-confirm.md`
 
 ### 10. Sampling, roots, and logging
 

@@ -112,7 +112,11 @@ pub fn result_session_id(
 
 /// Shape the `summary` payload for a `call` row. Per-tool fields keep
 /// large data clipped + sized; everything else passes through as-is.
-pub fn call_summary(tool: &str, args: &Value) -> Value {
+///
+/// `mrtr_retry` is true when the call carries `inputResponses`, i.e. it is
+/// the second round of an elicitation-backed confirmation (ADR 0009). Only
+/// the flag is journaled, never the responses.
+pub fn call_summary(tool: &str, args: &Value, mrtr_retry: bool) -> Value {
     match tool {
         "serial.open" => json!({
             // Records the requested `write_policy` for audit. `call_summary`
@@ -137,6 +141,7 @@ pub fn call_summary(tool: &str, args: &Value) -> Value {
             "session_id": optional_session_id(args),
             "bytes": byte_len(args, "data"),
             "confirm": optional_bool(args, "confirm"),
+            "mrtr_retry": mrtr_retry,
             "arg_keys": object_keys(args),
         }),
         "serial.exec" => json!({
@@ -145,6 +150,7 @@ pub fn call_summary(tool: &str, args: &Value) -> Value {
             "expect_bytes": byte_len(args, "expect"),
             "timeout_ms": optional_u64(args, "timeout_ms"),
             "confirm": optional_bool(args, "confirm"),
+            "mrtr_retry": mrtr_retry,
             "clear_before_write": optional_bool(args, "clear_before_write"),
             "normalize_output": optional_bool(args, "normalize_output"),
             "line_ending": optional_string(args, "line_ending"),
@@ -252,11 +258,15 @@ mod tests {
         CallToolResult::structured(sc)
     }
 
+    fn call_summary_legacy(tool: &str, args: &Value) -> Value {
+        call_summary(tool, args, false)
+    }
+
     #[test]
     fn call_summary_records_write_size_without_payload() {
         let big = "x".repeat(500);
         let args = json!({"session_id": "s".repeat(10_000), "data": big.clone(), "confirm": true});
-        let summary = call_summary("serial.write", &args);
+        let summary = call_summary("serial.write", &args, false);
         assert_eq!(summary["bytes"], 500, "byte_len preserves the full size");
         assert_eq!(
             summary["session_id"].as_str().unwrap().chars().count(),
@@ -277,7 +287,7 @@ mod tests {
         // row past the 16 KiB cap and drop the audit record).
         let big = "z".repeat(50_000);
         let args = json!({"port": "/dev/ttyUSB0", "write_policy": big.clone()});
-        let summary = call_summary("serial.open", &args);
+        let summary = call_summary("serial.open", &args, false);
         assert_eq!(
             summary["write_policy"].as_str().unwrap().chars().count(),
             MAX_JOURNAL_FIELD_CHARS,
@@ -285,12 +295,12 @@ mod tests {
         assert!(!summary.to_string().contains(&big));
         // A non-string value coerces to null rather than passing through.
         let odd = json!({"port": "/dev/ttyUSB0", "write_policy": {"nested": "x"}});
-        assert!(call_summary("serial.open", &odd)["write_policy"].is_null());
+        assert!(call_summary("serial.open", &odd, false)["write_policy"].is_null());
     }
 
     #[test]
     fn open_call_summary_records_target_and_clips_it() {
-        let summary = call_summary(
+        let summary = call_summary_legacy(
             "serial.open",
             &json!({"port": "/dev/ttyACM0", "line_ending": "lf"}),
         );
@@ -299,7 +309,7 @@ mod tests {
         assert_eq!(summary["line_ending"], "lf");
 
         let big = "d".repeat(50_000);
-        let summary = call_summary("serial.open", &json!({"device": big.clone()}));
+        let summary = call_summary("serial.open", &json!({"device": big.clone()}), false);
         assert_eq!(
             summary["device"].as_str().unwrap().chars().count(),
             MAX_JOURNAL_FIELD_CHARS,
@@ -314,7 +324,7 @@ mod tests {
             "port": "/dev/ttyUSB0",
             "deny_patterns": [secret, "other"],
         });
-        let open = call_summary("serial.open", &args);
+        let open = call_summary("serial.open", &args, false);
         assert_eq!(open["caller_deny_rule_count"], 2);
         assert!(!open.to_string().contains(secret));
 
@@ -338,7 +348,7 @@ mod tests {
     fn unknown_call_summary_is_bounded_and_metadata_only() {
         let big = "secret".repeat(1000);
         let args = json!({"session_id": "s", "data": big, "other": "value"});
-        let summary = call_summary("unknown.tool", &args);
+        let summary = call_summary("unknown.tool", &args, false);
         assert!(summary.get("args").is_none());
         assert!(summary.to_string().len() < 256);
         assert!(!summary.to_string().contains("secret"));
@@ -353,7 +363,7 @@ mod tests {
             huge_key: "value",
             "expect": format!("bad-regex-{secret}[")
         });
-        let summary = call_summary("serial.exec", &args);
+        let summary = call_summary("serial.exec", &args, false);
         assert!(
             summary.to_string().len() < 512,
             "summary should stay bounded: {summary}"
@@ -380,7 +390,7 @@ mod tests {
             "echo_mode": oversized_mode,
             "semantic_prompt": "osc3008",
         });
-        let summary = call_summary("serial.exec", &args);
+        let summary = call_summary("serial.exec", &args, false);
         assert_eq!(summary["line_ending"], "lf");
         assert_eq!(summary["semantic_prompt"], "osc3008");
         assert_eq!(

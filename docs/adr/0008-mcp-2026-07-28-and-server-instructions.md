@@ -57,13 +57,10 @@ configuration since `2025-03-26`; the server did not use it.
    and never appear for legacy clients. `rmcp`'s router sorts tools by name,
    which satisfies the deterministic-order requirement.
 
-4. **MRTR and Tasks are not produced yet.** `call_tool` returns
-   `CallToolResponse::Complete` for every tool. The journal records
-   `result_type` for any other variant so a future MRTR path cannot bypass the
-   audit row. Turning `write_policy = "confirm"` into an elicitation-backed
-   MRTR gate (so a person, not the model, supplies the confirmation) is the
-   intended next step and will get its own ADR; it must keep the current
-   `confirm: true` behaviour as the fallback for clients without elicitation.
+4. **Tasks are not produced.** The journal records `result_type` for any
+   non-`Complete` `CallToolResponse` so no MRTR or Tasks path can bypass the
+   audit row. The one MRTR use — turning `write_policy = "confirm"` into a
+   person-supplied confirmation — is ADR 0009.
 
 5. **Roots, Sampling, Logging stay out.** ADR 0004 already rejected sampling
    and roots and deferred logging; the revision's deprecation of all three

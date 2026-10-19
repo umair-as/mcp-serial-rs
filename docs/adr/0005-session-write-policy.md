@@ -25,6 +25,10 @@ experimental `elicit` surface and on client support, and a client that does not
 implement it needs a defined fallback. We wanted a guarantee that does not
 depend on either.
 
+> Amendment (ADR 0009): `confirm` now asks the person through MRTR elicitation
+> on MCP 2026-07-28 clients that declare the capability; the `confirm: true`
+> tripwire below remains the fallback for every other client.
+
 ## Decision
 
 Add a per-session **write policy**, captured at `serial.open` and immutable for

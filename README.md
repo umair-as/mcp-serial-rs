@@ -131,10 +131,16 @@ before any bytes reach the device:
   server-side with `WriteForbidden` (`-32012`) regardless of the request; reads,
   `drain`, and `clear_input` still work. This is model-proof: no bug and no
   injected device text can cause a write.
-- `confirm` — writes require an explicit `confirm: true` on the call, else
-  `ConfirmationRequired` (`-32013`). This is a tripwire and audit seam, not a
-  hard gate (an automated caller can set `confirm` itself); use `deny` when you
-  need a guarantee.
+- `confirm` — each write is approved first. On an MCP `2026-07-28` client that
+  declares the elicitation capability, the server answers `tools/call` with an
+  `input_required` elicitation showing the exact bytes; the host asks the
+  person, and the model's own `confirm: true` is ignored. Only an accepted
+  answer with `confirm: true` proceeds; anything else is `ConfirmationDeclined`
+  (`-32016`, not retryable). The answer is bound to the exact payload, so a
+  changed command is asked again. On any other client this is the original
+  tripwire: `confirm: true` on the call, else `ConfirmationRequired`
+  (`-32013`) — an audit seam, not a hard gate. Use `deny` when you need a
+  guarantee that does not depend on the client. See `docs/adr/0009`.
 
 The effective policy is the most restrictive of the caller's `write_policy` and
 any `privileged` device-profile default (`allow < confirm < deny`), so a caller
@@ -349,6 +355,8 @@ The `serial.*` MVP and the `rmcp` SDK adoption are complete:
   `_meta`) — and `tools/call` dispatch handled by the `rmcp` 3.x SDK over
   stdio. `tools/list` carries cache hints for `2026-07-28` clients.
 - Server `instructions` delivering the `AGENTS.md` guidance to every client.
+- Elicitation-backed `write_policy = "confirm"` through MRTR on `2026-07-28`
+  clients, with the `confirm: true` tripwire as the legacy fallback.
 - The `serial.*` tool set, with `rmcp`-generated input/output schemas and
   structured tool results.
 - Device profiles and named-device open.
