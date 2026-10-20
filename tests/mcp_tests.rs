@@ -799,13 +799,9 @@ async fn tools_list_contains_dotted_tools_with_input_schema() {
             .unwrap_or_else(|| panic!("tool `{name}` must set destructiveHint"));
         let expected_destructive = matches!(
             name,
-            "serial.write"
-                | "serial.read"
-                | "serial.drain"
-                | "serial.clear_input"
-                | "serial.read_until"
-                | "serial.exec"
-                | "serial.close"
+            // Reads consume local input but change nothing on the device, so
+            // hosts that honour annotations need not prompt for every read.
+            "serial.write" | "serial.clear_input" | "serial.exec" | "serial.close"
         );
         assert_eq!(
             destructive, expected_destructive,
@@ -1634,6 +1630,7 @@ async fn serial_open_unions_global_profile_and_caller_policy_rules() {
                     clear_before_write: None,
                     normalize_output: None,
                     timeout_ms: None,
+                    reason: None,
                 }),
                 ctx.clone(),
                 ToolInputResponses(None),
@@ -1712,6 +1709,7 @@ async fn serial_open_applies_profile_allow_patterns() {
                 clear_before_write: None,
                 normalize_output: None,
                 timeout_ms: None,
+                reason: None,
             }),
             ctx.clone(),
             ToolInputResponses(None),
@@ -1746,6 +1744,7 @@ async fn serial_open_applies_profile_allow_patterns() {
                 clear_before_write: None,
                 normalize_output: None,
                 timeout_ms: None,
+                reason: None,
             }),
             ctx.clone(),
             ToolInputResponses(None),
@@ -1879,19 +1878,20 @@ async fn confirm_exec_from_eliciting_client_asks_the_person_first() {
     assert_eq!(request["method"], "elicitation/create");
     assert_eq!(request["params"]["mode"], "form");
     let message = request["params"]["message"].as_str().expect("message");
-    assert!(message.contains(&session_id), "{message}");
-    assert!(message.contains("/dev/ttyUSB0"), "{message}");
-    assert!(
-        message.contains("\"probe\\n\""),
-        "excerpt is {{:?}}-escaped: {message}"
-    );
+    let lines: Vec<&str> = message.lines().collect();
+    // The question and the payload come first: hosts may collapse the rest.
     assert_eq!(
-        request["params"]["requestedSchema"]["required"],
-        json!(["confirm"])
+        lines[0], "Send 6 byte(s) to /dev/ttyUSB0? Accept = send, Decline = don't send.",
+        "{message}"
     );
+    assert_eq!(lines[1], "\"probe\" + LF", "{message}");
+    assert!(lines[2].contains(&session_id), "{message}");
+    assert!(lines[2].starts_with("serial.exec · session"), "{message}");
+    // No form fields: the host's Accept is the approval.
     assert_eq!(
-        request["params"]["requestedSchema"]["properties"]["confirm"]["type"],
-        "boolean"
+        request["params"]["requestedSchema"],
+        json!({"type": "object", "properties": {}}),
+        "{request}"
     );
     assert_device_untouched(&mut device).await;
 }
@@ -2018,10 +2018,12 @@ async fn confirm_write_from_eliciting_client_is_elicited_too() {
     )
     .await;
     let (_, request) = confirmation_request(&responses[0]);
-    assert!(request["params"]["message"]
-        .as_str()
-        .unwrap()
-        .starts_with("serial.write on serial session"));
+    let message = request["params"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("Send 1 byte(s) to /dev/ttyUSB0?"),
+        "{message}"
+    );
+    assert!(message.contains("serial.write · session"), "{message}");
     assert_device_untouched(&mut device).await;
 }
 
@@ -2192,52 +2194,98 @@ async fn confirm_elicitation_requires_form_support() {
 }
 
 #[tokio::test]
-async fn confirm_exec_shows_the_whole_long_command_it_authorizes() {
-    // Accepting authorizes every byte, so a suffix after a long benign
-    // prefix must be in the dialog, and what is sent must equal what was
-    // shown.
-    let command = format!("printf '{}'; printf HIDDEN_SUFFIX", "A".repeat(280));
-    let transmitted = format!("{command}\n");
-    let (server, session_id, mut device) =
-        server_with_open_session_policy(WritePolicy::Confirm).await;
-    let sid = session_id.clone();
-    let cmd = command.clone();
-    let shown = format!("{transmitted:?}");
-    let (first, second) = roundtrip_then(
-        server,
-        stateless_request_eliciting(
-            1,
-            "tools/call",
-            json!({"name": "serial.exec", "arguments": exec_args(&session_id, &command)}),
-        ),
-        move |resp| {
-            let (key, request) = confirmation_request(resp);
-            let message = request["params"]["message"].as_str().expect("message");
-            assert!(message.contains(&shown), "full payload shown: {message}");
-            assert!(!message.contains('…'), "{message}");
-            retry_with_answer(
-                &sid,
-                &cmd,
-                &key,
-                json!({"action": "accept", "content": {"confirm": true}}),
-            )
-        },
-    )
-    .await;
-    assert_eq!(first["result"]["resultType"], "input_required");
-    assert_eq!(
-        second["result"]["structuredContent"]["command_written"], true,
-        "{second}"
-    );
-    let sent = read_device_bytes(&mut device, transmitted.len()).await;
-    assert_eq!(sent, transmitted.as_bytes());
+async fn confirm_review_limit_counts_the_line_ending_marker() {
+    // `"<command>" + CRLF` is what the person reads, so the marker counts:
+    // 111 command chars + 2 quotes + 7 for " + CRLF" is exactly 120.
+    for (len, elicits) in [(111, true), (112, false)] {
+        let command = "A".repeat(len);
+        let (server, session_id, mut device) =
+            server_with_open_session_policy(WritePolicy::Confirm).await;
+        let mut args = exec_args(&session_id, &command);
+        args["line_ending"] = json!("crlf");
+        let responses = roundtrip(
+            server,
+            &[stateless_request_eliciting(
+                1,
+                "tools/call",
+                json!({"name": "serial.exec", "arguments": args}),
+            )],
+        )
+        .await;
+        if elicits {
+            let (_, request) = confirmation_request(&responses[0]);
+            let message = request["params"]["message"].as_str().unwrap();
+            let line = message.lines().nth(1).unwrap();
+            assert_eq!(line.chars().count(), 120, "{line}");
+            assert!(line.ends_with("\" + CRLF"), "{line}");
+        } else {
+            assert_eq!(rpc_error_code(&responses[0]), -32008, "{:?}", responses[0]);
+            let reason = tool_error_data(&responses[0])["reason"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(reason.contains("121 characters"), "{reason}");
+            assert!(!reason.contains("allow"), "no downgrade advice: {reason}");
+            assert!(!reason.contains("split"), "no splitting advice: {reason}");
+        }
+        assert_device_untouched(&mut device).await;
+    }
 }
 
 #[tokio::test]
-async fn confirm_write_shows_the_whole_long_payload_it_authorizes() {
-    // Same guarantee for raw writes, with multibyte text and control bytes
-    // that must stay escaped and unambiguous in the dialog.
-    let data = format!("{}\tcafé\u{1b}[0m\u{202e}HIDDEN_SUFFIX", "A".repeat(300));
+async fn confirm_refuses_payloads_too_long_to_review_before_asking() {
+    // Hosts clip long lines (Claude Code does), so a payload a person could
+    // not see in full is refused before anyone is asked, never approved
+    // partly unseen. Measured as displayed: escaped, with the quotes.
+    let long_command = format!("printf '{}'; printf HIDDEN_SUFFIX", "A".repeat(100));
+    let long_data = format!("{}HIDDEN_SUFFIX", "A".repeat(110));
+    for (tool, arguments, param) in [
+        ("serial.exec", "command", "command"),
+        ("serial.write", "data", "data"),
+    ] {
+        let (server, session_id, mut device) =
+            server_with_open_session_policy(WritePolicy::Confirm).await;
+        let args = if tool == "serial.exec" {
+            exec_args(&session_id, &long_command)
+        } else {
+            json!({"session_id": session_id, arguments: long_data})
+        };
+        let responses = roundtrip(
+            server,
+            &[stateless_request_eliciting(
+                1,
+                "tools/call",
+                json!({"name": tool, "arguments": args}),
+            )],
+        )
+        .await;
+        assert_ne!(
+            responses[0]["result"]["resultType"], "input_required",
+            "{tool}: {:?}",
+            responses[0]
+        );
+        assert_eq!(rpc_error_code(&responses[0]), -32008, "{:?}", responses[0]);
+        let error = tool_error_data(&responses[0]);
+        assert_eq!(error["name"], param);
+        assert!(
+            error["reason"]
+                .as_str()
+                .unwrap()
+                .contains("too long to review"),
+            "{error}"
+        );
+        assert_device_untouched(&mut device).await;
+    }
+}
+
+#[tokio::test]
+async fn confirm_write_at_the_review_limit_is_shown_whole_and_sends_exact_bytes() {
+    // Exactly the limit as displayed (escapes and quotes count). Multibyte
+    // text stays readable, control characters stay escaped, and the bytes
+    // sent equal the bytes shown.
+    let data = format!("{}\tcafé\u{1b}", "A".repeat(106));
+    let shown = format!("{data:?}");
+    assert_eq!(shown.chars().count(), 120, "{shown}");
     let (server, session_id, mut device) =
         server_with_open_session_policy(WritePolicy::Confirm).await;
     let sid = session_id.clone();
@@ -2252,17 +2300,13 @@ async fn confirm_write_shows_the_whole_long_payload_it_authorizes() {
         move |resp| {
             let (key, request) = confirmation_request(resp);
             let message = request["params"]["message"].as_str().expect("message");
-            assert!(
-                message.contains(r#"\tcafé\u{1b}[0m\u{202e}HIDDEN_SUFFIX""#),
-                "{message}"
-            );
-            assert!(message.contains(&format!("{payload:?}")), "{message}");
+            assert_eq!(message.lines().nth(1), Some(shown.as_str()), "{message}");
+            assert!(shown.ends_with(r#"\tcafé\u{1b}""#), "{shown}");
             let mut params = json!({
                 "name": "serial.write",
                 "arguments": {"session_id": sid, "data": payload},
             });
-            params["inputResponses"] =
-                json!({ key: {"action": "accept", "content": {"confirm": true}} });
+            params["inputResponses"] = json!({ key: {"action": "accept"} });
             stateless_request_eliciting(2, "tools/call", params)
         },
     )
@@ -2272,8 +2316,157 @@ async fn confirm_write_shows_the_whole_long_payload_it_authorizes() {
         data.len(),
         "{second}"
     );
-    let sent = read_device_bytes(&mut device, data.len()).await;
+    use tokio::io::AsyncReadExt;
+    let mut sent = vec![0u8; data.len()];
+    timeout(Duration::from_secs(2), device.read_exact(&mut sent))
+        .await
+        .expect("read timeout")
+        .expect("read");
     assert_eq!(sent, data.as_bytes());
+}
+
+#[tokio::test]
+async fn confirm_shows_the_agents_reason_after_the_payload_and_binds_it() {
+    let (server, session_id, mut device) =
+        server_with_open_session_policy(WritePolicy::Confirm).await;
+    let sid = session_id.clone();
+    let mut args = exec_args(&session_id, "probe");
+    args["reason"] = json!("check the console\nis alive **now**");
+    let (_, second) = roundtrip_then(
+        server,
+        stateless_request_eliciting(
+            1,
+            "tools/call",
+            json!({"name": "serial.exec", "arguments": args}),
+        ),
+        move |resp| {
+            let (key, request) = confirmation_request(resp);
+            let message = request["params"]["message"].as_str().expect("message");
+            let lines: Vec<&str> = message.lines().collect();
+            assert_eq!(lines[1], "\"probe\" + LF", "{message}");
+            assert_eq!(
+                lines[2], r#"Agent says (untrusted): "check the console\nis alive **now**""#,
+                "the reason is escaped onto one line after the payload: {message}"
+            );
+            // The same bytes with a different explanation are asked again.
+            let mut params = json!({"name": "serial.exec", "arguments": exec_args(&sid, "probe")});
+            params["arguments"]["reason"] = json!("something else");
+            params["inputResponses"] = json!({ key: {"action": "accept"} });
+            stateless_request_eliciting(2, "tools/call", params)
+        },
+    )
+    .await;
+    let (_, request) = confirmation_request(&second);
+    assert!(request["params"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("something else"));
+    assert_device_untouched(&mut device).await;
+}
+
+#[tokio::test]
+async fn overlong_reason_is_refused_before_asking() {
+    let (server, session_id, mut device) =
+        server_with_open_session_policy(WritePolicy::Confirm).await;
+    let mut args = exec_args(&session_id, "probe");
+    args["reason"] = json!("x".repeat(121));
+    let responses = roundtrip(
+        server,
+        &[stateless_request_eliciting(
+            1,
+            "tools/call",
+            json!({"name": "serial.exec", "arguments": args}),
+        )],
+    )
+    .await;
+    assert_eq!(rpc_error_code(&responses[0]), -32008, "{:?}", responses[0]);
+    assert_eq!(tool_error_data(&responses[0])["name"], "reason");
+    assert_device_untouched(&mut device).await;
+}
+
+#[tokio::test]
+async fn empty_raw_write_needs_no_approval_but_keeps_every_refusal() {
+    // Nothing to approve on a `confirm` session, from either client shape.
+    for request in [
+        stateless_request_eliciting as fn(u64, &str, Value) -> Value,
+        stateless_request,
+    ] {
+        let (server, session_id, mut device) =
+            server_with_open_session_policy(WritePolicy::Confirm).await;
+        let responses = roundtrip(
+            server,
+            &[request(
+                1,
+                "tools/call",
+                json!({"name": "serial.write", "arguments": {"session_id": session_id, "data": ""}}),
+            )],
+        )
+        .await;
+        assert_ne!(
+            responses[0]["result"]["isError"], true,
+            "{:?}",
+            responses[0]
+        );
+        assert_eq!(
+            responses[0]["result"]["structuredContent"]["bytes_written"],
+            0
+        );
+        assert_device_untouched(&mut device).await;
+    }
+
+    // `deny` still refuses it.
+    let (server, session_id, _device) = server_with_open_session_policy(WritePolicy::Deny).await;
+    let responses = roundtrip(
+        server,
+        &[stateless_request_eliciting(
+            1,
+            "tools/call",
+            json!({"name": "serial.write", "arguments": {"session_id": session_id, "data": ""}}),
+        )],
+    )
+    .await;
+    assert_eq!(rpc_error_code(&responses[0]), -32012, "{:?}", responses[0]);
+
+    // An unknown session is still an error.
+    let (server, _, _) = stub_setup(vec![]);
+    let responses = roundtrip(
+        server,
+        &[stateless_request_eliciting(
+            1,
+            "tools/call",
+            json!({"name": "serial.write", "arguments": {"session_id": "nope", "data": ""}}),
+        )],
+    )
+    .await;
+    assert_eq!(rpc_error_code(&responses[0]), -32003, "{:?}", responses[0]);
+
+    // A guarded session still refuses raw writes, even empty ones.
+    let (server, sessions, backend) = stub_setup(vec![]);
+    let policy = Arc::new(
+        CommandPolicy::compile(&[], &["\\breboot\\b".into()], &[], &[])
+            .expect("compile test policy"),
+    );
+    let session_id = sessions
+        .open_with_console_and_policy(
+            "/dev/ttyUSB0",
+            115_200,
+            2_000,
+            WritePolicy::Confirm,
+            ConsoleSettings::default(),
+            policy,
+        )
+        .await
+        .expect("open guarded session");
+    let mut device = backend.take_device();
+    let resp = handshake_then_call(
+        server,
+        "serial.write",
+        json!({"session_id": session_id, "data": ""}),
+    )
+    .await;
+    assert_eq!(rpc_error_code(&resp), -32015);
+    drop(sessions);
+    assert_device_untouched(&mut device).await;
 }
 
 #[tokio::test]
@@ -4377,6 +4570,7 @@ fn guarded_exec(session_id: &str, command: &str, line_ending: Option<LineEnding>
         clear_before_write: None,
         normalize_output: None,
         timeout_ms: Some(200),
+        reason: None,
     }
 }
 

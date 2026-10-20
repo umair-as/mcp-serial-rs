@@ -134,7 +134,7 @@ pub struct DeviceProfile {
     pub deny_patterns: Vec<String>,
     pub allow_patterns: Vec<String>,
     /// When true, sessions opened via this profile default to a `confirm`
-    /// write policy (writes require an explicit `confirm=true`). Use for
+    /// write policy (each write is approved first; see `WritePolicy`). Use for
     /// profiles that land on an interactive / privileged shell. A caller may
     /// still escalate to `deny` at `serial.open`, but cannot downgrade below
     /// `confirm`. Absent/false → `allow` default.
