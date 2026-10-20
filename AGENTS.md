@@ -5,6 +5,11 @@
 `mcp-serial-rs` exposes local serial-console access through MCP tools. It is a
 narrow console capability, not a full hardware-in-the-loop orchestrator.
 
+A condensed copy of this guide is also delivered over the wire as the MCP
+server `instructions` (`initialize` / `server/discover`), so a host that only
+installs the binary receives it. The source of that copy is
+`mcp::SERVER_INSTRUCTIONS` in `src/mcp/mod.rs`; keep the two in sync.
+
 ## Safe Workflow
 
 1. Discover ports with `serial.list_ports`.
@@ -12,8 +17,12 @@ narrow console capability, not a full hardware-in-the-loop orchestrator.
 3. Open one session with `serial.open`. When the port may land on an
    interactive or privileged shell, set `write_policy`: `"deny"` for a
    read-only session (writes are refused server-side — the safe default for
-   inspection), or `"confirm"` to require an explicit `confirm: true` on each
-   write. A `privileged` device profile already defaults to `confirm`.
+   inspection), or `"confirm"` to have each write approved first. On a client
+   that supports elicitation the server asks the *person* directly and your
+   own `confirm: true` is ignored; a `confirmation_declined` error means they
+   said no — do not retry or rephrase. On other clients pass an explicit
+   `confirm: true`. A `privileged` device profile already defaults to
+   `confirm`.
 4. Recover or verify session state with `serial.sessions` or
    `serial.get_session` — the snapshot's `write_policy` tells you whether the
    session can write.
@@ -49,9 +58,13 @@ it. Require explicit user authorization for sensitive writes.
 For a defense that does not depend on the agent behaving, open the session with
 `write_policy: "deny"`. A `deny` session refuses `serial.write` / `serial.exec`
 server-side (`WriteForbidden`, -32012) no matter what the model or the device
-text decides — reads still work. `confirm` (`ConfirmationRequired`, -32013) is a
-weaker tripwire: a caller can satisfy `confirm: true` itself, so it is an audit
-and deliberate-second-step aid, not a hard gate.
+text decides — reads still work. `confirm` has two shapes (ADR 0009): on an
+MCP 2026-07-28 client that supports form elicitation, the server asks the person
+through the client before sending anything, bound to the exact bytes shown,
+and a refusal is `ConfirmationDeclined` (-32016); on any other client it is the
+weaker tripwire where the caller satisfies `confirm: true` itself
+(`ConfirmationRequired`, -32013) — an audit and deliberate-second-step aid, not
+a hard gate.
 
 ## Output Handling
 

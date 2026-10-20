@@ -62,6 +62,12 @@ pub enum SerialError {
         "session '{session_id}' has a command policy; use serial.exec instead of serial.write"
     )]
     RawWriteForbidden { session_id: String },
+
+    /// The person at the MCP client answered the server's confirmation
+    /// elicitation with anything other than an accept (ADR 0009). Not
+    /// retryable: re-issuing the same call re-asks the same person.
+    #[error("session '{session_id}' write was not confirmed by the user (elicitation {action})")]
+    ConfirmationDeclined { session_id: String, action: String },
 }
 
 impl SerialError {
@@ -84,6 +90,7 @@ impl SerialError {
             SerialError::ConfirmationRequired { .. } => -32013,
             SerialError::CommandBlocked { .. } => -32014,
             SerialError::RawWriteForbidden { .. } => -32015,
+            SerialError::ConfirmationDeclined { .. } => -32016,
         }
     }
 
@@ -117,6 +124,9 @@ impl SerialError {
             SerialError::RawWriteForbidden { session_id } => {
                 json!({ "session_id": session_id, "mutation_via_exec_only": true })
             }
+            SerialError::ConfirmationDeclined { session_id, action } => {
+                json!({ "session_id": session_id, "write_policy": "confirm", "elicitation": action })
+            }
         }
     }
 
@@ -137,6 +147,7 @@ impl SerialError {
             SerialError::ConfirmationRequired { .. } => "confirmation_required",
             SerialError::CommandBlocked { .. } => "command_blocked",
             SerialError::RawWriteForbidden { .. } => "raw_write_forbidden",
+            SerialError::ConfirmationDeclined { .. } => "confirmation_declined",
         }
     }
 
@@ -219,6 +230,11 @@ mod tests {
             SerialError::CommandBlocked { rule: "r".into() }.code(),
             SerialError::RawWriteForbidden {
                 session_id: "s".into(),
+            }
+            .code(),
+            SerialError::ConfirmationDeclined {
+                session_id: "s".into(),
+                action: "decline".into(),
             }
             .code(),
         ];
