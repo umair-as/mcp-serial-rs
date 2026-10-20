@@ -13,7 +13,8 @@
 
 mod journal;
 
-use std::sync::Arc;
+use std::hash::RandomState;
+use std::sync::{Arc, LazyLock};
 
 use rmcp::{
     handler::server::{
@@ -21,10 +22,10 @@ use rmcp::{
     },
     model::{
         BooleanSchema, CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult,
-        ElicitRequest, ElicitRequestParams, ElicitResult, ElicitationAction, ElicitationSchema,
-        Implementation, InputRequest, InputRequests, InputRequiredResult, InputResponses,
-        JsonObject, ListToolsResult, PaginatedRequestParams, PrimitiveSchemaDefinition,
-        ProtocolVersion, ResultType, ServerCapabilities, ServerConfig,
+        ElicitRequest, ElicitRequestParams, ElicitResult, ElicitationAction, ElicitationCapability,
+        ElicitationSchema, Implementation, InputRequest, InputRequests, InputRequiredResult,
+        InputResponses, JsonObject, ListToolsResult, PaginatedRequestParams,
+        PrimitiveSchemaDefinition, ProtocolVersion, ResultType, ServerCapabilities, ServerConfig,
     },
     service::RequestContext,
     tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler,
@@ -352,7 +353,7 @@ impl<B: SerialBackend> McpServer<B> {
     /// Returns structured `{"bytes_written": n}`.
     #[tool(
         name = "serial.write",
-        description = "Write UTF-8 bytes verbatim to an open serial session. No implicit newline. This mutates external device state and may interact with a privileged shell. On a `confirm` session with an elicitation-capable client, the call returns `input_required` so the person can approve the exact bytes; `confirmation_declined` means they refused — do not retry.",
+        description = "Write UTF-8 bytes verbatim to an open serial session. No implicit newline. This mutates external device state and may interact with a privileged shell. On a `confirm` session with a form-elicitation-capable client, the call returns `input_required` so the person can approve the exact bytes; `confirmation_declined` means they refused — do not retry.",
         output_schema = tool_output_schema::<WriteResult>(),
         annotations(title = "Write serial bytes", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
@@ -584,7 +585,7 @@ impl<B: SerialBackend> McpServer<B> {
     /// JSON-RPC error.
     #[tool(
         name = "serial.exec",
-        description = "Atomically write a command, optionally append an explicit profile/per-call line ending, flush, and read until `expect` matches under one per-session lock. Echo-aware matching can exclude a declared line echo. Raw output remains authoritative and may contain echoes, prompts, wrapping, ANSI/OSC controls, and untrusted text from a privileged device shell. On a `confirm` session with an elicitation-capable client, the call returns `input_required` so the person can approve the exact line; `confirmation_declined` means they refused — do not retry.",
+        description = "Atomically write a command, optionally append an explicit profile/per-call line ending, flush, and read until `expect` matches under one per-session lock. Echo-aware matching can exclude a declared line echo. Raw output remains authoritative and may contain echoes, prompts, wrapping, ANSI/OSC controls, and untrusted text from a privileged device shell. On a `confirm` session with a form-elicitation-capable client, the call returns `input_required` so the person can approve the exact line; `confirmation_declined` means they refused — do not retry.",
         output_schema = tool_output_schema::<ExecResult>(),
         annotations(title = "Execute serial command", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
@@ -1017,9 +1018,12 @@ fn done<T: Into<CallToolResponse>>(value: T) -> Result<CallToolResponse, McpErro
     Ok(value.into())
 }
 
-/// Can this request be answered with an MRTR elicitation? Requires the
+/// Can this request be answered with an MRTR form elicitation? Requires the
 /// 2026-07-28 lifecycle (rmcp refuses `input_required` to older peers) and
-/// a declared elicitation capability. Legacy clients fall back to the
+/// declared support for **form** elicitation. Like rmcp's
+/// `supported_elicitation_modes`, an empty `elicitation: {}` counts as form
+/// support for backward compatibility, but a URL-only client does not: it
+/// could not complete the form. Every other client falls back to the
 /// ADR 0005 tripwire.
 fn client_can_elicit(context: &RequestContext<RoleServer>) -> bool {
     context
@@ -1027,20 +1031,28 @@ fn client_can_elicit(context: &RequestContext<RoleServer>) -> bool {
         .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28)
         && context
             .client_capabilities()
-            .is_some_and(|caps| caps.elicitation.is_some())
+            .and_then(|caps| caps.elicitation)
+            .is_some_and(|elicitation| supports_form_elicitation(&elicitation))
 }
 
-/// Longest payload excerpt shown to the person in the confirmation prompt.
-const CONFIRMATION_EXCERPT_CHARS: usize = 256;
+fn supports_form_elicitation(elicitation: &ElicitationCapability) -> bool {
+    elicitation.form.is_some() || elicitation.url.is_none()
+}
+
+/// Per-process random SipHash keys for [`confirmation_key`]. With the fixed
+/// keys of `DefaultHasher::new()` anyone could precompute two payloads with
+/// the same 64-bit key offline; random keys make that impossible.
+static CONFIRMATION_KEY_STATE: LazyLock<RandomState> = LazyLock::new(RandomState::new);
 
 /// Key under which the client must return the confirmation answer. It is a
-/// digest of the session, tool, and exact payload bytes, so a retry whose
-/// payload differs from what the person saw cannot reuse their answer. It
-/// is a binding, not a secret: forging it would also require forging the
-/// host-supplied `inputResponses`, which is outside the model's reach.
+/// keyed digest of the session, tool, and exact payload bytes, so a retry
+/// whose payload differs from what the person saw cannot reuse their
+/// answer. It is a binding, not a secret: forging it would also require
+/// forging the host-supplied `inputResponses`, which is outside the model's
+/// reach.
 fn confirmation_key(session_id: &str, tool: &str, payload: &[u8]) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::hash::DefaultHasher::new();
+    use std::hash::{BuildHasher, Hash, Hasher};
+    let mut hasher = CONFIRMATION_KEY_STATE.build_hasher();
     session_id.hash(&mut hasher);
     tool.hash(&mut hasher);
     payload.hash(&mut hasher);
@@ -1048,27 +1060,23 @@ fn confirmation_key(session_id: &str, tool: &str, payload: &[u8]) -> String {
 }
 
 /// Build the MRTR `input_required` result that asks the person to approve
-/// one specific write. The excerpt is `{:?}`-escaped so control bytes and
-/// newlines in the payload cannot reshape the host's dialog.
+/// one specific write. The message shows the **complete** payload: accepting
+/// authorizes every byte, so none may be hidden. Size is already bounded by
+/// `MAX_WRITE_CHUNK` before this runs.
 fn confirmation_request(
     snapshot: &SessionSnapshot,
     tool: &str,
     payload: &[u8],
     key: String,
 ) -> InputRequiredResult {
-    let text = String::from_utf8_lossy(payload);
-    let mut excerpt: String = text.chars().take(CONFIRMATION_EXCERPT_CHARS).collect();
-    if text.chars().count() > CONFIRMATION_EXCERPT_CHARS {
-        excerpt.push('…');
-    }
     let message = format!(
         "{tool} on serial session {} ({} @ {} baud, write_policy=confirm) wants to send {} \
-         byte(s) to the device:\n\n{:?}\n\nAllow this write? The agent cannot answer for you.",
+         byte(s) to the device:\n\n{}\n\nAllow this write? The agent cannot answer for you.",
         snapshot.session_id,
         snapshot.port,
         snapshot.baud,
         payload.len(),
-        excerpt,
+        escaped_payload(payload),
     );
     // Built by hand rather than through `ElicitationSchemaBuilder::build`,
     // which returns a `Result` we would otherwise have to `expect()`.
@@ -1091,6 +1099,18 @@ fn confirmation_request(
     let mut requests = InputRequests::new();
     requests.insert(key, InputRequest::Elicitation(request));
     InputRequiredResult::from_input_requests(requests)
+}
+
+/// Render the payload so control bytes, newlines, and invisible format
+/// characters (e.g. bidi overrides) cannot reshape the host's dialog or hide
+/// bytes. Valid UTF-8 is `{:?}`-escaped; anything else (not reachable today,
+/// since payloads come from JSON strings) is shown as an escaped byte string
+/// rather than lossily, so the text shown is always the bytes sent.
+fn escaped_payload(payload: &[u8]) -> String {
+    match std::str::from_utf8(payload) {
+        Ok(text) => format!("{text:?}"),
+        Err(_) => format!("b\"{}\"", payload.escape_ascii()),
+    }
 }
 
 /// Interpret the client's answer to [`confirmation_request`]. Only an
@@ -1593,7 +1613,7 @@ Safe workflow:
 1. Discover ports with `serial.list_ports`; prefer a named device profile when one exists.
 2. Open one session with `serial.open`. If the port may land on an interactive or \
 privileged shell, set `write_policy`: \"deny\" for a read-only session (writes are refused \
-server-side) or \"confirm\" to have each write approved first. On a client that supports \
+server-side) or \"confirm\" to have each write approved first. On a client that supports form \
 elicitation, \"confirm\" asks the person directly and your own `confirm: true` is ignored; a \
 `confirmation_declined` error means the person said no — do not retry or rephrase. On other \
 clients, pass `confirm: true` explicitly. A `privileged` profile already defaults to \
@@ -1692,5 +1712,63 @@ mod tool_error_tests {
             },
             Some("sid".into()),
         ));
+    }
+}
+
+#[cfg(test)]
+mod confirmation_tests {
+    use super::{confirmation_key, escaped_payload, supports_form_elicitation};
+    use rmcp::model::{ElicitationCapability, FormElicitationCapability, UrlElicitationCapability};
+
+    #[test]
+    fn form_support_follows_rmcp_compatibility_rules() {
+        let form = FormElicitationCapability::default();
+        let url = UrlElicitationCapability::default();
+        let empty = ElicitationCapability::new();
+        assert!(supports_form_elicitation(&empty), "empty implies form");
+        assert!(supports_form_elicitation(
+            &ElicitationCapability::new().with_form(form.clone())
+        ));
+        assert!(supports_form_elicitation(
+            &ElicitationCapability::new()
+                .with_form(form)
+                .with_url(url.clone())
+        ));
+        assert!(
+            !supports_form_elicitation(&ElicitationCapability::new().with_url(url)),
+            "URL-only clients cannot complete a form"
+        );
+    }
+
+    #[test]
+    fn escaped_payload_shows_every_byte_unambiguously() {
+        assert_eq!(escaped_payload(b"ls -l\r\n"), r#""ls -l\r\n""#);
+        assert_eq!(escaped_payload(b"\x1b[2J\x00"), r#""\u{1b}[2J\0""#);
+        // Multibyte text stays readable; invisible format characters that
+        // could reorder or hide text in a dialog are escaped.
+        assert_eq!(escaped_payload("café".as_bytes()), r#""café""#);
+        assert_eq!(
+            escaped_payload("a\u{202e}b\u{200b}c".as_bytes()),
+            r#""a\u{202e}b\u{200b}c""#
+        );
+        // Invalid UTF-8 is never shown lossily.
+        assert_eq!(escaped_payload(b"ok\xff"), r#"b"ok\xff""#);
+    }
+
+    #[test]
+    fn confirmation_key_is_stable_in_process_but_not_the_fixed_key_digest() {
+        use std::hash::{Hash, Hasher};
+        let key = confirmation_key("sid", "serial.exec", b"ls\n");
+        assert_eq!(key, confirmation_key("sid", "serial.exec", b"ls\n"));
+        assert_ne!(key, confirmation_key("sid", "serial.exec", b"ls \n"));
+        assert_ne!(key, confirmation_key("sid", "serial.write", b"ls\n"));
+
+        // The unkeyed `DefaultHasher::new()` digest is publicly computable;
+        // the per-process keys must not reproduce it (2^-64 false failure).
+        let mut fixed = std::hash::DefaultHasher::new();
+        "sid".hash(&mut fixed);
+        "serial.exec".hash(&mut fixed);
+        b"ls\n".as_slice().hash(&mut fixed);
+        assert_ne!(key, format!("confirm_write:{:016x}", fixed.finish()));
     }
 }

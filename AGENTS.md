@@ -59,7 +59,7 @@ For a defense that does not depend on the agent behaving, open the session with
 `write_policy: "deny"`. A `deny` session refuses `serial.write` / `serial.exec`
 server-side (`WriteForbidden`, -32012) no matter what the model or the device
 text decides — reads still work. `confirm` has two shapes (ADR 0009): on an
-MCP 2026-07-28 client that declares elicitation, the server asks the person
+MCP 2026-07-28 client that supports form elicitation, the server asks the person
 through the client before sending anything, bound to the exact bytes shown,
 and a refusal is `ConfirmationDeclined` (-32016); on any other client it is the
 weaker tripwire where the caller satisfies `confirm: true` itself

@@ -132,8 +132,9 @@ before any bytes reach the device:
   `drain`, and `clear_input` still work. This is model-proof: no bug and no
   injected device text can cause a write.
 - `confirm` — each write is approved first. On an MCP `2026-07-28` client that
-  declares the elicitation capability, the server answers `tools/call` with an
-  `input_required` elicitation showing the exact bytes; the host asks the
+  supports form elicitation (an `elicitation` capability with `form`, or an
+  empty one), the server answers `tools/call` with an `input_required`
+  elicitation showing the complete, escaped bytes; the host asks the
   person, and the model's own `confirm: true` is ignored. Only an accepted
   answer with `confirm: true` proceeds; anything else is `ConfirmationDeclined`
   (`-32016`, not retryable). The answer is bound to the exact payload, so a

@@ -198,8 +198,9 @@ a tool returns `resultType: "input_required"` and the client retries with
 `inputResponses`. `serial.write` / `serial.exec` on a `confirm` session now use
 this to ask the person through the client, bound to the exact bytes shown; the
 model's own `confirm: true` is ignored on that path and a refusal is
-`ConfirmationDeclined` (`-32016`). Clients without elicitation, or on an
-older revision, keep the ADR 0005 tripwire. Completion could help
+`ConfirmationDeclined` (`-32016`). Clients without form elicitation
+(including URL-only clients), or on an older revision, keep the ADR 0005
+tripwire. Completion could help
 device/profile/session IDs and remains deferred.
 
 Durable artifacts:

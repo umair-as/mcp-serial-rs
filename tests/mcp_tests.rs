@@ -2110,6 +2110,172 @@ async fn deny_session_is_not_elicited() {
     assert_device_untouched(&mut device).await;
 }
 
+/// A stateless request declaring exactly `capabilities`, for the
+/// elicitation capability matrix.
+fn stateless_request_with_caps(id: u64, method: &str, mut params: Value, caps: Value) -> Value {
+    let mut meta = stateless_meta();
+    meta["io.modelcontextprotocol/clientCapabilities"] = caps;
+    params["_meta"] = meta;
+    json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+}
+
+async fn read_device_bytes(device: &mut DuplexStream, len: usize) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; len];
+    timeout(Duration::from_secs(2), device.read_exact(&mut buf))
+        .await
+        .expect("read timeout")
+        .expect("read");
+    buf
+}
+
+#[tokio::test]
+async fn confirm_elicitation_requires_form_support() {
+    // Mirrors rmcp's `supported_elicitation_modes`: an empty capability
+    // implies form support; URL-only does not. Clients without form support
+    // fall back to the ADR 0005 tripwire, so `confirm: true` proceeds.
+    for (caps, elicits) in [
+        (json!({}), false),
+        (json!({"elicitation": {}}), true),
+        (json!({"elicitation": {"form": {}}}), true),
+        (json!({"elicitation": {"url": {}}}), false),
+        (json!({"elicitation": {"form": {}, "url": {}}}), true),
+    ] {
+        let (server, session_id, mut device) =
+            server_with_open_session_policy(WritePolicy::Confirm).await;
+        let mut args = exec_args(&session_id, "probe");
+        args["confirm"] = json!(true);
+        let responses = roundtrip(
+            server,
+            &[stateless_request_with_caps(
+                1,
+                "tools/call",
+                json!({"name": "serial.exec", "arguments": args}),
+                caps.clone(),
+            )],
+        )
+        .await;
+        if elicits {
+            let (_, request) = confirmation_request(&responses[0]);
+            assert_eq!(request["params"]["mode"], "form", "{caps}");
+            assert_device_untouched(&mut device).await;
+        } else {
+            assert_ne!(
+                responses[0]["result"]["resultType"], "input_required",
+                "{caps}: {:?}",
+                responses[0]
+            );
+            assert_eq!(
+                responses[0]["result"]["structuredContent"]["command_written"], true,
+                "{caps}: {:?}",
+                responses[0]
+            );
+            assert_eq!(read_device_bytes(&mut device, 6).await, b"probe\n");
+        }
+    }
+
+    // A URL-only client without `confirm: true` gets the tripwire refusal.
+    let (server, session_id, mut device) =
+        server_with_open_session_policy(WritePolicy::Confirm).await;
+    let responses = roundtrip(
+        server,
+        &[stateless_request_with_caps(
+            1,
+            "tools/call",
+            json!({"name": "serial.exec", "arguments": exec_args(&session_id, "probe")}),
+            json!({"elicitation": {"url": {}}}),
+        )],
+    )
+    .await;
+    assert_eq!(rpc_error_code(&responses[0]), -32013, "{:?}", responses[0]);
+    assert_device_untouched(&mut device).await;
+}
+
+#[tokio::test]
+async fn confirm_exec_shows_the_whole_long_command_it_authorizes() {
+    // Accepting authorizes every byte, so a suffix after a long benign
+    // prefix must be in the dialog, and what is sent must equal what was
+    // shown.
+    let command = format!("printf '{}'; printf HIDDEN_SUFFIX", "A".repeat(280));
+    let transmitted = format!("{command}\n");
+    let (server, session_id, mut device) =
+        server_with_open_session_policy(WritePolicy::Confirm).await;
+    let sid = session_id.clone();
+    let cmd = command.clone();
+    let shown = format!("{transmitted:?}");
+    let (first, second) = roundtrip_then(
+        server,
+        stateless_request_eliciting(
+            1,
+            "tools/call",
+            json!({"name": "serial.exec", "arguments": exec_args(&session_id, &command)}),
+        ),
+        move |resp| {
+            let (key, request) = confirmation_request(resp);
+            let message = request["params"]["message"].as_str().expect("message");
+            assert!(message.contains(&shown), "full payload shown: {message}");
+            assert!(!message.contains('…'), "{message}");
+            retry_with_answer(
+                &sid,
+                &cmd,
+                &key,
+                json!({"action": "accept", "content": {"confirm": true}}),
+            )
+        },
+    )
+    .await;
+    assert_eq!(first["result"]["resultType"], "input_required");
+    assert_eq!(
+        second["result"]["structuredContent"]["command_written"], true,
+        "{second}"
+    );
+    let sent = read_device_bytes(&mut device, transmitted.len()).await;
+    assert_eq!(sent, transmitted.as_bytes());
+}
+
+#[tokio::test]
+async fn confirm_write_shows_the_whole_long_payload_it_authorizes() {
+    // Same guarantee for raw writes, with multibyte text and control bytes
+    // that must stay escaped and unambiguous in the dialog.
+    let data = format!("{}\tcafé\u{1b}[0m\u{202e}HIDDEN_SUFFIX", "A".repeat(300));
+    let (server, session_id, mut device) =
+        server_with_open_session_policy(WritePolicy::Confirm).await;
+    let sid = session_id.clone();
+    let payload = data.clone();
+    let (_, second) = roundtrip_then(
+        server,
+        stateless_request_eliciting(
+            1,
+            "tools/call",
+            json!({"name": "serial.write", "arguments": {"session_id": session_id, "data": data}}),
+        ),
+        move |resp| {
+            let (key, request) = confirmation_request(resp);
+            let message = request["params"]["message"].as_str().expect("message");
+            assert!(
+                message.contains(r#"\tcafé\u{1b}[0m\u{202e}HIDDEN_SUFFIX""#),
+                "{message}"
+            );
+            assert!(message.contains(&format!("{payload:?}")), "{message}");
+            let mut params = json!({
+                "name": "serial.write",
+                "arguments": {"session_id": sid, "data": payload},
+            });
+            params["inputResponses"] =
+                json!({ key: {"action": "accept", "content": {"confirm": true}} });
+            stateless_request_eliciting(2, "tools/call", params)
+        },
+    )
+    .await;
+    assert_eq!(
+        second["result"]["structuredContent"]["bytes_written"],
+        data.len(),
+        "{second}"
+    );
+    let sent = read_device_bytes(&mut device, data.len()).await;
+    assert_eq!(sent, data.as_bytes());
+}
+
 #[tokio::test]
 async fn write_confirm_required_without_confirm() {
     let (server, session_id, mut device) =

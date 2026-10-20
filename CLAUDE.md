@@ -132,7 +132,8 @@ other. The tool list is static and advertised as cacheable for one hour to
   `allow` (default) | `confirm` | `deny`. `deny` refuses writes server-side →
   `WriteForbidden` (-32012); a hard, model-proof read-only session (reads /
   `drain` / `clear_input` still allowed). `confirm` has two shapes (ADR 0009):
-  on a 2026-07-28 client that declares elicitation, `gate_write` returns an
+  on a 2026-07-28 client that supports form elicitation (`form` or an empty
+  capability; URL-only does not count), `gate_write` returns an
   MRTR `input_required` elicitation keyed by a digest of (session, tool,
   exact bytes) and the model's `confirm: true` is ignored; the retry's answer
   must be `accept` + `confirm: true`, else `ConfirmationDeclined` (-32016,

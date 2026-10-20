@@ -25,10 +25,14 @@ the host, not by the model, which is what makes it worth asking for.
 On a `confirm` session, `serial.write` and `serial.exec` now have two shapes,
 chosen per request:
 
-1. **Client speaks `2026-07-28` and declares the `elicitation` capability.**
-   The server returns one form elicitation whose message names the tool,
-   session, port, baud, and the exact bytes about to be sent (`{:?}`-escaped,
-   excerpt-bounded), with a required boolean `confirm`. The model's own
+1. **Client speaks `2026-07-28` and supports form elicitation.** That is an
+   `elicitation` capability with `form`, or an empty `elicitation: {}` (implied
+   form support, as in rmcp's `supported_elicitation_modes`). A URL-only client
+   could not complete the form and takes path 2. The server returns one form
+   elicitation whose message names the tool, session, port, baud, and the
+   complete bytes about to be sent (`{:?}`-escaped, never truncated: accepting
+   authorizes every byte, and `MAX_WRITE_CHUNK` already bounds the size), with
+   a required boolean `confirm`. The model's own
    `confirm: true` argument is ignored on this path: the gate is only worth
    having if the model cannot satisfy it. Only `action: "accept"` with
    `content.confirm == true` proceeds. Decline, cancel, an accept without the
@@ -36,7 +40,8 @@ chosen per request:
    `ConfirmationDeclined` (`-32016`, `retryable: false`, `data.elicitation`
    naming the action) so the model learns a person said no and stops.
 
-2. **Any other client** (`2025-11-25` or older, or no elicitation capability).
+2. **Any other client** (`2025-11-25` or older, no elicitation capability, or
+   URL-only elicitation).
    ADR 0005 behaviour is unchanged: `confirm: true` proceeds, its absence is
    `ConfirmationRequired` (`-32013`). A legacy client that declares elicitation
    still gets this path, because MRTR does not exist on its revision and the
@@ -44,7 +49,8 @@ chosen per request:
    also refuse to send `input_required` to such a peer.
 
 Binding, not state. The elicitation key is `confirm_write:<digest>` where the
-digest covers `(session_id, tool, exact payload bytes)`. On the retry the server
+digest covers `(session_id, tool, exact payload bytes)`, keyed with per-process
+random SipHash keys so two colliding payloads cannot be precomputed offline. On the retry the server
 recomputes the key from the arguments it actually received and looks the
 answer up under it. A retry whose payload differs from what the person saw
 therefore finds no answer and is elicited again; a "yes" cannot be replayed
