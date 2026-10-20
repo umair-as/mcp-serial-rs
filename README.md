@@ -108,12 +108,12 @@ SDK generates input and output schemas from typed Rust structs.
 | `serial.open` | `{port, baud?, timeout_ms?, write_policy?, deny_patterns?, line_ending?}` **or** `{device, …same}` | `{session_id}` (32-char random hex) |
 | `serial.sessions` | — | `{sessions: [{session_id, port, baud, state, default_timeout_ms, write_policy, console_settings}]}` |
 | `serial.get_session` | `{session_id}` | `{session}` (includes policy and console settings) |
-| `serial.write` | `{session_id, data, confirm?}` (≤ 4 KiB) | `{bytes_written}` |
+| `serial.write` | `{session_id, data, confirm?, reason?}` (≤ 4 KiB) | `{bytes_written}` |
 | `serial.read` | `{session_id, max_bytes?, timeout_ms?}` | `{data, status, timed_out, bytes_read, truncated, session_usable, output_is_untrusted}` |
 | `serial.drain` | `{session_id, max_bytes?}` | same shape as `serial.read`, with a short idle deadline |
 | `serial.clear_input` | `{session_id, max_bytes?}` | `{status, bytes_read, discarded_bytes, truncated, session_usable}` |
 | `serial.read_until` | `{session_id, pattern, timeout_ms?}` | `{data, matched, status, bytes_read, truncated, match_details?, session_usable, output_is_untrusted}` |
-| `serial.exec` | `{session_id, command, expect, line_ending?, echo_mode?, semantic_prompt?, timeout_ms?, clear_before_write?, normalize_output?, confirm?}` | raw output plus optional normalized/command output, semantic status, byte counts, match details, and write state |
+| `serial.exec` | `{session_id, command, expect, line_ending?, echo_mode?, semantic_prompt?, timeout_ms?, clear_before_write?, normalize_output?, confirm?, reason?}` | raw output plus optional normalized/command output, semantic status, byte counts, match details, and write state |
 | `serial.close` | `{session_id}` | `{ok}` |
 
 `serial.open` accepts either a literal `port` path or a `device` profile name
@@ -134,11 +134,16 @@ before any bytes reach the device:
 - `confirm` — each write is approved first. On an MCP `2026-07-28` client that
   supports form elicitation (an `elicitation` capability with `form`, or an
   empty one), the server answers `tools/call` with an `input_required`
-  elicitation showing the complete, escaped bytes; the host asks the
-  person, and the model's own `confirm: true` is ignored. Only an accepted
-  answer with `confirm: true` proceeds; anything else is `ConfirmationDeclined`
-  (`-32016`, not retryable). The answer is bound to the exact payload, so a
-  changed command is asked again. On any other client this is the original
+  elicitation that asks "Send N byte(s) to <port>?", then shows the complete,
+  escaped bytes (for `exec`, the command plus its line ending), the caller's
+  optional `reason` as untrusted text, and the session details. The form has
+  no fields: the host's Accept sends, Decline or Cancel refuses
+  (`ConfirmationDeclined`, `-32016`, not retryable), and the model's own
+  `confirm: true` is ignored. The answer is bound to the exact payload and
+  `reason`, so a changed command or explanation is asked again. Payloads longer
+  than 120 characters as displayed are refused before anyone is asked
+  (`InvalidParam`, `-32008`), because hosts may clip long lines; an empty
+  `serial.write` needs no approval. On any other client this is the original
   tripwire: `confirm: true` on the call, else `ConfirmationRequired`
   (`-32013`) — an audit seam, not a hard gate. Use `deny` when you need a
   guarantee that does not depend on the client. See `docs/adr/0009`.

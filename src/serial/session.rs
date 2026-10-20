@@ -33,9 +33,10 @@ pub enum WritePolicy {
     /// Writes proceed unconditionally. The default; preserves prior behavior.
     #[default]
     Allow,
-    /// Writes require an explicit `confirm: true` on the call. A tripwire and
-    /// audit point (self-satisfiable by an automated caller), and the seam a
-    /// future MCP elicitation upgrade turns into a real human prompt.
+    /// Each write is approved first. On a client that supports form
+    /// elicitation the person is asked through the client and the caller's
+    /// `confirm` flag is ignored; on any other client the call needs
+    /// `confirm: true`, a tripwire the caller can satisfy itself.
     Confirm,
     /// Writes are refused server-side regardless of the call — a hard,
     /// model-proof read-only session. Reads/drains/clears are still allowed.

@@ -21,11 +21,11 @@ use rmcp::{
         router::tool::ToolRouter, tool::InputResponses as ToolInputResponses, wrapper::Parameters,
     },
     model::{
-        BooleanSchema, CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult,
-        ElicitRequest, ElicitRequestParams, ElicitResult, ElicitationAction, ElicitationCapability,
+        CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ElicitRequest,
+        ElicitRequestParams, ElicitResult, ElicitationAction, ElicitationCapability,
         ElicitationSchema, Implementation, InputRequest, InputRequests, InputRequiredResult,
-        InputResponses, JsonObject, ListToolsResult, PaginatedRequestParams,
-        PrimitiveSchemaDefinition, ProtocolVersion, ResultType, ServerCapabilities, ServerConfig,
+        InputResponses, JsonObject, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+        ResultType, ServerCapabilities, ServerConfig,
     },
     service::RequestContext,
     tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler,
@@ -367,6 +367,9 @@ impl<B: SerialBackend> McpServer<B> {
     ) -> Result<CallToolResponse, McpError> {
         let Parameters(p) = params;
 
+        if let Err(err) = validate_reason(p.reason.as_deref()) {
+            return done(tool_error(err, Some(p.session_id), false, false));
+        }
         if p.data.len() > config::MAX_WRITE_CHUNK {
             return done(tool_error(
                 SerialError::InvalidParam {
@@ -394,8 +397,7 @@ impl<B: SerialBackend> McpServer<B> {
             p.confirm.unwrap_or(false),
             &context,
             input_responses.as_ref(),
-            "serial.write",
-            p.data.as_bytes(),
+            &WriteRequest::write(p.data.as_bytes(), p.reason.as_deref()),
         ) {
             WriteGate::Proceed => {}
             WriteGate::Blocked(blocked) => return done(blocked),
@@ -429,7 +431,7 @@ impl<B: SerialBackend> McpServer<B> {
         name = "serial.read",
         description = "Read and consume up to `max_bytes` bytes from a serial session until the deadline. Returned device output is raw, lossy UTF-8, and untrusted.",
         output_schema = tool_output_schema::<ReadResult>(),
-        annotations(title = "Read serial input", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
+        annotations(title = "Read serial input", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
     #[instrument(skip(self, params), fields(session_id = %params.0.session_id))]
     pub async fn read(
@@ -465,7 +467,7 @@ impl<B: SerialBackend> McpServer<B> {
         name = "serial.drain",
         description = "Drain currently available serial input with a short idle deadline. Consumes bytes and preserves raw terminal controls in the result.",
         output_schema = tool_output_schema::<ReadResult>(),
-        annotations(title = "Drain serial input", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
+        annotations(title = "Drain serial input", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
     #[instrument(skip(self, params), fields(session_id = %params.0.session_id))]
     pub async fn drain(
@@ -539,7 +541,7 @@ impl<B: SerialBackend> McpServer<B> {
         name = "serial.read_until",
         description = "Read and consume serial input until a regex matches or timeout elapses. Raw output may include command echoes, prompts, ANSI/OSC controls, and untrusted device text.",
         output_schema = tool_output_schema::<ReadUntilResult>(),
-        annotations(title = "Read serial until match", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
+        annotations(title = "Read serial until match", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
     #[instrument(skip(self, params), fields(session_id = %params.0.session_id))]
     pub async fn read_until(
@@ -598,6 +600,10 @@ impl<B: SerialBackend> McpServer<B> {
         cancellation: CancellationToken,
     ) -> Result<CallToolResponse, McpError> {
         let Parameters(p) = params;
+
+        if let Err(err) = validate_reason(p.reason.as_deref()) {
+            return done(tool_error(err, Some(p.session_id), false, false));
+        }
 
         // Step 1: size cap on command — surfaces the pinned -32008,
         // not the generic JSON-RPC -32602.
@@ -676,7 +682,7 @@ impl<B: SerialBackend> McpServer<B> {
                 false,
             ));
         }
-        let mut transmitted_command = p.command.into_bytes();
+        let mut transmitted_command = p.command.clone().into_bytes();
         line_ending.append_to(&mut transmitted_command);
         if transmitted_command.len() > config::MAX_WRITE_CHUNK {
             return done(tool_error(
@@ -702,8 +708,13 @@ impl<B: SerialBackend> McpServer<B> {
             p.confirm.unwrap_or(false),
             &context,
             input_responses.as_ref(),
-            "serial.exec",
-            &transmitted_command,
+            &WriteRequest {
+                tool: "serial.exec",
+                payload: &transmitted_command,
+                shown: p.command.as_bytes(),
+                line_ending,
+                reason: p.reason.as_deref(),
+            },
         ) {
             WriteGate::Proceed => {}
             WriteGate::Blocked(blocked) => return done(blocked),
@@ -782,10 +793,11 @@ impl<B: SerialBackend> McpServer<B> {
     /// * **Elicitation-capable client on MCP 2026-07-28+** — the server asks
     ///   the *person* through an MRTR `input_required` round (`Elicit`). The
     ///   model's own `confirm: true` is ignored here: the gate is only worth
-    ///   having if the model cannot satisfy it. The elicitation key is a
-    ///   digest of `(session, tool, payload)`, so the retry's answer is bound
-    ///   to exactly the bytes that were shown to the person; a changed
-    ///   payload simply elicits again.
+    ///   having if the model cannot satisfy it. A payload too long to review
+    ///   ([`CONFIRM_REVIEW_MAX_CHARS`]) is refused instead of asked about. The
+    ///   elicitation key is a digest of `(session, tool, payload, reason)`, so
+    ///   the retry's answer is bound to exactly what was shown to the person;
+    ///   a changed payload or reason simply elicits again.
     /// * **Any other client** — the ADR 0005 tripwire: `confirm: true` on
     ///   the call, else `ConfirmationRequired`.
     fn gate_write(
@@ -794,16 +806,38 @@ impl<B: SerialBackend> McpServer<B> {
         confirmed: bool,
         context: &RequestContext<RoleServer>,
         input_responses: Option<&InputResponses>,
-        tool: &str,
-        payload: &[u8],
+        request: &WriteRequest<'_>,
     ) -> WriteGate {
         let blocked = match self.sessions.write_policy(session_id) {
             Err(err) => err,
             Ok(WritePolicy::Deny) => SerialError::WriteForbidden {
                 session_id: session_id.to_string(),
             },
+            // An empty raw write changes nothing on the device, so there is
+            // nothing to approve. `exec` is not covered: even an empty command
+            // can clear or read input.
+            Ok(WritePolicy::Confirm)
+                if request.tool == "serial.write" && request.payload.is_empty() =>
+            {
+                return WriteGate::Proceed;
+            }
             Ok(WritePolicy::Confirm) if client_can_elicit(context) => {
-                let key = confirmation_key(session_id, tool, payload);
+                // Counted on the full payload line, line-ending marker included.
+                let shown = request.display().chars().count();
+                if shown > CONFIRM_REVIEW_MAX_CHARS {
+                    return WriteGate::blocked(
+                        SerialError::InvalidParam {
+                            name: request.param_name().into(),
+                            reason: format!(
+                                "too long to review in a confirmation dialog ({shown} characters \
+                                 as displayed; max {CONFIRM_REVIEW_MAX_CHARS}); a person must be \
+                                 able to see the whole write before approving it"
+                            ),
+                        },
+                        session_id,
+                    );
+                }
+                let key = confirmation_key(session_id, request);
                 match input_responses.and_then(|r| r.get(&key)) {
                     None => {
                         let snapshot = match self.sessions.get_session(session_id) {
@@ -811,7 +845,10 @@ impl<B: SerialBackend> McpServer<B> {
                             Err(err) => return WriteGate::blocked(err, session_id),
                         };
                         return WriteGate::Elicit(confirmation_request(
-                            &snapshot, tool, payload, key,
+                            &snapshot,
+                            request,
+                            &request.display(),
+                            key,
                         ));
                     }
                     Some(answer) => match confirmation_answer(answer) {
@@ -1044,53 +1081,118 @@ fn supports_form_elicitation(elicitation: &ElicitationCapability) -> bool {
 /// the same 64-bit key offline; random keys make that impossible.
 static CONFIRMATION_KEY_STATE: LazyLock<RandomState> = LazyLock::new(RandomState::new);
 
+/// Longest payload line, as displayed (escaped, with the surrounding quotes and
+/// any ` + LF` line-ending marker), that a person is asked to approve in one
+/// dialog. Hosts may clip a long line at the window edge (Claude Code does), so
+/// a longer payload is refused before anyone is asked rather than approved
+/// partly unseen. This bounds the line; it cannot guarantee visibility in a
+/// narrow window or with wide characters.
+pub const CONFIRM_REVIEW_MAX_CHARS: usize = 120;
+
+/// Longest `reason`, in Unicode scalar values, an agent may attach to a write.
+pub const REASON_MAX_CHARS: usize = 120;
+
+/// One write a person may be asked to approve on a `confirm` session.
+struct WriteRequest<'a> {
+    tool: &'static str,
+    /// The exact bytes that will be transmitted.
+    payload: &'a [u8],
+    /// The caller's text as shown to the person. For `exec` it excludes the
+    /// appended line ending, which is shown separately; `shown` plus the
+    /// ending is always exactly `payload`.
+    shown: &'a [u8],
+    line_ending: LineEnding,
+    /// Optional, untrusted explanation from the agent.
+    reason: Option<&'a str>,
+}
+
+impl<'a> WriteRequest<'a> {
+    fn write(payload: &'a [u8], reason: Option<&'a str>) -> Self {
+        Self {
+            tool: "serial.write",
+            payload,
+            shown: payload,
+            line_ending: LineEnding::None,
+            reason,
+        }
+    }
+
+    /// The payload line of the dialog: the escaped caller text plus a
+    /// visible marker for any appended line ending.
+    fn display(&self) -> String {
+        let mut shown = escaped_payload(self.shown);
+        let ending = match self.line_ending {
+            LineEnding::None => "",
+            LineEnding::Lf => " + LF",
+            LineEnding::Cr => " + CR",
+            LineEnding::Crlf => " + CRLF",
+        };
+        shown.push_str(ending);
+        shown
+    }
+
+    /// Name of the parameter that carries the payload, for error reports.
+    fn param_name(&self) -> &'static str {
+        if self.tool == "serial.exec" {
+            "command"
+        } else {
+            "data"
+        }
+    }
+}
+
+/// Validate an agent-supplied `reason` before anything else happens.
+fn validate_reason(reason: Option<&str>) -> Result<(), SerialError> {
+    match reason {
+        Some(text) if text.chars().count() > REASON_MAX_CHARS => Err(SerialError::InvalidParam {
+            name: "reason".into(),
+            reason: format!("must be at most {REASON_MAX_CHARS} characters"),
+        }),
+        _ => Ok(()),
+    }
+}
+
 /// Key under which the client must return the confirmation answer. It is a
-/// keyed digest of the session, tool, and exact payload bytes, so a retry
-/// whose payload differs from what the person saw cannot reuse their
-/// answer. It is a binding, not a secret: forging it would also require
-/// forging the host-supplied `inputResponses`, which is outside the model's
-/// reach.
-fn confirmation_key(session_id: &str, tool: &str, payload: &[u8]) -> String {
+/// keyed digest of the session, tool, exact payload bytes, and the agent's
+/// `reason`, so a retry whose payload or explanation differs from what the
+/// person saw cannot reuse their answer. It is a binding, not a secret:
+/// forging it would also require forging the host-supplied `inputResponses`,
+/// which is outside the model's reach.
+fn confirmation_key(session_id: &str, request: &WriteRequest<'_>) -> String {
     use std::hash::{BuildHasher, Hash, Hasher};
     let mut hasher = CONFIRMATION_KEY_STATE.build_hasher();
     session_id.hash(&mut hasher);
-    tool.hash(&mut hasher);
-    payload.hash(&mut hasher);
+    request.tool.hash(&mut hasher);
+    request.payload.hash(&mut hasher);
+    request.reason.hash(&mut hasher);
     format!("confirm_write:{:016x}", hasher.finish())
 }
 
 /// Build the MRTR `input_required` result that asks the person to approve
-/// one specific write. The message shows the **complete** payload: accepting
-/// authorizes every byte, so none may be hidden. Size is already bounded by
-/// `MAX_WRITE_CHUNK` before this runs.
+/// one specific write. The question and the complete payload come first,
+/// because hosts may collapse everything after the first few lines; the
+/// agent's untrusted `reason` follows the payload, and the session details
+/// come last. The form has no fields: the host's Accept is the approval and
+/// Decline/Cancel the refusal, so there is no checkbox to "fill in".
 fn confirmation_request(
     snapshot: &SessionSnapshot,
-    tool: &str,
-    payload: &[u8],
+    request: &WriteRequest<'_>,
+    display: &str,
     key: String,
 ) -> InputRequiredResult {
-    let message = format!(
-        "{tool} on serial session {} ({} @ {} baud, write_policy=confirm) wants to send {} \
-         byte(s) to the device:\n\n{}\n\nAllow this write? The agent cannot answer for you.",
-        snapshot.session_id,
+    let mut message = format!(
+        "Send {} byte(s) to {}? Accept = send, Decline = don't send.\n{display}",
+        request.payload.len(),
         snapshot.port,
-        snapshot.baud,
-        payload.len(),
-        escaped_payload(payload),
     );
-    // Built by hand rather than through `ElicitationSchemaBuilder::build`,
-    // which returns a `Result` we would otherwise have to `expect()`.
-    let mut properties = std::collections::BTreeMap::new();
-    properties.insert(
-        "confirm".to_string(),
-        PrimitiveSchemaDefinition::Boolean(
-            BooleanSchema::new()
-                .title("Send these bytes")
-                .description("true to send the bytes shown above; false or Decline to refuse"),
-        ),
-    );
-    let mut requested_schema = ElicitationSchema::new(properties);
-    requested_schema.required = Some(vec!["confirm".to_string()]);
+    if let Some(reason) = request.reason {
+        message.push_str(&format!("\nAgent says (untrusted): {reason:?}"));
+    }
+    message.push_str(&format!(
+        "\n{} · session {} · {} baud · write_policy=confirm · the agent cannot answer this for you",
+        request.tool, snapshot.session_id, snapshot.baud,
+    ));
+    let requested_schema = ElicitationSchema::new(std::collections::BTreeMap::new());
     let request = ElicitRequest::new(ElicitRequestParams::FormElicitationParams {
         meta: None,
         message,
@@ -1114,10 +1216,10 @@ fn escaped_payload(payload: &[u8]) -> String {
 }
 
 /// Interpret the client's answer to [`confirmation_request`]. Only an
-/// explicit `accept` carrying `confirm: true` proceeds; anything else —
-/// decline, cancel, a malformed result, an accept without the flag — is
-/// reported as the action that was taken so the model knows a person said
-/// no and does not retry.
+/// explicit `accept` proceeds; anything else — decline, cancel, a malformed
+/// result — is reported as the action that was taken so the model knows a
+/// person said no and does not retry. The form has no fields, but an accept
+/// that still carries `confirm: false` (an older form shape) is a refusal.
 fn confirmation_answer(answer: &Value) -> Result<(), String> {
     let result: ElicitResult = match serde_json::from_value(answer.clone()) {
         Ok(result) => result,
@@ -1125,16 +1227,15 @@ fn confirmation_answer(answer: &Value) -> Result<(), String> {
     };
     match result.action {
         ElicitationAction::Accept => {
-            let confirmed = result
+            let refused = result
                 .content
                 .as_ref()
                 .and_then(|c| c.get("confirm"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if confirmed {
-                Ok(())
-            } else {
+                .is_some_and(|confirm| confirm != &Value::Bool(true));
+            if refused {
                 Err("accept_without_confirm".to_string())
+            } else {
+                Ok(())
             }
         }
         ElicitationAction::Decline => Err("decline".to_string()),
@@ -1359,12 +1460,17 @@ pub struct OpenParams {
 pub struct WriteParams {
     pub session_id: String,
     pub data: String,
-    /// Under `write_policy = "confirm"`: on a client that supports
+    /// Under `write_policy = "confirm"`: on a client that supports form
     /// elicitation the server asks the person directly and this flag is
     /// ignored; on any other client it must be `true`. Ignored under
     /// `allow`, cannot override `deny`. Defaults to `false`.
     #[serde(default)]
     pub confirm: Option<bool>,
+    /// Optional one-line explanation (at most 120 characters) shown to the
+    /// person in a confirmation dialog as untrusted agent text. Say why the
+    /// write is needed; it never replaces the bytes shown.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1442,12 +1548,17 @@ pub struct ExecParams {
     /// Override semantic prompt parsing for this call.
     #[serde(default)]
     pub semantic_prompt: Option<SemanticPrompt>,
-    /// Under `write_policy = "confirm"`: on a client that supports
+    /// Under `write_policy = "confirm"`: on a client that supports form
     /// elicitation the server asks the person directly and this flag is
     /// ignored; on any other client it must be `true`. Ignored under
     /// `allow`, cannot override `deny`. Defaults to `false`.
     #[serde(default)]
     pub confirm: Option<bool>,
+    /// Optional one-line explanation (at most 120 characters) shown to the
+    /// person in a confirmation dialog as untrusted agent text. Say why the
+    /// write is needed; it never replaces the bytes shown.
+    #[serde(default)]
+    pub reason: Option<String>,
     #[serde(default)]
     pub clear_before_write: Option<bool>,
     #[serde(default)]
@@ -1615,9 +1726,12 @@ Safe workflow:
 privileged shell, set `write_policy`: \"deny\" for a read-only session (writes are refused \
 server-side) or \"confirm\" to have each write approved first. On a client that supports form \
 elicitation, \"confirm\" asks the person directly and your own `confirm: true` is ignored; a \
-`confirmation_declined` error means the person said no — do not retry or rephrase. On other \
-clients, pass `confirm: true` explicitly. A `privileged` profile already defaults to \
-\"confirm\".
+`confirmation_declined` error means the person said no — do not retry or rephrase. Pass a \
+short `reason` (at most 120 characters) saying why the write is needed; it is shown to the \
+person. A write longer than 120 characters as displayed is refused before the person is \
+asked; send only complete operations that fit, and never split one command across writes to \
+get around the limit. On other clients, pass \
+`confirm: true` explicitly. A `privileged` profile already defaults to \"confirm\".
 3. Check `serial.sessions` / `serial.get_session` to recover state; the snapshot's \
 `write_policy` and `command_policy` say what the session may do.
 4. Before executing a command, clear stale input with `serial.drain`, `serial.clear_input`, \
@@ -1681,6 +1795,7 @@ mod tool_error_tests {
         assert!(!session_usable(
             SerialError::PortBusy {
                 port: "/dev/ttyUSB0".into(),
+                session_id: None,
             },
             None,
         ));
@@ -1717,8 +1832,28 @@ mod tool_error_tests {
 
 #[cfg(test)]
 mod confirmation_tests {
-    use super::{confirmation_key, escaped_payload, supports_form_elicitation};
+    use super::{
+        confirmation_answer, confirmation_key, escaped_payload, supports_form_elicitation,
+        validate_reason, WriteRequest, REASON_MAX_CHARS,
+    };
+    use crate::serial::console::LineEnding;
     use rmcp::model::{ElicitationCapability, FormElicitationCapability, UrlElicitationCapability};
+    use serde_json::json;
+
+    fn exec_request<'a>(
+        payload: &'a [u8],
+        shown: &'a [u8],
+        line_ending: LineEnding,
+        reason: Option<&'a str>,
+    ) -> WriteRequest<'a> {
+        WriteRequest {
+            tool: "serial.exec",
+            payload,
+            shown,
+            line_ending,
+            reason,
+        }
+    }
 
     #[test]
     fn form_support_follows_rmcp_compatibility_rules() {
@@ -1758,17 +1893,82 @@ mod confirmation_tests {
     #[test]
     fn confirmation_key_is_stable_in_process_but_not_the_fixed_key_digest() {
         use std::hash::{Hash, Hasher};
-        let key = confirmation_key("sid", "serial.exec", b"ls\n");
-        assert_eq!(key, confirmation_key("sid", "serial.exec", b"ls\n"));
-        assert_ne!(key, confirmation_key("sid", "serial.exec", b"ls \n"));
-        assert_ne!(key, confirmation_key("sid", "serial.write", b"ls\n"));
+        let ls = WriteRequest::write(b"ls\n", None);
+        let key = confirmation_key("sid", &ls);
+        assert_eq!(key, confirmation_key("sid", &ls));
+        assert_ne!(
+            key,
+            confirmation_key("sid", &WriteRequest::write(b"ls \n", None))
+        );
+        assert_ne!(
+            key,
+            confirmation_key("sid", &exec_request(b"ls\n", b"ls", LineEnding::Lf, None))
+        );
+        assert_ne!(
+            key,
+            confirmation_key("sid", &WriteRequest::write(b"ls\n", Some("list files")))
+        );
 
         // The unkeyed `DefaultHasher::new()` digest is publicly computable;
         // the per-process keys must not reproduce it (2^-64 false failure).
         let mut fixed = std::hash::DefaultHasher::new();
         "sid".hash(&mut fixed);
-        "serial.exec".hash(&mut fixed);
+        "serial.write".hash(&mut fixed);
         b"ls\n".as_slice().hash(&mut fixed);
+        None::<&str>.hash(&mut fixed);
         assert_ne!(key, format!("confirm_write:{:016x}", fixed.finish()));
+    }
+
+    #[test]
+    fn display_shows_command_and_line_ending_that_rebuild_the_payload() {
+        for (ending, marker) in [
+            (LineEnding::None, ""),
+            (LineEnding::Lf, " + LF"),
+            (LineEnding::Cr, " + CR"),
+            (LineEnding::Crlf, " + CRLF"),
+        ] {
+            let mut payload = b"echo a\r".to_vec();
+            ending.append_to(&mut payload);
+            let request = exec_request(&payload, b"echo a\r", ending, None);
+            assert_eq!(request.display(), format!(r#""echo a\r"{marker}"#));
+        }
+        assert_eq!(
+            WriteRequest::write(b"x\n", None).display(),
+            r#""x\n""#,
+            "a raw write shows its own newline escaped, with no marker"
+        );
+    }
+
+    #[test]
+    fn reason_is_bounded_in_characters_not_bytes() {
+        let at_limit = "é".repeat(REASON_MAX_CHARS);
+        assert!(validate_reason(Some(&at_limit)).is_ok());
+        assert!(validate_reason(Some(&format!("{at_limit}x"))).is_err());
+        assert!(validate_reason(None).is_ok());
+    }
+
+    #[test]
+    fn accept_alone_approves_but_an_explicit_false_refuses() {
+        assert!(confirmation_answer(&json!({"action": "accept"})).is_ok());
+        assert!(confirmation_answer(&json!({"action": "accept", "content": {}})).is_ok());
+        assert!(
+            confirmation_answer(&json!({"action": "accept", "content": {"confirm": true}})).is_ok()
+        );
+        assert_eq!(
+            confirmation_answer(&json!({"action": "accept", "content": {"confirm": false}})),
+            Err("accept_without_confirm".to_string())
+        );
+        assert_eq!(
+            confirmation_answer(&json!({"action": "accept", "content": {"confirm": "yes"}})),
+            Err("accept_without_confirm".to_string())
+        );
+        assert_eq!(
+            confirmation_answer(&json!({"action": "decline"})),
+            Err("decline".to_string())
+        );
+        assert_eq!(
+            confirmation_answer(&json!({"action": "cancel"})),
+            Err("cancel".to_string())
+        );
     }
 }

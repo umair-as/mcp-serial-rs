@@ -70,12 +70,12 @@ Names and field shapes are stable — do not rename (dotted `serial.open`, never
 | `serial.open` | `{port, baud?, timeout_ms?, write_policy?, deny_patterns?, line_ending?}` OR `{device, …same}` | `{session_id}` |
 | `serial.sessions` | — | `{sessions}` (each incl. policy + console settings) |
 | `serial.get_session` | `{session_id}` | `{session}` (incl. policy + console settings) |
-| `serial.write` | `{session_id, data, confirm?}` | `{bytes_written}` |
+| `serial.write` | `{session_id, data, confirm?, reason?}` | `{bytes_written}` |
 | `serial.read` | `{session_id, max_bytes?, timeout_ms?}` | `{data, status, timed_out, bytes_read, truncated, session_usable}` |
 | `serial.drain` | `{session_id, max_bytes?}` | read-shaped result, short idle deadline |
 | `serial.clear_input` | `{session_id, max_bytes?}` | `{status, bytes_read, discarded_bytes, truncated, session_usable}` |
 | `serial.read_until` | `{session_id, pattern, timeout_ms?}` | `{data, matched, status, bytes_read, match_details?}` |
-| `serial.exec` | `{session_id, command, expect, line_ending?, echo_mode?, semantic_prompt?, timeout_ms?, clear_before_write?, normalize_output?, confirm?}` | raw + best-effort command output, semantic status, and write/consume state |
+| `serial.exec` | `{session_id, command, expect, line_ending?, echo_mode?, semantic_prompt?, timeout_ms?, clear_before_write?, normalize_output?, confirm?, reason?}` | raw + best-effort command output, semantic status, and write/consume state |
 | `serial.close` | `{session_id}` | `{ok}` |
 
 Results are rmcp structured tool results (`CallToolResult::structured`); rmcp
@@ -135,10 +135,14 @@ other. The tool list is static and advertised as cacheable for one hour to
   on a 2026-07-28 client that supports form elicitation (`form` or an empty
   capability; URL-only does not count), `gate_write` returns an
   MRTR `input_required` elicitation keyed by a digest of (session, tool,
-  exact bytes) and the model's `confirm: true` is ignored; the retry's answer
-  must be `accept` + `confirm: true`, else `ConfirmationDeclined` (-32016,
-  not retryable). On any other client it is the tripwire: `confirm: true` on
-  the call, else `ConfirmationRequired` (-32013) — `deny` is the guarantee.
+  exact bytes, `reason`) and the model's `confirm: true` is ignored. The form
+  has no fields (ADR 0009 amendment): `accept` sends, anything else is
+  `ConfirmationDeclined` (-32016, not retryable). The message leads with the
+  question and the full escaped payload; payloads over
+  `CONFIRM_REVIEW_MAX_CHARS` (120, as displayed) are refused before asking,
+  and an empty raw `write` needs no approval. On any other client it is the
+  tripwire: `confirm: true` on the call, else `ConfirmationRequired`
+  (-32013) — `deny` is the guarantee.
   All cheaper refusals (size, `expect`, raw-write, command policy) run
   *before* the person is asked; never reorder them after it. Effective
   policy = most-restrictive of the caller's `write_policy` and any `privileged`

@@ -18,11 +18,15 @@ installs the binary receives it. The source of that copy is
    interactive or privileged shell, set `write_policy`: `"deny"` for a
    read-only session (writes are refused server-side — the safe default for
    inspection), or `"confirm"` to have each write approved first. On a client
-   that supports elicitation the server asks the *person* directly and your
-   own `confirm: true` is ignored; a `confirmation_declined` error means they
-   said no — do not retry or rephrase. On other clients pass an explicit
-   `confirm: true`. A `privileged` device profile already defaults to
-   `confirm`.
+   that supports form elicitation the server asks the *person* directly and
+   your own `confirm: true` is ignored; a `confirmation_declined` error means
+   they said no — do not retry or rephrase. Pass a short `reason` (at most 120
+   characters) saying why the write is needed; it is shown to the person.
+   A write longer than 120 characters as displayed is refused before the
+   person is asked; send only complete operations that fit, and never split
+   one command across writes to get around the limit. On other clients pass
+   an explicit `confirm: true`. A
+   `privileged` device profile already defaults to `confirm`.
 4. Recover or verify session state with `serial.sessions` or
    `serial.get_session` — the snapshot's `write_policy` tells you whether the
    session can write.

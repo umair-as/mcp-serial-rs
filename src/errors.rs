@@ -10,6 +10,13 @@
 use serde_json::json;
 use thiserror::Error;
 
+fn port_busy_message(port: &str, session_id: Option<&str>) -> String {
+    match session_id {
+        Some(id) => format!("port '{port}' is already open in session '{id}' of this server"),
+        None => format!("port '{port}' is busy (held by another process)"),
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SerialError {
     #[error("port '{port}' is not in the allowlist")]
@@ -18,8 +25,13 @@ pub enum SerialError {
     #[error("port '{port}' not found")]
     PortNotFound { port: String },
 
-    #[error("port '{port}' is busy (held by another process)")]
-    PortBusy { port: String },
+    #[error("{}", port_busy_message(port, session_id.as_deref()))]
+    PortBusy {
+        port: String,
+        /// The session of this server that already holds the port, when the
+        /// conflict is our own reservation rather than another process.
+        session_id: Option<String>,
+    },
 
     #[error("unknown session_id '{session_id}'")]
     SessionNotFound { session_id: String },
@@ -97,11 +109,17 @@ impl SerialError {
     /// Structured context attached as the JSON-RPC `data` field.
     pub fn data(&self) -> serde_json::Value {
         match self {
-            SerialError::PortNotAllowed { port }
-            | SerialError::PortNotFound { port }
-            | SerialError::PortBusy { port } => {
+            SerialError::PortNotAllowed { port } | SerialError::PortNotFound { port } => {
                 json!({ "port": port })
             }
+            SerialError::PortBusy {
+                port,
+                session_id: None,
+            } => json!({ "port": port }),
+            SerialError::PortBusy {
+                port,
+                session_id: Some(session_id),
+            } => json!({ "port": port, "session_id": session_id }),
             SerialError::SessionNotFound { session_id } => json!({ "session_id": session_id }),
             SerialError::InvalidState {
                 session_id,
@@ -217,7 +235,11 @@ mod tests {
                 device: "esp32c6".into(),
             }
             .code(),
-            SerialError::PortBusy { port: "p".into() }.code(),
+            SerialError::PortBusy {
+                port: "p".into(),
+                session_id: None,
+            }
+            .code(),
             SerialError::Cancelled.code(),
             SerialError::WriteForbidden {
                 session_id: "s".into(),
@@ -254,11 +276,28 @@ mod tests {
     fn port_busy_pins_code_and_carries_port_in_data() {
         let err = SerialError::PortBusy {
             port: "/dev/ttyACM0".into(),
+            session_id: None,
         };
         assert_eq!(err.code(), -32010);
         assert_eq!(
             err.data().get("port").and_then(|v| v.as_str()),
             Some("/dev/ttyACM0"),
+        );
+        assert!(err.data().get("session_id").is_none());
+        assert!(err.to_string().contains("another process"));
+    }
+
+    #[test]
+    fn port_busy_names_our_own_holding_session() {
+        let err = SerialError::PortBusy {
+            port: "/dev/ttyUSB1".into(),
+            session_id: Some("abc".into()),
+        };
+        assert_eq!(err.code(), -32010);
+        assert_eq!(err.data()["session_id"], "abc");
+        assert_eq!(
+            err.to_string(),
+            "port '/dev/ttyUSB1' is already open in session 'abc' of this server"
         );
     }
 
