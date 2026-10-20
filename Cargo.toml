@@ -33,4 +33,4 @@ schemars = "1.0"
 tokio-test = "0.4"
 assert_matches = "1"
 tempfile = "3"
-jsonschema = { version = "0.52", default-features = false }
+jsonschema = { version = "0.58", default-features = false }
