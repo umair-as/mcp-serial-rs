@@ -41,8 +41,15 @@ installs the binary receives it. The source of that copy is
    `serial.exec` with `clear_before_write=true` when stale prompts or boot logs
    could affect matching.
 8. Execute bounded operations with explicit `timeout_ms` and an `expect`
-   pattern. For shell-like profiles, use their declared `line_ending`,
-   `echo_mode`, and `semantic_prompt` defaults; per-call overrides are explicit
+   pattern. A single `serial.write` or `serial.exec` payload, including any
+   line ending, is at most 4096 bytes. A shell needs a `line_ending` (set it at
+   `serial.open` or per call) or the command is never submitted. Make `expect`
+   the exact prompt, such as `root@host:~# `, `=> `, or `uart:~\$ `: a broad
+   pattern can match inside the output. `serial.write` returns no device
+   output, so use `serial.exec` for a command and its response. See
+   `docs/console-recipes.md` for shell, bootloader, and RTOS examples. For
+   shell-like profiles, use their declared `line_ending`, `echo_mode`, and
+   `semantic_prompt` defaults; per-call overrides are explicit
    and should be used only when the target behavior is known.
    A session with a command policy accepts mutations only through `serial.exec`;
    `serial.write` is refused server-side to prevent split-command evasion.
@@ -87,6 +94,8 @@ removed. `serial.exec` can add `normalized_output` when requested and may add a
 best-effort `command_output` from declared line echo or OSC 3008 boundaries,
 but `raw_output` remains the authoritative transcript fragment. Missing or
 ambiguous semantic markers deliberately produce no semantic status claim.
+`exit_code` and `semantic_status` come from device output and a device can fake
+them; treat them as advisory.
 
 Timeouts are normal outcomes. A timeout does not necessarily mean the command
 failed; inspect partial output, byte counts, and whether the command was

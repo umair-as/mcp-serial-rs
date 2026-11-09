@@ -7,8 +7,12 @@ description = "MCP server exposing serial-port access (open/read/write/exec/clos
 repository = "https://github.com/umair-as/mcp-serial-rs"
 readme = "README.md"
 # MSRV follows rmcp: 1.75 → 1.85 for the edition-2024 chain behind
-# rmcp 1.x, then → 1.88 for rmcp 3.x (MCP 2026-07-28).
+# rmcp 1.x, then → 1.88 for rmcp 3.x (MCP 2026-07-28). Keep in sync with
+# the `msrv` job's toolchain in ci.yml.
 rust-version = "1.88"
+# MSRV-aware resolution: rmcp 3.x allows `uuid` releases that need a newer
+# toolchain, and this keeps the lockfile on versions that build at 1.88.
+resolver = "3"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
