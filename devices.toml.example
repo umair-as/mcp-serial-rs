@@ -17,9 +17,9 @@
 #   description   — human-readable label returned in list_ports
 #   probe         — regex pattern expected after opening (for future serial.identify)
 #   tags          — freeform labels for filtering and documentation
-#   privileged    — optional bool (default false). true → sessions opened via
-#                   this profile default to write_policy=confirm (writes need an
-#                   explicit confirm=true). Use for interactive/privileged shells.
+#   privileged    — optional bool (default false). true → sessions on this
+#                   profile default to write_policy=confirm, and callers cannot
+#                   lower it. Set it where you want every write approved.
 #   line_ending   — optional exec terminator: none (default), lf, cr, or crlf
 #   echo_mode     — optional echo contract: unknown (default), none, or line
 #   semantic_prompt — optional output boundary parser: none (default) or osc3008
@@ -54,7 +54,7 @@ baud         = 115200
 description  = "Raspberry Pi 5 debug UART (WCH CH340)"
 probe        = "login:|#|\\$"
 tags         = ["linux", "rpi5", "gateway"]
-privileged   = true
+# privileged = true   # uncomment to require approval for every write
 line_ending  = "lf"
 echo_mode    = "line"
 semantic_prompt = "osc3008"

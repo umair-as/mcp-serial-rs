@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Per-port `Session`: state machine (`Opening → Ready → Closing → Closed`,
-//! CLAUDE.md §5) and the owned port handle.
+//! CLAUDE.md) and the owned port handle.
 //!
 //! The port is held behind `Arc<tokio::sync::Mutex<P>>` so I/O can take place
 //! off the manager-wide lock: under the manager lock we clone the `Arc`, then
@@ -30,7 +30,8 @@ use crate::serial::policy::CommandPolicy;
 )]
 #[serde(rename_all = "lowercase")]
 pub enum WritePolicy {
-    /// Writes proceed unconditionally. The default; preserves prior behavior.
+    /// Writes proceed with no per-write check. The default, and the right
+    /// choice for normal console work.
     #[default]
     Allow,
     /// Each write is approved first. On a client that supports form

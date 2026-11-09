@@ -3,7 +3,7 @@
 //! Append-only JSONL traffic journal for every MCP tool call.
 //!
 //! One line per [`JournalEntry`]; each tool invocation produces a `call`
-//! entry before dispatch and a `result` entry after. Per CLAUDE.md §6 this
+//! entry before dispatch and a `result` entry after. Per CLAUDE.md this
 //! is always-on auditing — not opt-in — but I/O failures degrade gracefully.
 //! Open failure leaves the server with no journal handle; per-row failures are
 //! logged via `tracing::warn` and the writer is retained for later retry.
@@ -15,7 +15,7 @@
 //!
 //! Time format: ISO 8601 UTC with millisecond precision
 //! (`YYYY-MM-DDTHH:MM:SS.sssZ`). Hand-rolled rather than pulling in a date
-//! crate — CLAUDE.md §2 forbids new runtime dependencies without approval.
+//! crate, to avoid a new runtime dependency.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

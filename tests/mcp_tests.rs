@@ -799,9 +799,9 @@ async fn tools_list_contains_dotted_tools_with_input_schema() {
             .unwrap_or_else(|| panic!("tool `{name}` must set destructiveHint"));
         let expected_destructive = matches!(
             name,
-            // Reads consume local input but change nothing on the device, so
-            // hosts that honour annotations need not prompt for every read.
-            "serial.write" | "serial.clear_input" | "serial.exec" | "serial.close"
+            // Reads consume local input and close only releases the port. Neither
+            // changes the device, so hosts that honour annotations need not prompt.
+            "serial.write" | "serial.clear_input" | "serial.exec"
         );
         assert_eq!(
             destructive, expected_destructive,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! `SessionManager`: owns the `HashMap<SessionId, Session>` and enforces the
-//! `MAX_SESSIONS` cap from `config.rs`. See CLAUDE.md §5.
+//! `MAX_SESSIONS` cap from `config.rs`. See CLAUDE.md.
 //!
 //! The manager is generic over [`SerialBackend`] so unit tests can substitute
 //! a mock that never touches a real device.
@@ -1070,7 +1070,7 @@ fn visible_match_details(
 ///
 /// The data under the lock is a plain `HashMap` and a `u64` RNG state; neither
 /// is mid-mutation across an unwind boundary, so reading them after a poison
-/// is safe. This keeps library code free of `expect()` per CLAUDE.md §8.
+/// is safe. This keeps library code free of `expect()` per CLAUDE.md.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }

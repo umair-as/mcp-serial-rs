@@ -89,7 +89,7 @@ are never journaled.
 - Not done here: completion for session IDs, a URL-mode elicitation, or
   eliciting on legacy clients through the deprecated server-initiated path.
 
-## Amendment (2026-10-20): a dialog people can answer
+## Amendment: a dialog people can answer
 
 The first test with a real client (Claude Code, against a serial console)
 showed that the gate works, but the dialog was hard to answer correctly:

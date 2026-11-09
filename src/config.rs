@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Compile-time configuration constants and runtime device profiles.
-//! See CLAUDE.md §6.
+//! See CLAUDE.md ("Config & safety").
 //!
 //! Hard limits stay as `pub const` so they participate in type-checking at
 //! every call site. Two configuration items are runtime-tunable:
@@ -58,7 +58,7 @@ pub const DEFAULT_DEVICES_PATH: &str = "devices.toml";
 
 /// Env var pointing at the JSONL traffic-journal file. Set to override the
 /// default user-private state path. The journal is always-on (per
-/// CLAUDE.md §6); if the path is unwritable, the server logs a warning and
+/// CLAUDE.md); if the path is unwritable, the server logs a warning and
 /// runs in degraded mode without auditing rather than failing to start.
 pub const JOURNAL_ENV: &str = "MCP_SERIAL_JOURNAL";
 
@@ -134,8 +134,8 @@ pub struct DeviceProfile {
     pub deny_patterns: Vec<String>,
     pub allow_patterns: Vec<String>,
     /// When true, sessions opened via this profile default to a `confirm`
-    /// write policy (each write is approved first; see `WritePolicy`). Use for
-    /// profiles that land on an interactive / privileged shell. A caller may
+    /// write policy (each write is approved first; see `WritePolicy`). Set it on
+    /// boards where the operator wants every write approved. A caller may
     /// still escalate to `deny` at `serial.open`, but cannot downgrade below
     /// `confirm`. Absent/false → `allow` default.
     pub privileged: bool,

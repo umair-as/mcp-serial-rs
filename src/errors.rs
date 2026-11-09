@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Typed errors for the serial library, with one-to-one mapping to JSON-RPC
-//! error codes. See CLAUDE.md §1 ("thiserror, not anyhow") and §7.
+//! error codes. See CLAUDE.md ("`thiserror`, never `anyhow`") and ADR 0001.
 //!
 //! Server-defined error codes occupy the JSON-RPC reserved range -32000..=-32099.
 //! Each `SerialError` variant has a unique code so clients can branch on it
