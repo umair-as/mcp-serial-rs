@@ -252,10 +252,15 @@ The file shipped at `devices.toml.example` is a working template. Copy it to
 `MCP_SERIAL_DEVICES` to point anywhere else. A missing file is not an error;
 profiles are optional and named-device opens simply return `DeviceNotFound`.
 
-A `devices.toml` in the working directory is not read, because a repository an
-agent can edit must not be able to change device policy. The server warns at
+The working directory is not searched for a `devices.toml`, because a repository
+an agent can edit must not be able to change device policy. The server warns at
 startup if it finds one there, and if the profile file is writable by other
-users.
+users. A relative `MCP_SERIAL_DEVICES` path does resolve against the working
+directory, so use an absolute one.
+
+**Upgrading from 0.5.0 or earlier.** Move any `./devices.toml` to the location
+above. Until you do, the server runs with no profiles and only a warning on
+stderr, so a board marked `privileged` opens with the default `allow` policy.
 
 **CP2102 clone caveat.** Counterfeit CP2102 chips often report `iSerial=0001`.
 If you have more than one, tighten the profile with `match_vid` / `match_pid`

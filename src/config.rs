@@ -77,7 +77,8 @@ pub const DEFAULT_JOURNAL_PATH: &str = ".mcp-serial-rs/audit.jsonl";
 /// Resolve the device-profile path: [`DEVICES_ENV`] if set, else
 /// `devices.toml` under the user's config directory. `None` when no config
 /// directory can be determined; profiles are optional, so that is not an
-/// error. The working directory is never consulted.
+/// error. The working directory is never searched; only a relative
+/// [`DEVICES_ENV`] value resolves against it.
 pub fn devices_path() -> Option<PathBuf> {
     resolve_devices_path(
         std::env::var_os(DEVICES_ENV),
@@ -86,12 +87,17 @@ pub fn devices_path() -> Option<PathBuf> {
     )
 }
 
+/// An empty [`DEVICES_ENV`] value counts as unset.
+fn non_empty(value: Option<OsString>) -> Option<OsString> {
+    value.filter(|value| !value.is_empty())
+}
+
 fn resolve_devices_path(
     explicit: Option<OsString>,
     xdg_config_home: Option<OsString>,
     home: Option<OsString>,
 ) -> Option<PathBuf> {
-    if let Some(path) = explicit.filter(|path| !path.is_empty()) {
+    if let Some(path) = non_empty(explicit) {
         return Some(PathBuf::from(path));
     }
     // The XDG spec says to ignore a relative value. Honouring one here would
@@ -110,7 +116,7 @@ fn resolve_devices_path(
 /// True when a `devices.toml` sits in the working directory and is being
 /// ignored because [`DEVICES_ENV`] does not point anywhere.
 pub fn legacy_devices_file_ignored() -> bool {
-    std::env::var_os(DEVICES_ENV).is_none() && Path::new(LEGACY_DEVICES_FILE).is_file()
+    non_empty(std::env::var_os(DEVICES_ENV)).is_none() && Path::new(LEGACY_DEVICES_FILE).is_file()
 }
 
 /// True when someone other than the owner can modify the profile file, and

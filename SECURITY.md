@@ -39,9 +39,10 @@ Out of scope (must be stated to users):
 - Run process as a non-root user with least privilege (only required group memberships, e.g. `dialout`).
 
 - Load device profiles from the user's config directory or an explicit
-  `MCP_SERIAL_DEVICES` path, never the working directory, so a repository an
-  agent can edit cannot supply or strip device policy. Warn when the file is
-  writable by other users.
+  `MCP_SERIAL_DEVICES` path. The working directory is never searched, so a
+  repository an agent can edit cannot supply or strip device policy; only a
+  relative `MCP_SERIAL_DEVICES` value, which the operator sets, resolves against
+  it. Warn when the file is writable by other users.
 
 ### 2a) Server-owned command policy
 

@@ -250,7 +250,8 @@ fn fault_setup(
 ) {
     let backend = FaultBackend::new(behavior);
     let sessions = Arc::new(SessionManager::new(backend.clone()));
-    let server = McpServer::new(sessions.clone(), Arc::new(Vec::new()), None);
+    let server = McpServer::new(sessions.clone(), Arc::new(Vec::new()), None)
+        .with_global_deny_patterns(Vec::new());
     (server, sessions, backend)
 }
 
@@ -283,6 +284,7 @@ fn stub_mcp_server(
         Arc::new(mcp_serial_rs::serial::resolve_device),
         Arc::new(|_: &str, _: &[DeviceProfile]| Ok(None)),
     )
+    .with_global_deny_patterns(Vec::new())
 }
 
 /// Build an `McpServer` backed by [`StubBackend`] with the supplied
@@ -1600,7 +1602,8 @@ fn policy_test_server() -> (
             None,
             resolver,
             Arc::new(|_: &str, _: &[DeviceProfile]| Ok(None)),
-        ),
+        )
+        .with_global_deny_patterns(Vec::new()),
         sessions,
         backend,
     )
@@ -3874,7 +3877,8 @@ async fn stub_server_with_journal(
     let writer = mcp_serial_rs::serial::journal::JournalWriter::try_open_arc(path)
         .await
         .expect("journal open in test must succeed");
-    let server = McpServer::new(sessions.clone(), Arc::new(Vec::new()), Some(writer));
+    let server = McpServer::new(sessions.clone(), Arc::new(Vec::new()), Some(writer))
+        .with_global_deny_patterns(Vec::new());
     (server, sessions, backend)
 }
 
@@ -4505,7 +4509,8 @@ fn port_profile_test_server() -> (McpServer<StubBackend>, Arc<SessionManager<Stu
             None,
             device_resolver,
             port_resolver,
-        ),
+        )
+        .with_global_deny_patterns(Vec::new()),
         sessions,
     )
 }

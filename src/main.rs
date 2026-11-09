@@ -129,7 +129,7 @@ where
             "--help" | "-h" => {
                 writeln!(
                     stdout,
-                    "{} {}\n\nUsage: {} [--version|--help]\n\nWith no flags, starts the MCP stdio server.\n\nDevice profiles are optional. They are read from MCP_SERIAL_DEVICES, else\n$XDG_CONFIG_HOME/mcp-serial-rs/devices.toml (by default\n~/.config/mcp-serial-rs/devices.toml). The working directory is not read.",
+                    "{} {}\n\nUsage: {} [--version|--help]\n\nWith no flags, starts the MCP stdio server.\n\nDevice profiles are optional. They are read from MCP_SERIAL_DEVICES, else\n$XDG_CONFIG_HOME/mcp-serial-rs/devices.toml (by default\n~/.config/mcp-serial-rs/devices.toml). The working directory is not searched.",
                     env!("CARGO_PKG_NAME"),
                     env!("CARGO_PKG_VERSION"),
                     env!("CARGO_PKG_NAME"),

@@ -47,8 +47,9 @@ installs the binary receives it. The source of that copy is
    the exact prompt, such as `root@host:~# `, `=> `, or `uart:~\$ `: a broad
    pattern can match inside the output. `serial.write` returns no device
    output, so use `serial.exec` for a command and its response. See
-   `docs/console-recipes.md` for shell, bootloader, and RTOS examples. For shell-like profiles, use their declared `line_ending`,
-   `echo_mode`, and `semantic_prompt` defaults; per-call overrides are explicit
+   `docs/console-recipes.md` for shell, bootloader, and RTOS examples. For
+   shell-like profiles, use their declared `line_ending`, `echo_mode`, and
+   `semantic_prompt` defaults; per-call overrides are explicit
    and should be used only when the target behavior is known.
    A session with a command policy accepts mutations only through `serial.exec`;
    `serial.write` is refused server-side to prevent split-command evasion.

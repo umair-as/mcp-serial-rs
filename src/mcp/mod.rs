@@ -94,11 +94,11 @@ impl<B: SerialBackend> Clone for McpServer<B> {
     }
 }
 
-/// Longest caller-supplied session id written to a log field. Real ids are
-/// 32 characters; this leaves room to recognise a malformed one.
+/// Longest caller-supplied identifier written to a log field. Real session
+/// ids are 32 characters; this leaves room to recognise a malformed one.
 const MAX_TRACED_ID_CHARS: usize = 64;
 
-/// Bounded, escaped form of a caller-supplied session id for log fields, so
+/// Bounded, escaped form of a caller-supplied identifier for log fields, so
 /// a hostile value cannot flood stderr or inject terminal controls.
 fn traced_id(id: &str) -> String {
     id.chars()
@@ -205,7 +205,11 @@ impl<B: SerialBackend> McpServer<B> {
         output_schema = tool_output_schema::<OpenResult>(),
         annotations(title = "Open serial session", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
-    #[instrument(skip(self, params), fields(port = ?params.0.port, device = ?params.0.device, baud = ?params.0.baud))]
+    #[instrument(skip(self, params), fields(
+        port = ?params.0.port.as_deref().map(traced_id),
+        device = ?params.0.device.as_deref().map(traced_id),
+        baud = ?params.0.baud,
+    ))]
     pub async fn open(&self, params: Parameters<OpenParams>) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
 
