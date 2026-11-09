@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! `SessionManager`: owns the `HashMap<SessionId, Session>` and enforces the
-//! `MAX_SESSIONS` cap from `config.rs`. See CLAUDE.md §5.
+//! `MAX_SESSIONS` cap from `config.rs`. See CLAUDE.md.
 //!
 //! The manager is generic over [`SerialBackend`] so unit tests can substitute
 //! a mock that never touches a real device.
@@ -50,6 +50,7 @@ fn map_open_error(e: tokio_serial::Error, port: &str) -> SerialError {
     match e.kind {
         tokio_serial::ErrorKind::NoDevice => SerialError::PortBusy {
             port: port.to_string(),
+            session_id: None,
         },
         tokio_serial::ErrorKind::Io(std::io::ErrorKind::NotFound) => SerialError::PortNotFound {
             port: port.to_string(),
@@ -295,13 +296,14 @@ impl<B: SerialBackend> SessionManager<B> {
         // Reserve a slot synchronously.
         let session_id = {
             let mut inner = lock(&self.inner);
-            if inner
+            if let Some((holder, _)) = inner
                 .sessions
-                .values()
-                .any(|session| session.port_path == port_path)
+                .iter()
+                .find(|(_, session)| session.port_path == port_path)
             {
                 return Err(SerialError::PortBusy {
                     port: port_path.to_string(),
+                    session_id: Some(holder.clone()),
                 });
             }
             if inner.sessions.len() >= config::MAX_SESSIONS {
@@ -430,6 +432,11 @@ impl<B: SerialBackend> SessionManager<B> {
         // (lock wait, write, flush) is bounded by the session default captured
         // at `serial.open`, not a fixed global.
         let (port, timeout_ms) = self.checkout_port_and_timeout(session_id)?;
+        // An empty write changes nothing on the device: the session is still
+        // validated (above), but the port lock, write, and flush are skipped.
+        if data.is_empty() {
+            return Ok(0);
+        }
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let mut guard = lock_port(&port, deadline, timeout_ms, cancellation.clone()).await?;
         self.ensure_port_still_ready(session_id, &port)?;
@@ -1063,7 +1070,7 @@ fn visible_match_details(
 ///
 /// The data under the lock is a plain `HashMap` and a `u64` RNG state; neither
 /// is mid-mutation across an unwind boundary, so reading them after a poison
-/// is safe. This keeps library code free of `expect()` per CLAUDE.md §8.
+/// is safe. This keeps library code free of `expect()` per CLAUDE.md.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -1352,7 +1359,10 @@ mod tests {
             .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
             .await
             .unwrap_err();
-        assert!(matches!(err, SerialError::PortBusy { .. }));
+        assert!(matches!(
+            &err,
+            SerialError::PortBusy { session_id: Some(holder), .. } if *holder == id
+        ));
         m.close(&id).await.unwrap();
         m.open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
             .await
@@ -1398,7 +1408,10 @@ mod tests {
         let e =
             tokio_serial::Error::new(tokio_serial::ErrorKind::NoDevice, "Device or resource busy");
         match super::map_open_error(e, "/dev/ttyACM0") {
-            SerialError::PortBusy { port } => assert_eq!(port, "/dev/ttyACM0"),
+            SerialError::PortBusy { port, session_id } => {
+                assert_eq!(port, "/dev/ttyACM0");
+                assert_eq!(session_id, None);
+            }
             other => panic!("expected PortBusy, got {other:?}"),
         }
     }

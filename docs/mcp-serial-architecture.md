@@ -98,6 +98,10 @@ sequenceDiagram
     Server-->>Client: closed
 ```
 
+A `2026-07-28` client skips `initialize` and `notifications/initialized` and
+sends its protocol version and capabilities in each request's `_meta` (ADR
+0008).
+
 `serial.exec` is a single manager-level operation. It holds the per-session port
 lock across optional input clearing, command write, flush, and read-until. This
 prevents another same-session request from consuming or injecting bytes between
@@ -107,7 +111,8 @@ check and the existing write-policy gate; line-echo mode delays regex matching
 until after the echo boundary. A profile/global command policy is also captured
 at open and gates the complete command before port checkout. Guarded sessions
 refuse raw writes so policy matching cannot be bypassed by split input; see ADR
-0007.
+0007. On a `confirm` session the write gate may answer with an `input_required`
+elicitation before anything is sent; see ADR 0009.
 
 ## Current Tool Surface
 

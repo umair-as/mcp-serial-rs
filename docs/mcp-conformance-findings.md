@@ -2,8 +2,6 @@
 
 # MCP Conformance Findings
 
-Date: 2026-07-15 (re-baselined 2026-10-19 for MCP `2026-07-28`)
-
 Scope: review of `mcp-serial-rs` against the MCP `2026-07-28` tools model
 (with `2025-11-25` compatibility), the exact local `rmcp = 3.5` API,
 repository tests/docs, and a live probe of the installed MCP server against
@@ -27,9 +25,9 @@ The server intentionally implements a narrow tools-only MCP surface over stdio:
 - static tool list with no list-change notification.
 
 This is MCP-compliant as a tools-only server. Resources, prompts, progress,
-completion, MRTR/elicitation, and the tasks extension are optional protocol
-features and are tracked below as deferred enhancements, not compliance
-failures. Roots, sampling, and logging are deprecated in `2026-07-28` and are
+completion, and the tasks extension are optional protocol features and are
+tracked below as deferred enhancements, not compliance failures. Elicitation
+through MRTR is implemented for `write_policy = "confirm"` (ADR 0009). Roots, sampling, and logging are deprecated in `2026-07-28` and are
 intentionally not implemented.
 
 ## Live Probe Evidence

@@ -92,3 +92,23 @@ The `confirm` mode's honest limitation — self-satisfiable by an automated
 caller — is documented, not hidden: its value is the deliberate second step,
 the audit record, and the future human-in-the-loop seam, with `deny` as the
 real hard gate.
+
+## Amendment: which policy agents should pick
+
+The agent guidance told callers to choose `deny` or `confirm` whenever a port
+"may land on an interactive or privileged shell". That describes nearly every
+console, including RTOS shells that have no login at all. Routine work then
+produced a dialog for every write, and approving them became reflexive, which
+gives little protection at the cost of a lot of friction.
+
+The operator who runs this local server already chose which ports it can reach.
+`AGENTS.md`, `SERVER_INSTRUCTIONS`, and the `serial.open` schema now tell agents
+to omit `write_policy` for normal console work, to use `deny` only for passive
+observation, and to use `confirm` only when the operator asks. Enforcement is
+unchanged: an operator who wants approval on a board sets `privileged = true`,
+and the allowlist and command policies still apply. `allow` means the server
+will not stop a write; it is not permission to run a destructive command.
+
+The trade-off: unless the operator sets one of those controls, the defence
+against injected device text that motivated this ADR rests on the agent, and on
+whatever approval the host itself applies.

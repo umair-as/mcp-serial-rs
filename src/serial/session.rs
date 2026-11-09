@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Per-port `Session`: state machine (`Opening → Ready → Closing → Closed`,
-//! CLAUDE.md §5) and the owned port handle.
+//! CLAUDE.md) and the owned port handle.
 //!
 //! The port is held behind `Arc<tokio::sync::Mutex<P>>` so I/O can take place
 //! off the manager-wide lock: under the manager lock we clone the `Arc`, then
@@ -30,12 +30,14 @@ use crate::serial::policy::CommandPolicy;
 )]
 #[serde(rename_all = "lowercase")]
 pub enum WritePolicy {
-    /// Writes proceed unconditionally. The default; preserves prior behavior.
+    /// Writes proceed with no per-write check. The default, and the right
+    /// choice for normal console work.
     #[default]
     Allow,
-    /// Writes require an explicit `confirm: true` on the call. A tripwire and
-    /// audit point (self-satisfiable by an automated caller), and the seam a
-    /// future MCP elicitation upgrade turns into a real human prompt.
+    /// Each write is approved first. On a client that supports form
+    /// elicitation the person is asked through the client and the caller's
+    /// `confirm` flag is ignored; on any other client the call needs
+    /// `confirm: true`, a tripwire the caller can satisfy itself.
     Confirm,
     /// Writes are refused server-side regardless of the call — a hard,
     /// model-proof read-only session. Reads/drains/clears are still allowed.

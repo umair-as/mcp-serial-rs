@@ -70,12 +70,12 @@ Names and field shapes are stable — do not rename (dotted `serial.open`, never
 | `serial.open` | `{port, baud?, timeout_ms?, write_policy?, deny_patterns?, line_ending?}` OR `{device, …same}` | `{session_id}` |
 | `serial.sessions` | — | `{sessions}` (each incl. policy + console settings) |
 | `serial.get_session` | `{session_id}` | `{session}` (incl. policy + console settings) |
-| `serial.write` | `{session_id, data, confirm?}` | `{bytes_written}` |
+| `serial.write` | `{session_id, data, confirm?, reason?}` | `{bytes_written}` |
 | `serial.read` | `{session_id, max_bytes?, timeout_ms?}` | `{data, status, timed_out, bytes_read, truncated, session_usable}` |
 | `serial.drain` | `{session_id, max_bytes?}` | read-shaped result, short idle deadline |
 | `serial.clear_input` | `{session_id, max_bytes?}` | `{status, bytes_read, discarded_bytes, truncated, session_usable}` |
 | `serial.read_until` | `{session_id, pattern, timeout_ms?}` | `{data, matched, status, bytes_read, match_details?}` |
-| `serial.exec` | `{session_id, command, expect, line_ending?, echo_mode?, semantic_prompt?, timeout_ms?, clear_before_write?, normalize_output?, confirm?}` | raw + best-effort command output, semantic status, and write/consume state |
+| `serial.exec` | `{session_id, command, expect, line_ending?, echo_mode?, semantic_prompt?, timeout_ms?, clear_before_write?, normalize_output?, confirm?, reason?}` | raw + best-effort command output, semantic status, and write/consume state |
 | `serial.close` | `{session_id}` | `{ok}` |
 
 Results are rmcp structured tool results (`CallToolResult::structured`); rmcp
@@ -87,7 +87,9 @@ produces is the ADR 0009 confirmation elicitation (`input_required`) from
 **Server instructions:** `mcp::SERVER_INSTRUCTIONS` is the machine-delivered
 copy of `AGENTS.md` (sent as `instructions` in `initialize` and
 `server/discover`). When you change the guidance in one, mirror it in the
-other. The tool list is static and advertised as cacheable for one hour to
+other. The guidance tells agents to omit `write_policy` for normal console
+work; don't reintroduce advice to pick `confirm`/`deny` because a port is a
+shell (ADR 0005 amendment). The tool list is static and advertised as cacheable for one hour to
 `2026-07-28` clients (`TOOLS_LIST_TTL_MS`); keep that true.
 
 **Behaviors that will bite you if you forget them:**
@@ -135,15 +137,19 @@ other. The tool list is static and advertised as cacheable for one hour to
   on a 2026-07-28 client that supports form elicitation (`form` or an empty
   capability; URL-only does not count), `gate_write` returns an
   MRTR `input_required` elicitation keyed by a digest of (session, tool,
-  exact bytes) and the model's `confirm: true` is ignored; the retry's answer
-  must be `accept` + `confirm: true`, else `ConfirmationDeclined` (-32016,
-  not retryable). On any other client it is the tripwire: `confirm: true` on
-  the call, else `ConfirmationRequired` (-32013) — `deny` is the guarantee.
+  exact bytes, `reason`) and the model's `confirm: true` is ignored. The form
+  has no fields (ADR 0009 amendment): `accept` sends, anything else is
+  `ConfirmationDeclined` (-32016, not retryable). The message leads with the
+  question and the full escaped payload; payloads over
+  `CONFIRM_REVIEW_MAX_CHARS` (120, as displayed) are refused before asking,
+  and an empty raw `write` needs no approval. On any other client it is the
+  tripwire: `confirm: true` on the call, else `ConfirmationRequired`
+  (-32013) — `deny` is the guarantee.
   All cheaper refusals (size, `expect`, raw-write, command policy) run
   *before* the person is asked; never reorder them after it. Effective
   policy = most-restrictive of the caller's `write_policy` and any `privileged`
   device-profile default (`Allow < Confirm < Deny`): callers may escalate, never
-  downgrade a privileged profile. Both errors are tool errors with
+  downgrade a privileged profile. The gate errors are tool errors with
   `command_written=false`, `session_usable=true`. Success shapes are unchanged;
   the audit journal records denials via `error_code`/`error_type` plus a
   metadata-only `confirm` flag. (See `docs/adr/0005`.)
@@ -195,13 +201,16 @@ MAX_TIMEOUT_MS   = 30_000;      // all caller timeouts clamped to this
 | `MCP_SERIAL_ALLOWLIST` | Comma-separated globs; when set, *replaces* the compiled-in list. Used by tests under `/tmp` and non-standard hosts. | compiled-in list |
 | `MCP_SERIAL_DEVICES` | TOML of device profiles. Missing file is not an error. | `./devices.toml` |
 | `MCP_SERIAL_JOURNAL` | Append-only JSONL **tool-call** journal (call row + result row per `tools/call`; lifecycle traffic not journaled). Summaries are **metadata-only** — byte counts, statuses, error codes, bounded arg keys; never command/output payloads or error messages. Best-effort: unwritable/unsafe paths degrade to a `tracing::warn` and continue. I/O is deadline-bounded; file `0600`, parent `0700`, symlinks/non-regular files rejected on Unix. | `$XDG_STATE_HOME/mcp-serial-rs/audit.jsonl`, else `~/.local/state/...` |
+| `MCP_SERIAL_DENY_PATTERNS` | JSON array of extra deny regexes applied to every session's `serial.exec` commands. Setting it makes every session guarded. | unset |
 | `RUST_LOG` | `tracing-subscriber` filter. | `mcp_serial_rs=info` |
 
 **Device profiles** are an *optional convenience* for pinned local
 environments, not the headline workflow — the primary path is `list_ports` →
 pick an allowlisted port → `open` with `port`. Each profile is keyed by a short
 name with `match_serial`, `match_vid?`, `match_pid?`, `baud`, `description`,
-`probe?`, `tags`. `list_ports` enriches matched ports with `device` +
+`probe?`, `tags`, plus optional `privileged`, console defaults (`line_ending`,
+`echo_mode`, `semantic_prompt`), and `deny_patterns` / `allow_patterns`.
+`list_ports` enriches matched ports with `device` +
 `description`; `open` accepts `{device}` (profile `baud` is the default) and
 returns `DeviceNotFound` if the profile is unknown or unplugged. Preserve the
 support and its tests; don't expand profile coverage.

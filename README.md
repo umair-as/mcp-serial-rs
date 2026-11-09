@@ -1,8 +1,8 @@
 # mcp-serial-rs
 
 [![CI](https://github.com/umair-as/mcp-serial-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/umair-as/mcp-serial-rs/actions/workflows/ci.yml)
-![Rust MSRV](https://img.shields.io/badge/rust-1.85%2B-orange)
-![MCP](https://img.shields.io/badge/MCP-2025--11--25-blue)
+![Rust MSRV](https://img.shields.io/badge/rust-1.88%2B-orange)
+![MCP](https://img.shields.io/badge/MCP-2026--07--28-blue)
 ![Transport](https://img.shields.io/badge/transport-stdio-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)
 
@@ -29,7 +29,7 @@ cargo test
 MSRV 1.88. Edition 2021. The 1.88 floor is required by `rmcp` 3.x,
 which implements MCP `2026-07-28` while still negotiating the legacy
 `initialize` handshake with `2025-11-25` clients (see ADR 0008). See
-`CLAUDE.md §1–2` for the dependency rationale. The protocol layer is the `rmcp` SDK over its
+`docs/adr/` for the design rationale. The protocol layer is the `rmcp` SDK over its
 stdio transport; this crate owns the serial domain (sessions, the
 device-profile registry, the allowlist, the audit journal) and
 registers the `serial.*` tools with the SDK.
@@ -71,7 +71,8 @@ calls return an MCP tool result whose parsed payload lives under
 `result.structuredContent` (a text rendering is also present in
 `result.content` for clients that do not read structured output).
 
-With four boards attached and `devices.toml` from this repo, the
+With four boards attached and a `devices.toml` based on
+`devices.toml.example`, the
 `serial.list_ports` call above answers with:
 
 ```json
@@ -83,7 +84,7 @@ With four boards attached and `devices.toml` from this repo, the
       "ports": [
         {"port":"/dev/ttyUSBx","vid":4292,"pid":60000,
          "serial":"AABBCCDD00001111",
-         "device":"lab-node","description":"Lab device console (CP2102N)"},
+         "device":"esp32c6","description":"ESP32-C6 Zephyr DFU target (CP2102N)"},
         {"port":"/dev/ttyACM0","vid":6790,"pid":21971,"serial":"EXAMPLE001",
          "device":"rpi5","description":"Raspberry Pi 5 debug UART (WCH CH340)"},
         {"port":"/dev/ttyUSB0","vid":4292,"pid":60000,"serial":"0001",
@@ -106,14 +107,14 @@ SDK generates input and output schemas from typed Rust structs.
 |---|---|---|
 | `serial.list_ports` | — | `{ports: [{port, vid, pid, serial, device, description}]}` |
 | `serial.open` | `{port, baud?, timeout_ms?, write_policy?, deny_patterns?, line_ending?}` **or** `{device, …same}` | `{session_id}` (32-char random hex) |
-| `serial.sessions` | — | `{sessions: [{session_id, port, baud, state, default_timeout_ms, write_policy, console_settings}]}` |
+| `serial.sessions` | — | `{sessions: [{session_id, port, baud, state, default_timeout_ms, write_policy, console_settings, command_policy}]}` |
 | `serial.get_session` | `{session_id}` | `{session}` (includes policy and console settings) |
-| `serial.write` | `{session_id, data, confirm?}` (≤ 4 KiB) | `{bytes_written}` |
+| `serial.write` | `{session_id, data, confirm?, reason?}` (≤ 4 KiB) | `{bytes_written}` |
 | `serial.read` | `{session_id, max_bytes?, timeout_ms?}` | `{data, status, timed_out, bytes_read, truncated, session_usable, output_is_untrusted}` |
 | `serial.drain` | `{session_id, max_bytes?}` | same shape as `serial.read`, with a short idle deadline |
 | `serial.clear_input` | `{session_id, max_bytes?}` | `{status, bytes_read, discarded_bytes, truncated, session_usable}` |
 | `serial.read_until` | `{session_id, pattern, timeout_ms?}` | `{data, matched, status, bytes_read, truncated, match_details?, session_usable, output_is_untrusted}` |
-| `serial.exec` | `{session_id, command, expect, line_ending?, echo_mode?, semantic_prompt?, timeout_ms?, clear_before_write?, normalize_output?, confirm?}` | raw output plus optional normalized/command output, semantic status, byte counts, match details, and write state |
+| `serial.exec` | `{session_id, command, expect, line_ending?, echo_mode?, semantic_prompt?, timeout_ms?, clear_before_write?, normalize_output?, confirm?, reason?}` | raw output plus optional normalized/command output, semantic status, byte counts, match details, and write state |
 | `serial.close` | `{session_id}` | `{ok}` |
 
 `serial.open` accepts either a literal `port` path or a `device` profile name
@@ -126,27 +127,46 @@ exclusive OS access as defense in depth.
 Each session carries a **write policy** set at `open` (`write_policy`), enforced
 before any bytes reach the device:
 
-- `allow` (default) — writes proceed as before.
-- `deny` — a read-only session. `serial.write` / `serial.exec` are refused
+- `allow` (default) — writes proceed. This is the right choice for normal
+  console work on a Linux console, an RTOS shell, or a bootloader prompt: whoever
+  runs this local server already chose which ports it can reach. It is not
+  permission to run destructive commands.
+- `deny` — a read-only session for passive observation. `serial.write` / `serial.exec` are refused
   server-side with `WriteForbidden` (`-32012`) regardless of the request; reads,
   `drain`, and `clear_input` still work. This is model-proof: no bug and no
   injected device text can cause a write.
-- `confirm` — each write is approved first. On an MCP `2026-07-28` client that
+- `confirm` — each write is approved first, for when the operator wants that.
+  On an MCP `2026-07-28` client that
   supports form elicitation (an `elicitation` capability with `form`, or an
   empty one), the server answers `tools/call` with an `input_required`
-  elicitation showing the complete, escaped bytes; the host asks the
-  person, and the model's own `confirm: true` is ignored. Only an accepted
-  answer with `confirm: true` proceeds; anything else is `ConfirmationDeclined`
-  (`-32016`, not retryable). The answer is bound to the exact payload, so a
-  changed command is asked again. On any other client this is the original
+  elicitation that asks "Send N byte(s) to <port>?", then shows the complete,
+  escaped bytes (for `exec`, the command plus its line ending), the caller's
+  optional `reason` as untrusted text, and the session details. The form has
+  no fields: the host's Accept sends, Decline or Cancel refuses
+  (`ConfirmationDeclined`, `-32016`, not retryable), and the model's own
+  `confirm: true` is ignored. The answer is bound to the exact payload and
+  `reason`, so a changed command or explanation is asked again. Payloads longer
+  than 120 characters as displayed are refused before anyone is asked
+  (`InvalidParam`, `-32008`), because hosts may clip long lines; an empty
+  `serial.write` needs no approval. On any other client this is the original
   tripwire: `confirm: true` on the call, else `ConfirmationRequired`
   (`-32013`) — an audit seam, not a hard gate. Use `deny` when you need a
   guarantee that does not depend on the client. See `docs/adr/0009`.
 
 The effective policy is the most restrictive of the caller's `write_policy` and
 any `privileged` device-profile default (`allow < confirm < deny`), so a caller
-may escalate but never downgrade a privileged profile. Both gate errors carry
+may escalate but never downgrade a privileged profile. The gate errors
+(`WriteForbidden`, `ConfirmationRequired`, `ConfirmationDeclined`) carry
 `command_written=false` and `session_usable=true`. See `docs/adr/0005`.
+
+**Host prompts are separate.** Most MCP hosts ask before running a tool, before
+the call ever reaches this server, and each host has its own setting for it. To
+let an agent drive a console without those prompts, allow the `serial.*` tools
+in your host's settings. With that and an `allow` session, only the agent's own
+judgment stands between the model and whatever is on the console, including a
+root shell or a bootloader. That suits your own bench. Where it does not, use
+`deny`, `privileged = true`, or a command policy, which hold regardless of the
+host's settings.
 
 Domain validation and serial failures detected inside a tool call — unknown
 session, disallowed port, unknown device, malformed regex, oversized write,
@@ -214,9 +234,10 @@ console execution defaults (`line_ending`, `echo_mode`, and
     "params":{"name":"serial.open","arguments":{"device":"esp32c6"}}}
    ```
 
-A profile may also set `privileged = true` (optional, default false) for ports
-that open onto an interactive or privileged shell. Sessions opened via such a
-profile default to `write_policy = "confirm"`; a caller can still escalate to
+A profile may also set `privileged = true` (optional, default false) when the
+operator wants every write on that board approved. Sessions on such a profile,
+whether opened by `device` or by the literal path of the matching port, default
+to `write_policy = "confirm"`; a caller can still escalate to
 `deny` at `serial.open`, but cannot downgrade below `confirm`.
 
 The file shipped at `devices.toml.example` is a working template — copy to
@@ -234,6 +255,7 @@ or disambiguate via `/dev/serial/by-path` and hard-code the port path.
 |---|---|---|
 | `MCP_SERIAL_DEVICES` | Path to the device-profile TOML file | `./devices.toml` |
 | `MCP_SERIAL_ALLOWLIST` | Comma-separated glob patterns of openable device paths. When set, replaces the compiled-in list entirely. | unset → `/dev/ttyUSB*,/dev/ttyACM*` |
+| `MCP_SERIAL_DENY_PATTERNS` | JSON array of extra deny regexes applied to every session's `serial.exec` commands. Setting it makes every session guarded (no raw `serial.write`, and `serial.exec` needs a line ending). | unset |
 | `MCP_SERIAL_JOURNAL` | Append-only JSONL audit journal path (see below) | `$XDG_STATE_HOME/mcp-serial-rs/audit.jsonl`, else `~/.local/state/mcp-serial-rs/audit.jsonl` |
 | `RUST_LOG` | `tracing-subscriber` filter, e.g. `mcp_serial_rs=debug` | `mcp_serial_rs=info` |
 
@@ -297,7 +319,7 @@ was observed:
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"smoke","version":"0.1.0"}}}
 {"jsonrpc":"2.0","method":"notifications/initialized"}
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"serial.open","arguments":{"device":"rpi5","timeout_ms":2000}}}
-{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"serial.exec","arguments":{"session_id":"<from-#2>","command":"uname -a","expect":"[#>$] ","timeout_ms":8000,"clear_before_write":true,"normalize_output":true,"confirm":true}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"serial.exec","arguments":{"session_id":"<from-#2>","command":"uname -a","expect":"[#>$] ","timeout_ms":8000,"clear_before_write":true,"normalize_output":true}}}
 {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"serial.close","arguments":{"session_id":"<from-#2>"}}}
 EOF
 ```
@@ -317,7 +339,7 @@ per-port mutex.
 ## Tests
 
 ```sh
-cargo test                          # 140 total: 85 lib unit + 3 CLI + 51 MCP wire + 1 loopback
+cargo test                          # unit, CLI, MCP wire, and loopback tests
 cargo test --test loopback          # PTY round-trip — needs `socat`
 ```
 

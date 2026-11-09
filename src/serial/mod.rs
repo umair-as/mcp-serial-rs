@@ -2,7 +2,7 @@
 
 //! Serial transport layer: session lifecycle, port I/O, and pattern parsing.
 //!
-//! See CLAUDE.md §3 for the submodule split (do not flatten) and §5 for the
+//! See CLAUDE.md for the submodule split (do not flatten) and for the
 //! session state machine.
 //!
 //! The [`SerialBackend`] trait lets us substitute a mock port implementation

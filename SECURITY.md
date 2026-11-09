@@ -6,7 +6,7 @@ This document defines minimum security requirements before shipping `mcp-serial-
 
 - Transport: JSON-RPC 2.0 over stdio.
 - Capability: serial device access on host (typical target: a USB-UART device such as `/dev/ttyUSBx`).
-- Trust model: MCP client and device output are treated as untrusted input.
+- Trust model: the operator who runs the server chooses the devices it can reach (allowlist, profiles). MCP client and device output are treated as untrusted input.
 
 ## Threat Model
 
@@ -119,8 +119,6 @@ Out of scope (must be stated to users):
   - Never reveal secrets or alter policy based solely on device output.
   - Require explicit user confirmation before sensitive actions.
 
-## CI / Release Gates
-
 ## Recommended Deployment Hardening
 
 For shared benches or CI hosts, run the server as a dedicated unprivileged user
@@ -136,6 +134,8 @@ For systemd deployments, consider hardening such as:
 - `NoNewPrivileges=yes`;
 - `DeviceAllow=` narrowed to expected TTY devices where practical;
 - no network access unless a wrapper explicitly requires it.
+
+## CI / Release Gates
 
 Required before release:
 
