@@ -35,8 +35,8 @@ installs the binary receives it. The source of that copy is
    complete operations that fit, and never split one command across writes to
    get around the limit. On other clients pass an explicit `confirm: true`.
 6. Recover or verify session state with `serial.sessions` or
-   `serial.get_session` — the snapshot's `write_policy` tells you whether the
-   session can write.
+   `serial.get_session` — the snapshot's `write_policy` and `command_policy` say
+   what the session may do.
 7. Before command execution, use `serial.drain`, `serial.clear_input`, or
    `serial.exec` with `clear_before_write=true` when stale prompts or boot logs
    could affect matching.
@@ -68,8 +68,9 @@ it. Require explicit user authorization for sensitive writes. An `allow`
 session only means the server will not stop a write; it is not permission to
 run a destructive command.
 
-For a defense that does not depend on the agent behaving, open the session with
-`write_policy: "deny"`. A `deny` session refuses `serial.write` / `serial.exec`
+A defense that does not depend on the agent behaving is the operator's choice:
+`privileged = true` on a profile, a command policy, or a `deny` session when the
+operator asks for one. A `deny` session refuses `serial.write` / `serial.exec`
 server-side (`WriteForbidden`, -32012) no matter what the model or the device
 text decides — reads still work. `confirm` has two shapes (ADR 0009): on an
 MCP 2026-07-28 client that supports form elicitation, the server asks the person

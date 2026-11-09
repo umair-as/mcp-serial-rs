@@ -1618,11 +1618,10 @@ impl<B: SerialBackend> ServerHandler for McpServer<B> {
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         let result = self.tool_router.call(tcc).await;
 
-        // result row. Every `serial.*` handler returns a complete
-        // `CallToolResult`; the MRTR `InputRequired` and Tasks `Task`
-        // variants are not produced by this server (ADR 0008), so the
-        // journal only needs the complete/error shapes. Should the router
-        // ever hand back another variant, record its kind rather than
+        // result row. `serial.*` handlers return a complete `CallToolResult`,
+        // except the ADR 0009 confirmation elicitation (`InputRequired`) from
+        // `write`/`exec`. The Tasks `Task` variant is not produced by this
+        // server. For any non-complete variant, record its kind rather than
         // silently dropping the row.
         if let Some(j) = &self.journal {
             let entry = match &result {
