@@ -14,17 +14,19 @@ use std::sync::Arc;
 
 use rmcp::transport;
 use rmcp::ServiceExt;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use mcp_serial_rs::config;
+use mcp_serial_rs::errors::SerialError;
 use mcp_serial_rs::mcp::McpServer;
 use mcp_serial_rs::serial::journal::JournalWriter;
 use mcp_serial_rs::serial::manager::{SessionManager, TokioSerialBackend};
 
-/// Load device profiles. They are optional: any problem is logged and the
-/// server continues with an empty list, so `serial.list_ports` and
-/// `serial.open(port=...)` still work.
-fn load_profiles() -> Vec<config::DeviceProfile> {
+/// Load device profiles. They are optional, so a missing file or config
+/// directory means an empty list. A file that exists but cannot be read or
+/// parsed is an error: continuing would silently drop its `privileged` and
+/// command-policy settings.
+fn load_profiles() -> Result<Vec<config::DeviceProfile>, SerialError> {
     if config::legacy_devices_file_ignored() {
         warn!(
             file = config::LEGACY_DEVICES_FILE,
@@ -34,7 +36,7 @@ fn load_profiles() -> Vec<config::DeviceProfile> {
     }
     let Some(path) = config::devices_path() else {
         warn!("no user config directory found; running without device profiles");
-        return Vec::new();
+        return Ok(Vec::new());
     };
     if config::is_group_or_world_writable(&path) {
         warn!(
@@ -42,20 +44,19 @@ fn load_profiles() -> Vec<config::DeviceProfile> {
             "device-profile file is writable by other users, who could change its policies"
         );
     }
-    match config::load_devices(&path) {
-        Ok(profiles) => {
-            info!(
-                count = profiles.len(),
-                path = %path.display(),
-                "loaded device profiles"
-            );
-            profiles
-        }
-        Err(e) => {
-            warn!(error = %e, path = %path.display(), "failed to load device profiles");
-            Vec::new()
-        }
-    }
+    let profiles = config::load_devices(&path).inspect_err(|e| {
+        error!(
+            error = %e,
+            path = %path.display(),
+            "refusing to start: fix or remove this device-profile file"
+        );
+    })?;
+    info!(
+        count = profiles.len(),
+        path = %path.display(),
+        "loaded device profiles"
+    );
+    Ok(profiles)
 }
 
 #[tokio::main]
@@ -82,7 +83,9 @@ async fn main() -> std::io::Result<()> {
         )
         .init();
 
-    let profiles = load_profiles();
+    let Ok(profiles) = load_profiles() else {
+        std::process::exit(1);
+    };
 
     // Open the audit journal. Failure is non-fatal: the server runs
     // in degraded mode (no journaling) for missing paths, permissions

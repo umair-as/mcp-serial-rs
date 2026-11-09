@@ -42,7 +42,8 @@ Out of scope (must be stated to users):
   `MCP_SERIAL_DEVICES` path. The working directory is never searched, so a
   repository an agent can edit cannot supply or strip device policy; only a
   relative `MCP_SERIAL_DEVICES` value, which the operator sets, resolves against
-  it. Warn when the file is writable by other users.
+  it. Warn when the file is writable by other users, and refuse to start when
+  it exists but cannot be read or parsed.
 
 ### 2a) Server-owned command policy
 

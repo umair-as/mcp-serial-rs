@@ -250,7 +250,9 @@ The file shipped at `devices.toml.example` is a working template. Copy it to
 `$XDG_CONFIG_HOME/mcp-serial-rs/devices.toml` (by default
 `~/.config/mcp-serial-rs/devices.toml`) and edit it, or set
 `MCP_SERIAL_DEVICES` to point anywhere else. A missing file is not an error;
-profiles are optional and named-device opens simply return `DeviceNotFound`.
+profiles are optional and named-device opens simply return `DeviceNotFound`. A
+file that exists but cannot be read or parsed stops the server from starting,
+so a typo cannot silently remove a `privileged` setting.
 
 The working directory is not searched for a `devices.toml`, because a repository
 an agent can edit must not be able to change device policy. The server warns at

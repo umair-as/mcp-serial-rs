@@ -284,6 +284,36 @@ fn binary_ignores_devices_file_in_working_directory() {
     );
 }
 
+/// Losing a file's `privileged` settings to a typo must not be silent. Null
+/// stdin means a regression ends at EOF instead of hanging the test.
+#[test]
+fn binary_refuses_to_start_on_unparseable_devices_file() {
+    let config_home = tempfile::tempdir().expect("tempdir");
+    let config_dir = config_home.path().join("mcp-serial-rs");
+    std::fs::create_dir(&config_dir).expect("config dir");
+    std::fs::write(config_dir.join("devices.toml"), "not [valid toml").expect("write file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mcp-serial-rs"))
+        .current_dir(config_home.path())
+        .env_remove("MCP_SERIAL_DEVICES")
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("HOME", config_home.path())
+        .env(
+            "MCP_SERIAL_JOURNAL",
+            config_home.path().join("journal.jsonl"),
+        )
+        .env("RUST_LOG", "mcp_serial_rs=info")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run server");
+
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{log}");
+    assert!(log.contains("refusing to start"), "{log}");
+    assert!(output.stdout.is_empty(), "stdout is for MCP frames only");
+}
+
 #[test]
 fn loopback_rmcp_open_write_echo_read_until_close() {
     if !socat_available() {
