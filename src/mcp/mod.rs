@@ -72,6 +72,8 @@ pub struct McpServer<B: SerialBackend> {
     journal: Option<Arc<JournalWriter>>,
     device_resolver: Arc<DeviceResolver>,
     port_profile_resolver: Arc<PortProfileResolver>,
+    /// Replaces the `MCP_SERIAL_DENY_PATTERNS` lookup when set.
+    global_deny_override: Option<Arc<Vec<String>>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -86,9 +88,23 @@ impl<B: SerialBackend> Clone for McpServer<B> {
             journal: self.journal.clone(),
             device_resolver: Arc::clone(&self.device_resolver),
             port_profile_resolver: Arc::clone(&self.port_profile_resolver),
+            global_deny_override: self.global_deny_override.clone(),
             tool_router: self.tool_router.clone(),
         }
     }
+}
+
+/// Longest caller-supplied session id written to a log field. Real ids are
+/// 32 characters; this leaves room to recognise a malformed one.
+const MAX_TRACED_ID_CHARS: usize = 64;
+
+/// Bounded, escaped form of a caller-supplied session id for log fields, so
+/// a hostile value cannot flood stderr or inject terminal controls.
+fn traced_id(id: &str) -> String {
+    id.chars()
+        .take(MAX_TRACED_ID_CHARS)
+        .flat_map(char::escape_default)
+        .collect()
 }
 
 #[tool_router(router = tool_router)]
@@ -136,8 +152,18 @@ impl<B: SerialBackend> McpServer<B> {
             journal,
             device_resolver,
             port_profile_resolver,
+            global_deny_override: None,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Use these global deny patterns instead of reading
+    /// `MCP_SERIAL_DENY_PATTERNS`, so tests need not mutate the process
+    /// environment.
+    #[doc(hidden)]
+    pub fn with_global_deny_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.global_deny_override = Some(Arc::new(patterns));
+        self
     }
 
     /// Enumerate allowlisted serial ports and annotate with matching device
@@ -260,9 +286,12 @@ impl<B: SerialBackend> McpServer<B> {
         // Most-restrictive wins (Allow < Confirm < Deny): a caller may escalate
         // a session's policy but never downgrade a privileged profile default.
         let write_policy = profile_policy.max(p.write_policy.unwrap_or_default());
-        let global_deny = match config::global_deny_patterns() {
-            Ok(patterns) => patterns,
-            Err(err) => return Ok(tool_error(err, None, false, false)),
+        let global_deny = match self.global_deny_override.as_deref() {
+            Some(patterns) => patterns.clone(),
+            None => match config::global_deny_patterns() {
+                Ok(patterns) => patterns,
+                Err(err) => return Ok(tool_error(err, None, false, false)),
+            },
         };
         let command_policy = match CommandPolicy::compile(
             &global_deny,
@@ -332,7 +361,7 @@ impl<B: SerialBackend> McpServer<B> {
         output_schema = tool_output_schema::<GetSessionResult>(),
         annotations(title = "Get serial session", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
-    #[instrument(skip(self, params), fields(session_id = %params.0.session_id))]
+    #[instrument(skip(self, params), fields(session_id = %traced_id(&params.0.session_id)))]
     pub async fn get_session(
         &self,
         params: Parameters<GetSessionParams>,
@@ -357,7 +386,7 @@ impl<B: SerialBackend> McpServer<B> {
         output_schema = tool_output_schema::<WriteResult>(),
         annotations(title = "Write serial bytes", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
-    #[instrument(skip_all, fields(session_id = %params.0.session_id, len = %params.0.data.len()))]
+    #[instrument(skip_all, fields(session_id = %traced_id(&params.0.session_id), len = %params.0.data.len()))]
     pub async fn write(
         &self,
         params: Parameters<WriteParams>,
@@ -433,7 +462,7 @@ impl<B: SerialBackend> McpServer<B> {
         output_schema = tool_output_schema::<ReadResult>(),
         annotations(title = "Read serial input", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
-    #[instrument(skip(self, params), fields(session_id = %params.0.session_id))]
+    #[instrument(skip(self, params), fields(session_id = %traced_id(&params.0.session_id)))]
     pub async fn read(
         &self,
         params: Parameters<ReadParams>,
@@ -469,7 +498,7 @@ impl<B: SerialBackend> McpServer<B> {
         output_schema = tool_output_schema::<ReadResult>(),
         annotations(title = "Drain serial input", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
-    #[instrument(skip(self, params), fields(session_id = %params.0.session_id))]
+    #[instrument(skip(self, params), fields(session_id = %traced_id(&params.0.session_id)))]
     pub async fn drain(
         &self,
         params: Parameters<DrainParams>,
@@ -499,7 +528,7 @@ impl<B: SerialBackend> McpServer<B> {
         output_schema = tool_output_schema::<ClearInputResult>(),
         annotations(title = "Clear serial input", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
-    #[instrument(skip(self, params), fields(session_id = %params.0.session_id))]
+    #[instrument(skip(self, params), fields(session_id = %traced_id(&params.0.session_id)))]
     pub async fn clear_input(
         &self,
         params: Parameters<DrainParams>,
@@ -543,7 +572,7 @@ impl<B: SerialBackend> McpServer<B> {
         output_schema = tool_output_schema::<ReadUntilResult>(),
         annotations(title = "Read serial until match", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
-    #[instrument(skip(self, params), fields(session_id = %params.0.session_id))]
+    #[instrument(skip(self, params), fields(session_id = %traced_id(&params.0.session_id)))]
     pub async fn read_until(
         &self,
         params: Parameters<ReadUntilParams>,
@@ -591,7 +620,7 @@ impl<B: SerialBackend> McpServer<B> {
         output_schema = tool_output_schema::<ExecResult>(),
         annotations(title = "Execute serial command", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
-    #[instrument(skip_all, fields(session_id = %params.0.session_id, cmd_len = %params.0.command.len()))]
+    #[instrument(skip_all, fields(session_id = %traced_id(&params.0.session_id), cmd_len = %params.0.command.len()))]
     pub async fn exec(
         &self,
         params: Parameters<ExecParams>,
@@ -773,7 +802,7 @@ impl<B: SerialBackend> McpServer<B> {
         output_schema = tool_output_schema::<CloseResult>(),
         annotations(title = "Close serial session", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
-    #[instrument(skip(self, params), fields(session_id = %params.0.session_id))]
+    #[instrument(skip(self, params), fields(session_id = %traced_id(&params.0.session_id)))]
     pub async fn close(&self, params: Parameters<CloseParams>) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
         match self.sessions.close(&p.session_id).await {
@@ -990,7 +1019,9 @@ pub struct ExecResult {
     pub normalized_output: Option<String>,
     pub command_output: Option<String>,
     pub command_output_source: Option<&'static str>,
+    /// Parsed from device output (OSC 3008). Advisory: a device can fake it.
     pub semantic_status: Option<&'static str>,
+    /// Parsed from device output (OSC 3008). Advisory: a device can fake it.
     pub exit_code: Option<i32>,
     pub ok: bool,
     pub bytes_written: usize,
@@ -1463,6 +1494,7 @@ pub struct OpenParams {
 #[serde(deny_unknown_fields)]
 pub struct WriteParams {
     pub session_id: String,
+    /// Text to send, at most 4096 bytes. No newline is added.
     pub data: String,
     /// Under `write_policy = "confirm"`: on a client that supports form
     /// elicitation the server asks the person directly and this flag is
@@ -1538,6 +1570,7 @@ pub struct CloseParams {
 #[serde(deny_unknown_fields)]
 pub struct ExecParams {
     pub session_id: String,
+    /// Command to send, at most 4096 bytes including any line ending.
     pub command: String,
     pub expect: String,
     /// Override the session profile's command terminator. `none` preserves
@@ -1748,7 +1781,13 @@ other clients, pass `confirm: true` explicitly.
 6. Before executing a command, clear stale input with `serial.drain`, `serial.clear_input`, \
 or `serial.exec` with `clear_before_write: true`.
 7. Run bounded operations: always pass `timeout_ms` and an `expect` pattern to `serial.exec`. \
-`serial.exec` sends `command` unchanged unless a profile or per-call `line_ending` is set. \
+A single `serial.write` or `serial.exec` payload, including any line ending, is at most 4096 \
+bytes. \
+`serial.exec` sends `command` unchanged unless a profile or per-call `line_ending` is set; a \
+shell needs one (set it at `serial.open` or per call) or the command is never submitted. Make \
+`expect` the exact prompt, such as `root@host:~# `, `=> `, or `uart:~\\$ `: a broad pattern \
+can match inside the output. `serial.write` returns no device output, so use `serial.exec` \
+for a command and its response. \
 A session with a command policy accepts mutations only through `serial.exec` (one terminated \
 line per call) and refuses raw `serial.write`; a `command_blocked` refusal is a policy \
 decision — do not rephrase around it.
@@ -1766,10 +1805,24 @@ server will not stop a write; it is not permission to run a destructive command.
 
 Output handling: `raw_output` / `data` is preserved verbatim (echo, prompts, CRLF, ANSI/OSC). \
 `normalize_output: true` on `serial.exec` adds a cleaned copy; it never replaces the raw \
-transcript. A missing semantic status is deliberate, not a failure.
+transcript. A missing semantic status is deliberate, not a failure. `exit_code` and \
+`semantic_status` come from device output and a device can fake them; treat them as advisory.
 
 Scope limits: no power control, firmware flashing, board reservation, SSH, or CI scheduling. \
 Compose with separate bench tooling for those.";
+
+#[cfg(test)]
+mod traced_id_tests {
+    use super::*;
+
+    #[test]
+    fn traced_id_keeps_real_ids_and_bounds_hostile_ones() {
+        let real = "0123456789abcdef0123456789abcdef";
+        assert_eq!(traced_id(real), real);
+        assert_eq!(traced_id(&"a".repeat(100_000)).len(), MAX_TRACED_ID_CHARS);
+        assert_eq!(traced_id("a\n\u{1b}[2J"), "a\\n\\u{1b}[2J");
+    }
+}
 
 #[cfg(test)]
 mod tool_error_tests {

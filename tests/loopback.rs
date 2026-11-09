@@ -168,6 +168,54 @@ fn send(stdin: &mut std::process::ChildStdin, req: Value) {
     stdin.flush().expect("flush binary stdin");
 }
 
+/// The one test that sets `MCP_SERIAL_DENY_PATTERNS`. A subprocess owns its
+/// environment, so this cannot race other tests. The bad regex is refused
+/// before the (nonexistent) port is touched, so no `socat` is needed.
+#[test]
+fn binary_applies_global_deny_patterns_from_env() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mcp-serial-rs"))
+        .env("MCP_SERIAL_ALLOWLIST", "/tmp/mcp-no-such-port-*")
+        .env("MCP_SERIAL_DEVICES", dir.path().join("none.toml"))
+        .env("MCP_SERIAL_JOURNAL", dir.path().join("journal.jsonl"))
+        .env("MCP_SERIAL_DENY_PATTERNS", r#"["["]"#)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let rx = spawn_response_pump(child.stdout.take().expect("stdout"));
+
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "env-test", "version": "0.0.1"},
+        }}),
+    );
+    next_response(&rx);
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    );
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "serial.open",
+            "arguments": {"port": "/tmp/mcp-no-such-port-x"},
+        }}),
+    );
+    let response = next_response(&rx);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(
+        response["result"]["structuredContent"]["error"]["data"]["name"], "command_policy",
+        "{response}"
+    );
+}
+
 #[test]
 fn loopback_rmcp_open_write_echo_read_until_close() {
     if !socat_available() {

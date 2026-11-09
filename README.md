@@ -29,7 +29,7 @@ cargo test
 MSRV 1.88. Edition 2021. The 1.88 floor is required by `rmcp` 3.x,
 which implements MCP `2026-07-28` while still negotiating the legacy
 `initialize` handshake with `2025-11-25` clients (see ADR 0008). See
-`docs/adr/` for the design rationale. The protocol layer is the `rmcp` SDK over its
+`docs/adr/` for the design rationale. CI checks the MSRV. The protocol layer is the `rmcp` SDK over its
 stdio transport; this crate owns the serial domain (sessions, the
 device-profile registry, the allowlist, the audit journal) and
 registers the `serial.*` tools with the SDK.
@@ -48,7 +48,9 @@ return `PortBusy`, and the default journal is metadata-only. Regenerate strict c
 
 ```sh
 # Optional: load device profiles so list_ports is enriched.
-cp devices.toml.example devices.toml && edit devices.toml
+mkdir -p ~/.config/mcp-serial-rs
+cp devices.toml.example ~/.config/mcp-serial-rs/devices.toml
+"$EDITOR" ~/.config/mcp-serial-rs/devices.toml
 
 # Drive the server with a legacy (2025-11-25) MCP handshake, then call a tool.
 (
@@ -203,7 +205,11 @@ the echoed line in `raw_output` but prevents `expect` from matching it; it
 requires `line_ending` to be `lf`, `cr`, or `crlf`.
 `semantic_prompt="osc3008"` can expose bounded `command_output`,
 `semantic_status`, and `exit_code`; missing or ambiguous markers fall back
-cleanly without claiming a status. See [ADR 0006](docs/adr/0006-console-execution-profiles.md).
+cleanly without claiming a status. These values come from device output and a
+device can fake them, so treat them as advisory. See
+[ADR 0006](docs/adr/0006-console-execution-profiles.md) and
+[console recipes](docs/console-recipes.md) for worked shell, bootloader, and RTOS
+examples.
 
 Profiles can also apply a server-owned command policy to complete `serial.exec`
 commands. `deny_patterns` block matches; `allow_patterns` permit only matches.
@@ -240,10 +246,16 @@ whether opened by `device` or by the literal path of the matching port, default
 to `write_policy = "confirm"`; a caller can still escalate to
 `deny` at `serial.open`, but cannot downgrade below `confirm`.
 
-The file shipped at `devices.toml.example` is a working template — copy to
-`devices.toml` (the default location) and edit. Or set `MCP_SERIAL_DEVICES`
-to point anywhere else. A missing file is not an error; profiles are
-optional and named-device opens simply return `DeviceNotFound`.
+The file shipped at `devices.toml.example` is a working template. Copy it to
+`$XDG_CONFIG_HOME/mcp-serial-rs/devices.toml` (by default
+`~/.config/mcp-serial-rs/devices.toml`) and edit it, or set
+`MCP_SERIAL_DEVICES` to point anywhere else. A missing file is not an error;
+profiles are optional and named-device opens simply return `DeviceNotFound`.
+
+A `devices.toml` in the working directory is not read, because a repository an
+agent can edit must not be able to change device policy. The server warns at
+startup if it finds one there, and if the profile file is writable by other
+users.
 
 **CP2102 clone caveat.** Counterfeit CP2102 chips often report `iSerial=0001`.
 If you have more than one, tighten the profile with `match_vid` / `match_pid`
@@ -253,7 +265,7 @@ or disambiguate via `/dev/serial/by-path` and hard-code the port path.
 
 | Env var | Purpose | Default |
 |---|---|---|
-| `MCP_SERIAL_DEVICES` | Path to the device-profile TOML file | `./devices.toml` |
+| `MCP_SERIAL_DEVICES` | Path to the device-profile TOML file | `$XDG_CONFIG_HOME/mcp-serial-rs/devices.toml`, else `~/.config/mcp-serial-rs/devices.toml` |
 | `MCP_SERIAL_ALLOWLIST` | Comma-separated glob patterns of openable device paths. When set, replaces the compiled-in list entirely. | unset → `/dev/ttyUSB*,/dev/ttyACM*` |
 | `MCP_SERIAL_DENY_PATTERNS` | JSON array of extra deny regexes applied to every session's `serial.exec` commands. Setting it makes every session guarded (no raw `serial.write`, and `serial.exec` needs a line ending). | unset |
 | `MCP_SERIAL_JOURNAL` | Append-only JSONL audit journal path (see below) | `$XDG_STATE_HOME/mcp-serial-rs/audit.jsonl`, else `~/.local/state/mcp-serial-rs/audit.jsonl` |

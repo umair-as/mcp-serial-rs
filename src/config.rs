@@ -10,6 +10,7 @@
 //! - `MCP_SERIAL_DEVICES` env var → path to `devices.toml` ([`load_devices`])
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -53,8 +54,10 @@ pub const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20;
 /// an error — profiles are optional. See [`load_devices`].
 pub const DEVICES_ENV: &str = "MCP_SERIAL_DEVICES";
 
-/// Default path consulted when [`DEVICES_ENV`] is unset.
-pub const DEFAULT_DEVICES_PATH: &str = "devices.toml";
+/// File name of a device-profile list in the working directory. It is no
+/// longer read: a repository an agent can edit must not be able to supply
+/// or strip device policy. The server warns when it finds one.
+pub const LEGACY_DEVICES_FILE: &str = "devices.toml";
 
 /// Env var pointing at the JSONL traffic-journal file. Set to override the
 /// default user-private state path. The journal is always-on (per
@@ -71,12 +74,56 @@ pub const DENY_PATTERNS_ENV: &str = "MCP_SERIAL_DENY_PATTERNS";
 /// `XDG_STATE_HOME` can supply a user-private location.
 pub const DEFAULT_JOURNAL_PATH: &str = ".mcp-serial-rs/audit.jsonl";
 
-/// Resolve the device-profile path: env var if set, else
-/// [`DEFAULT_DEVICES_PATH`] relative to the current working directory.
-pub fn devices_path() -> PathBuf {
-    std::env::var(DEVICES_ENV)
+/// Resolve the device-profile path: [`DEVICES_ENV`] if set, else
+/// `devices.toml` under the user's config directory. `None` when no config
+/// directory can be determined; profiles are optional, so that is not an
+/// error. The working directory is never consulted.
+pub fn devices_path() -> Option<PathBuf> {
+    resolve_devices_path(
+        std::env::var_os(DEVICES_ENV),
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+fn resolve_devices_path(
+    explicit: Option<OsString>,
+    xdg_config_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Option<PathBuf> {
+    if let Some(path) = explicit.filter(|path| !path.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    // The XDG spec says to ignore a relative value. Honouring one here would
+    // put the file back under the working directory.
+    let config_dir = xdg_config_home
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_DEVICES_PATH))
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            home.map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|path| path.join(".config"))
+        })?;
+    Some(config_dir.join("mcp-serial-rs").join("devices.toml"))
+}
+
+/// True when a `devices.toml` sits in the working directory and is being
+/// ignored because [`DEVICES_ENV`] does not point anywhere.
+pub fn legacy_devices_file_ignored() -> bool {
+    std::env::var_os(DEVICES_ENV).is_none() && Path::new(LEGACY_DEVICES_FILE).is_file()
+}
+
+/// True when someone other than the owner can modify the profile file, and
+/// so could remove `privileged` or a command policy.
+#[cfg(unix)]
+pub fn is_group_or_world_writable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o022 != 0)
+}
+
+#[cfg(not(unix))]
+pub fn is_group_or_world_writable(_path: &Path) -> bool {
+    false
 }
 
 /// Resolve the journal path: env var if set, else [`DEFAULT_JOURNAL_PATH`].
@@ -382,13 +429,57 @@ mod tests {
     }
 
     #[test]
-    fn devices_path_honors_env_var() {
-        // Don't actually set the env var (it would race with other tests).
-        // The default-path branch is the safe one to exercise here.
-        unsafe {
-            std::env::remove_var(DEVICES_ENV);
+    fn devices_path_prefers_the_explicit_env_var() {
+        assert_eq!(
+            resolve_devices_path(
+                Some("custom/profiles.toml".into()),
+                Some("/xdg".into()),
+                Some("/home/user".into()),
+            ),
+            Some(PathBuf::from("custom/profiles.toml"))
+        );
+    }
+
+    #[test]
+    fn devices_path_uses_the_user_config_directory() {
+        let expected = PathBuf::from("/xdg/mcp-serial-rs/devices.toml");
+        assert_eq!(
+            resolve_devices_path(None, Some("/xdg".into()), Some("/home/user".into())),
+            Some(expected)
+        );
+        let expected = PathBuf::from("/home/user/.config/mcp-serial-rs/devices.toml");
+        assert_eq!(
+            resolve_devices_path(None, None, Some("/home/user".into())),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn devices_path_never_falls_back_to_the_working_directory() {
+        let expected = PathBuf::from("/home/user/.config/mcp-serial-rs/devices.toml");
+        assert_eq!(
+            resolve_devices_path(None, Some("relative".into()), Some("/home/user".into())),
+            Some(expected),
+            "a relative XDG_CONFIG_HOME must be ignored"
+        );
+        assert_eq!(resolve_devices_path(None, None, None), None);
+        assert_eq!(resolve_devices_path(Some("".into()), None, None), None);
+        assert_eq!(
+            resolve_devices_path(None, Some("relative".into()), Some("also-relative".into())),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_or_world_writable_profile_files_are_detected() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        for (mode, expected) in [(0o600, false), (0o644, false), (0o664, true), (0o646, true)] {
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(is_group_or_world_writable(tmp.path()), expected, "{mode:o}");
         }
-        assert_eq!(devices_path(), PathBuf::from(DEFAULT_DEVICES_PATH));
+        assert!(!is_group_or_world_writable(Path::new("/nonexistent/x")));
     }
 
     // --- allowlist --- //

@@ -103,7 +103,7 @@ jobs:
 
           mkdir "$staging"
           cp target/release/mcp-serial-rs \
-            README.md LICENSE-MIT LICENSE-APACHE "$staging/"
+            README.md LICENSE-MIT LICENSE-APACHE devices.toml.example "$staging/"
           mkdir dist
           tar -czf "dist/$asset" "$staging"
           (cd dist && sha256sum "$asset" > "${asset}.sha256")

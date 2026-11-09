@@ -21,6 +21,43 @@ use mcp_serial_rs::mcp::McpServer;
 use mcp_serial_rs::serial::journal::JournalWriter;
 use mcp_serial_rs::serial::manager::{SessionManager, TokioSerialBackend};
 
+/// Load device profiles. They are optional: any problem is logged and the
+/// server continues with an empty list, so `serial.list_ports` and
+/// `serial.open(port=...)` still work.
+fn load_profiles() -> Vec<config::DeviceProfile> {
+    if config::legacy_devices_file_ignored() {
+        warn!(
+            file = config::LEGACY_DEVICES_FILE,
+            "ignoring a device-profile file in the working directory; move it to the user \
+             config directory or set MCP_SERIAL_DEVICES"
+        );
+    }
+    let Some(path) = config::devices_path() else {
+        warn!("no user config directory found; running without device profiles");
+        return Vec::new();
+    };
+    if config::is_group_or_world_writable(&path) {
+        warn!(
+            path = %path.display(),
+            "device-profile file is writable by other users, who could change its policies"
+        );
+    }
+    match config::load_devices(&path) {
+        Ok(profiles) => {
+            info!(
+                count = profiles.len(),
+                path = %path.display(),
+                "loaded device profiles"
+            );
+            profiles
+        }
+        Err(e) => {
+            warn!(error = %e, path = %path.display(), "failed to load device profiles");
+            Vec::new()
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     if let Some(code) = handle_cli_args(
@@ -45,24 +82,7 @@ async fn main() -> std::io::Result<()> {
         )
         .init();
 
-    let devices_path = config::devices_path();
-    let profiles = match config::load_devices(&devices_path) {
-        Ok(p) => {
-            info!(
-                count = p.len(),
-                path = %devices_path.display(),
-                "loaded device profiles"
-            );
-            p
-        }
-        Err(e) => {
-            // Profiles are optional — log and continue with an empty
-            // list so `serial.list_ports` and `serial.open(port=...)`
-            // still work.
-            warn!(error = %e, path = %devices_path.display(), "failed to load device profiles");
-            Vec::new()
-        }
-    };
+    let profiles = load_profiles();
 
     // Open the audit journal. Failure is non-fatal: the server runs
     // in degraded mode (no journaling) for missing paths, permissions
@@ -109,7 +129,7 @@ where
             "--help" | "-h" => {
                 writeln!(
                     stdout,
-                    "{} {}\n\nUsage: {} [--version|--help]\n\nWith no flags, starts the MCP stdio server.",
+                    "{} {}\n\nUsage: {} [--version|--help]\n\nWith no flags, starts the MCP stdio server.\n\nDevice profiles are optional. They are read from MCP_SERIAL_DEVICES, else\n$XDG_CONFIG_HOME/mcp-serial-rs/devices.toml (by default\n~/.config/mcp-serial-rs/devices.toml). The working directory is not read.",
                     env!("CARGO_PKG_NAME"),
                     env!("CARGO_PKG_VERSION"),
                     env!("CARGO_PKG_NAME"),

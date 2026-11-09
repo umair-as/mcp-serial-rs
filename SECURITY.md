@@ -38,6 +38,11 @@ Out of scope (must be stated to users):
 - Reject non-allowlisted ports with a typed error.
 - Run process as a non-root user with least privilege (only required group memberships, e.g. `dialout`).
 
+- Load device profiles from the user's config directory or an explicit
+  `MCP_SERIAL_DEVICES` path, never the working directory, so a repository an
+  agent can edit cannot supply or strip device policy. Warn when the file is
+  writable by other users.
+
 ### 2a) Server-owned command policy
 
 - Profiles and the optional global deny policy can block complete `serial.exec`
