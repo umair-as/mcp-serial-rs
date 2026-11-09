@@ -6,6 +6,10 @@ history.
 
 ## [0.6.0](https://github.com/umair-as/mcp-serial-rs/compare/v0.5.0...v0.6.0) - 2026-11-09
 
+### Breaking Changes
+
+- Load device profiles from the user config directory ([59214d1](https://github.com/umair-as/mcp-serial-rs/commit/59214d15aef19d01cfbf2ea1c59edcc61b00957d))
+
 ### Features
 
 - Make the confirm dialog answerable at a glance (#27) ([7b5d9ff](https://github.com/umair-as/mcp-serial-rs/commit/7b5d9ff469e57d38fa4edd89b16f7d9a76b00f49))
