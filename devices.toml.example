@@ -5,6 +5,10 @@
 # Matching enriches serial.list_ports output and allows serial.open
 # to accept a device name instead of a raw port path.
 #
+# Optional. The server works without it. Copy this file to
+# ~/.config/mcp-serial-rs/devices.toml, or point
+# MCP_SERIAL_DEVICES at it. A devices.toml in the working directory is not read.
+#
 # To find your values:
 #   udevadm info -q property /dev/ttyUSB0 | grep ID_SERIAL=
 #   tio -l

@@ -66,7 +66,9 @@ well-formed `type=command` start marker and its matching end marker. It exposes
 only the command-output slice, an allowlisted success/failure token, and an
 optional numeric status. It never exposes marker identifiers or treats marker
 fields as instructions. Missing, malformed, mismatched, or ambiguous markers
-fall back to normalized transcript output with no semantic status claim.
+fall back to normalized transcript output with no semantic status claim. Any
+status that is reported still comes from device output and a device can fake
+it, so callers must treat it as advisory.
 
 `raw_output` and its compatibility alias `output` remain unchanged and
 authoritative. `normalized_output` remains opt-in. New additive result fields

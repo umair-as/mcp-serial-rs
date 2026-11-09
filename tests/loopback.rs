@@ -168,6 +168,152 @@ fn send(stdin: &mut std::process::ChildStdin, req: Value) {
     stdin.flush().expect("flush binary stdin");
 }
 
+/// The one test that sets `MCP_SERIAL_DENY_PATTERNS`. A subprocess owns its
+/// environment, so this cannot race other tests. The bad regex is refused
+/// before the (nonexistent) port is touched, so no `socat` is needed.
+#[test]
+fn binary_applies_global_deny_patterns_from_env() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mcp-serial-rs"))
+        .env("MCP_SERIAL_ALLOWLIST", "/tmp/mcp-no-such-port-*")
+        .env("MCP_SERIAL_DEVICES", dir.path().join("none.toml"))
+        .env("MCP_SERIAL_JOURNAL", dir.path().join("journal.jsonl"))
+        .env("MCP_SERIAL_DENY_PATTERNS", r#"["["]"#)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let rx = spawn_response_pump(child.stdout.take().expect("stdout"));
+
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "env-test", "version": "0.0.1"},
+        }}),
+    );
+    next_response(&rx);
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    );
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "serial.open",
+            "arguments": {"port": "/tmp/mcp-no-such-port-x"},
+        }}),
+    );
+    let response = next_response(&rx);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(
+        response["result"]["structuredContent"]["error"]["data"]["name"], "command_policy",
+        "{response}"
+    );
+}
+
+const PLANTED_PROFILE: &str = r#"
+[devices.planted]
+match_serial = "PLANTED"
+baud = 115200
+description = "planted profile"
+"#;
+
+/// The binary's stderr once it is serving, started from `cwd` with
+/// `config_home` as its only user config directory.
+fn startup_log(cwd: &Path, config_home: &Path) -> String {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mcp-serial-rs"))
+        .current_dir(cwd)
+        .env_remove("MCP_SERIAL_DEVICES")
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("HOME", config_home)
+        .env("MCP_SERIAL_JOURNAL", config_home.join("journal.jsonl"))
+        .env("RUST_LOG", "mcp_serial_rs=info")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let rx = spawn_response_pump(child.stdout.take().expect("stdout"));
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "profile-path-test", "version": "0.0.1"},
+        }}),
+    );
+    next_response(&rx);
+    let _ = child.kill();
+    let output = child.wait_with_output().expect("collect stderr");
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// `serial.open` reports `device_not_found` for an unplugged profile as well
+/// as an unknown one, so only the startup log can show what was loaded. The
+/// second run proves the same file is accepted from the real location.
+#[test]
+fn binary_ignores_devices_file_in_working_directory() {
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let config_home = tempfile::tempdir().expect("tempdir");
+    std::fs::write(cwd.path().join("devices.toml"), PLANTED_PROFILE).expect("plant file");
+
+    let log = startup_log(cwd.path(), config_home.path());
+    assert!(log.contains("count=0"), "planted file was loaded: {log}");
+    assert!(
+        log.contains("ignoring a device-profile file"),
+        "no warning about the planted file: {log}"
+    );
+
+    let config_dir = config_home.path().join("mcp-serial-rs");
+    std::fs::create_dir(&config_dir).expect("config dir");
+    std::fs::write(config_dir.join("devices.toml"), PLANTED_PROFILE).expect("write profile");
+    let empty_cwd = tempfile::tempdir().expect("tempdir");
+
+    let log = startup_log(empty_cwd.path(), config_home.path());
+    assert!(log.contains("count=1"), "user config not loaded: {log}");
+    assert!(
+        !log.contains("ignoring a device-profile file"),
+        "warned without a planted file: {log}"
+    );
+}
+
+/// Losing a file's `privileged` settings to a typo must not be silent. Null
+/// stdin means a regression ends at EOF instead of hanging the test.
+#[test]
+fn binary_refuses_to_start_on_unparseable_devices_file() {
+    let config_home = tempfile::tempdir().expect("tempdir");
+    let config_dir = config_home.path().join("mcp-serial-rs");
+    std::fs::create_dir(&config_dir).expect("config dir");
+    std::fs::write(config_dir.join("devices.toml"), "not [valid toml").expect("write file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mcp-serial-rs"))
+        .current_dir(config_home.path())
+        .env_remove("MCP_SERIAL_DEVICES")
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("HOME", config_home.path())
+        .env(
+            "MCP_SERIAL_JOURNAL",
+            config_home.path().join("journal.jsonl"),
+        )
+        .env("RUST_LOG", "mcp_serial_rs=info")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run server");
+
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{log}");
+    assert!(log.contains("refusing to start"), "{log}");
+    assert!(output.stdout.is_empty(), "stdout is for MCP frames only");
+}
+
 #[test]
 fn loopback_rmcp_open_write_echo_read_until_close() {
     if !socat_available() {

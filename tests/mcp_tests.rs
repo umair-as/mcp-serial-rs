@@ -250,7 +250,8 @@ fn fault_setup(
 ) {
     let backend = FaultBackend::new(behavior);
     let sessions = Arc::new(SessionManager::new(backend.clone()));
-    let server = McpServer::new(sessions.clone(), Arc::new(Vec::new()), None);
+    let server = McpServer::new(sessions.clone(), Arc::new(Vec::new()), None)
+        .with_global_deny_patterns(Vec::new());
     (server, sessions, backend)
 }
 
@@ -283,6 +284,7 @@ fn stub_mcp_server(
         Arc::new(mcp_serial_rs::serial::resolve_device),
         Arc::new(|_: &str, _: &[DeviceProfile]| Ok(None)),
     )
+    .with_global_deny_patterns(Vec::new())
 }
 
 /// Build an `McpServer` backed by [`StubBackend`] with the supplied
@@ -714,6 +716,30 @@ async fn stateless_request_without_meta_is_a_protocol_error() {
     .await;
     assert!(responses[0].get("error").is_some(), "{:?}", responses[0]);
     assert!(responses[0].get("result").is_none());
+}
+
+#[tokio::test]
+async fn write_and_exec_schemas_state_the_write_limit() {
+    let responses = roundtrip(
+        tokio_server(),
+        &[stateless_request(1, "tools/list", json!({}))],
+    )
+    .await;
+    let limit = mcp_serial_rs::config::MAX_WRITE_CHUNK.to_string();
+    let tools = responses[0]["result"]["tools"].as_array().expect("tools");
+    for (tool, field) in [("serial.write", "data"), ("serial.exec", "command")] {
+        let schema = tools
+            .iter()
+            .find(|t| t["name"] == tool)
+            .expect("tool listed");
+        let description = schema["inputSchema"]["properties"][field]["description"]
+            .as_str()
+            .expect("field description");
+        assert!(
+            description.contains(&limit),
+            "{tool}.{field}: {description}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1545,10 +1571,6 @@ fn policy_profile() -> DeviceProfile {
     }
 }
 
-/// Serializes tests that set `MCP_SERIAL_DENY_PATTERNS` with tests whose
-/// `serial.open` must not observe another test's temporary value.
-static GLOBAL_POLICY_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 fn policy_test_server() -> (
     McpServer<StubBackend>,
     Arc<SessionManager<StubBackend>>,
@@ -1580,7 +1602,8 @@ fn policy_test_server() -> (
             None,
             resolver,
             Arc::new(|_: &str, _: &[DeviceProfile]| Ok(None)),
-        ),
+        )
+        .with_global_deny_patterns(Vec::new()),
         sessions,
         backend,
     )
@@ -1589,10 +1612,8 @@ fn policy_test_server() -> (
 #[tokio::test]
 async fn serial_open_unions_global_profile_and_caller_policy_rules() {
     let (ctx, _transport) = direct_context();
-    let _env = GLOBAL_POLICY_ENV.lock().await;
-    let previous = std::env::var_os("MCP_SERIAL_DENY_PATTERNS");
-    unsafe { std::env::set_var("MCP_SERIAL_DENY_PATTERNS", r#"["global-block"]"#) };
     let (server, _sessions, _backend) = policy_test_server();
+    let server = server.with_global_deny_patterns(vec!["global-block".into()]);
     let params: OpenParams = serde_json::from_value(json!({
         "device": "policy-device",
         "deny_patterns": ["caller-block"],
@@ -1602,12 +1623,6 @@ async fn serial_open_unions_global_profile_and_caller_policy_rules() {
         .open(Parameters(params))
         .await
         .expect("open tool result");
-    unsafe {
-        match previous {
-            Some(value) => std::env::set_var("MCP_SERIAL_DENY_PATTERNS", value),
-            None => std::env::remove_var("MCP_SERIAL_DENY_PATTERNS"),
-        }
-    }
     let session_id = open
         .structured_content
         .as_ref()
@@ -1647,11 +1662,9 @@ async fn serial_open_unions_global_profile_and_caller_policy_rules() {
 }
 
 #[tokio::test]
-async fn serial_open_rejects_bad_regex_from_global_policy_env() {
-    let _env = GLOBAL_POLICY_ENV.lock().await;
-    let previous = std::env::var_os("MCP_SERIAL_DENY_PATTERNS");
-    unsafe { std::env::set_var("MCP_SERIAL_DENY_PATTERNS", r#"["["]"#) };
+async fn serial_open_rejects_bad_regex_from_global_policy() {
     let (server, _sessions, _backend) = policy_test_server();
+    let server = server.with_global_deny_patterns(vec!["[".into()]);
     let result = server
         .open(Parameters(OpenParams {
             port: Some("/dev/ttyUSB0".into()),
@@ -1664,12 +1677,6 @@ async fn serial_open_rejects_bad_regex_from_global_policy_env() {
         }))
         .await
         .expect("open tool result");
-    unsafe {
-        match previous {
-            Some(value) => std::env::set_var("MCP_SERIAL_DENY_PATTERNS", value),
-            None => std::env::remove_var("MCP_SERIAL_DENY_PATTERNS"),
-        }
-    }
     assert_eq!(
         result.structured_content.as_ref().unwrap()["error"]["code"],
         -32008
@@ -3870,7 +3877,8 @@ async fn stub_server_with_journal(
     let writer = mcp_serial_rs::serial::journal::JournalWriter::try_open_arc(path)
         .await
         .expect("journal open in test must succeed");
-    let server = McpServer::new(sessions.clone(), Arc::new(Vec::new()), Some(writer));
+    let server = McpServer::new(sessions.clone(), Arc::new(Vec::new()), Some(writer))
+        .with_global_deny_patterns(Vec::new());
     (server, sessions, backend)
 }
 
@@ -4501,13 +4509,13 @@ fn port_profile_test_server() -> (McpServer<StubBackend>, Arc<SessionManager<Stu
             None,
             device_resolver,
             port_resolver,
-        ),
+        )
+        .with_global_deny_patterns(Vec::new()),
         sessions,
     )
 }
 
 async fn open_by_port(server: &McpServer<StubBackend>, args: Value) -> String {
-    let _env = GLOBAL_POLICY_ENV.lock().await;
     let result = server
         .open(Parameters(
             serde_json::from_value(args).expect("deserialize serial.open JSON arguments"),
@@ -4527,8 +4535,7 @@ async fn serial_open_by_port_of_profiled_device_applies_profile_controls() {
     let snapshot = sessions.get_session(&session_id).expect("snapshot");
     assert_eq!(snapshot.write_policy, WritePolicy::Confirm);
     assert_eq!(snapshot.baud, 57_600);
-    // `>=`: concurrent tests may briefly set global MCP_SERIAL_DENY_PATTERNS.
-    assert!(snapshot.command_policy.deny_rule_count >= 1);
+    assert_eq!(snapshot.command_policy.deny_rule_count, 1);
     assert!(snapshot.command_policy.mutation_via_exec_only);
 }
 
@@ -4579,7 +4586,6 @@ async fn guarded_exec_blocks_split_and_multiline_commands() {
     let (ctx, _transport) = direct_context();
     let (server, sessions, backend) = policy_test_server();
     let session_id = {
-        let _env = GLOBAL_POLICY_ENV.lock().await;
         let open = server
             .open(Parameters(
                 serde_json::from_value(json!({
@@ -4719,7 +4725,6 @@ async fn guarded_exec_without_line_ending_is_refused_before_device_io() {
 #[tokio::test]
 async fn serial_open_refuses_overriding_a_guarded_profile_line_ending() {
     let (server, sessions, _backend) = policy_test_server();
-    let _env = GLOBAL_POLICY_ENV.lock().await;
     let open = |line_ending: &str| {
         serde_json::from_value::<OpenParams>(
             json!({"device": "policy-device", "line_ending": line_ending}),
