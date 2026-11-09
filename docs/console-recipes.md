@@ -80,10 +80,15 @@ send, and run destructive commands only with explicit authorization.
 The usual prompt is `uart:~$ `, so escape the `$` in `expect`.
 
 ```json
+{"port": "/dev/ttyACM0", "line_ending": "cr"}
+```
+
+```json
 {
   "session_id": "<from serial.open>",
   "command": "kernel version",
   "expect": "uart:~\\$ ",
+  "echo_mode": "line",
   "timeout_ms": 5000,
   "clear_before_write": true
 }
@@ -92,13 +97,20 @@ The usual prompt is `uart:~$ `, so escape the `$` in `expect`.
 - There is no login, so the shell is effectively privileged from the first byte.
 - Log lines can interleave with command output. Read `raw_output` with that in
   mind, and do not assume a line belongs to your command.
-- There are no OSC 3008 markers, so leave `semantic_prompt` unset. No exit status
-  is reported.
-- The shell may redraw the line with terminal controls as you type, so leave
-  `echo_mode` unset unless you have tested `line` on your build.
-- A USB CDC-ACM console disappears when the board resets. The session can then
-  fail or reach EOF, and the port may return under a different number. Check
-  `serial.list_ports` and open it again.
+- There are no OSC 3008 markers, so leave `semantic_prompt` unset. To see the
+  previous command's return value, run `retval`.
+- `echo_mode: line` keeps the echoed command out of matching. `command_output`
+  still includes the trailing prompt.
+- The shell wraps its echo at 80 columns with a line break, so the echo of a long
+  command will not match the text you sent.
+- The prompt is colored and the read stops at the match, so part of its color
+  code can stay in the buffer. Set `clear_before_write` on the next call.
+- `normalized_output` removes cursor-movement codes, so indented text such as
+  `help` output loses its indentation. Use `raw_output` when layout matters.
+- A console on the chip's own USB (CDC-ACM) disappears when the board resets. The
+  session can then fail or reach EOF, and the port may return under a different
+  number. Check `serial.list_ports` and open it again. A console through an
+  external USB-UART adapter or debug probe stays connected across a reset.
 
 ## Raw byte exchange
 
