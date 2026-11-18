@@ -71,9 +71,13 @@ The audit log is now required:
 - The failed state is never cleared by a later successful write. After a
   failure nothing more is written, so a partly flushed row cannot be completed
   into a corrupt line.
-- A row that cannot be serialised or is over the 16 KiB cap counts as a
-  failure too: a refused row is a missing row. Summaries are clipped well below
-  the cap, so this is a guard, not an expected path.
+- A row over the 16 KiB cap is still written, with its summary replaced by
+  `{"summary_omitted": "too_large", "summary_bytes": N}`. Summary size depends
+  on caller input (JSON escaping can multiply it), so it must neither drop a
+  row nor mark the log as failed.
+- A call is admitted only if its row is written and the log had not failed by
+  then, so a failure recorded while another call's flush is pending refuses
+  that call too.
 - At open, a last line left without its newline by a write that failed partway
   in an earlier run is ended, so the next row starts on its own line.
 - There is no option to run without the audit log. The row format is

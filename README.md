@@ -313,7 +313,8 @@ is produced, a `result` row. Lifecycle traffic (`initialize`, `tools/list`,
 
 On Unix, a newly created parent directory is `0700` and the file `0600`.
 Final-component symlinks, non-regular files, and a world-writable parent
-without the sticky bit are refused.
+without the sticky bit (the working directory, for a bare file name) are
+refused.
 
 **It fails closed.** If the server cannot write the audit log, it does not
 touch a serial port:

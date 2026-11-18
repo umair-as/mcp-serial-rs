@@ -113,9 +113,17 @@ impl JournalWriter {
     /// Open `path` in create+append mode. Returns the writer on success or
     /// the underlying I/O error; `main` treats the error as fatal.
     pub async fn open(path: &Path) -> std::io::Result<Self> {
-        // A bare file name has an empty parent: that is the working
-        // directory, which already exists and is not ours to chmod.
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        // A bare file name has an empty parent: the working directory. It
+        // already exists and is not ours to chmod, but it gets the same
+        // safety check as any other existing parent.
+        let parent = path.parent().map(|p| {
+            if p.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                p
+            }
+        });
+        if let Some(parent) = parent {
             let parent_existed = tokio::fs::symlink_metadata(parent).await.is_ok();
             tokio::fs::create_dir_all(parent).await?;
             #[cfg(unix)]
@@ -176,21 +184,35 @@ impl JournalWriter {
 
     /// Serialise `entry` to JSONL, write it and flush.
     ///
-    /// Every failure marks the writer as failed, including a row that
-    /// cannot be serialised or is over the size cap (summaries are clipped
-    /// well below it, so that is a guard, not an expected path). From then
-    /// on `log` returns an error without writing.
+    /// A row over the size cap is still written, with its summary replaced
+    /// by a marker, so caller-supplied arguments can neither drop a row nor
+    /// mark the writer as failed. Every other failure marks the writer as
+    /// failed; from then on `log` returns an error without writing. `Ok`
+    /// means this row is on disk and the writer had not failed by then.
     pub async fn log(&self, entry: &JournalEntry) -> std::io::Result<()> {
-        let mut line =
-            serde_json::to_vec(entry).map_err(|e| self.fail(std::io::Error::other(e)))?;
+        let mut line = self.encode(entry)?;
         if line.len() > MAX_JOURNAL_ROW_BYTES {
-            return Err(self.fail(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "journal row of {} bytes is over the {MAX_JOURNAL_ROW_BYTES}-byte cap",
-                    line.len()
-                ),
-            )));
+            warn!(
+                tool = %entry.tool,
+                len = line.len(),
+                max = MAX_JOURNAL_ROW_BYTES,
+                "journal summary too large; writing the row without it"
+            );
+            let marked = JournalEntry {
+                summary: serde_json::json!({
+                    "summary_omitted": "too_large",
+                    "summary_bytes": line.len(),
+                }),
+                ..entry.clone()
+            };
+            line = self.encode(&marked)?;
+            // Identifiers are clipped at construction, so this cannot fire.
+            if line.len() > MAX_JOURNAL_ROW_BYTES {
+                return Err(self.fail(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "journal row too large even without its summary",
+                )));
+            }
         }
         line.push(b'\n');
         let deadline = std::time::Duration::from_millis(JOURNAL_IO_TIMEOUT_MS);
@@ -211,6 +233,10 @@ impl JournalWriter {
         })
         .await;
         match result {
+            // Another call may have failed while this flush was pending (a
+            // lock timeout is recorded without the lock). Once failed, no
+            // call may be admitted, so report this one as refused too.
+            Ok(Ok(())) if self.has_failed() => Err(failed_error()),
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(self.fail(e)),
             Err(_) => Err(self.fail(std::io::Error::new(
@@ -218,6 +244,10 @@ impl JournalWriter {
                 "journal write timed out",
             ))),
         }
+    }
+
+    fn encode(&self, entry: &JournalEntry) -> std::io::Result<Vec<u8>> {
+        serde_json::to_vec(entry).map_err(|e| self.fail(std::io::Error::other(e)))
     }
 
     /// Mark the writer failed, logging the first failure only.
@@ -367,20 +397,21 @@ mod tests {
         assert_eq!(parsed_b.summary["bytes_written"], 5);
     }
 
+    /// Caller input decides the summary size, so an oversized summary must
+    /// neither drop the row nor disable the log.
     #[tokio::test]
-    async fn writer_refuses_oversized_row_and_fails() {
+    async fn writer_replaces_oversized_summary_and_stays_healthy() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let writer = JournalWriter::open(tmp.path()).await.unwrap();
 
         let oversized = JournalEntry::new(
             "none",
-            "serial.write",
+            "serial.exec",
             JournalEntry::DIR_CALL,
-            json!({"blob": "x".repeat(MAX_JOURNAL_ROW_BYTES + 1)}),
+            json!({"blob": "\u{1}".repeat(MAX_JOURNAL_ROW_BYTES / 4)}),
         );
-        let err = writer.log(&oversized).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        assert!(writer.has_failed(), "a refused row is a missing row");
+        writer.log(&oversized).await.unwrap();
+        assert!(!writer.has_failed());
 
         let normal = JournalEntry::new(
             "none",
@@ -388,8 +419,80 @@ mod tests {
             JournalEntry::DIR_RESULT,
             json!({"ok": true, "port_count": 1}),
         );
-        writer.log(&normal).await.unwrap_err();
-        assert!(std::fs::read_to_string(tmp.path()).unwrap().is_empty());
+        writer.log(&normal).await.unwrap();
+
+        let contents = std::fs::read_to_string(tmp.path()).unwrap();
+        let rows: Vec<JournalEntry> = contents
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2, "{contents}");
+        assert_eq!(rows[0].tool, "serial.exec");
+        assert_eq!(rows[0].summary["summary_omitted"], "too_large");
+        assert!(rows[0].summary["summary_bytes"].as_u64().unwrap() > MAX_JOURNAL_ROW_BYTES as u64);
+        assert_eq!(rows[1].tool, "serial.list_ports");
+    }
+
+    /// A failure recorded while another call's flush is pending must refuse
+    /// that call too. The journal is a socket whose send buffer is full, so
+    /// the flush blocks until the test drains the peer.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writer_refuses_pending_row_after_failure_latches() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let (mut log_end, mut peer) = UnixStream::pair().unwrap();
+        log_end.set_nonblocking(true).unwrap();
+        while log_end.write(&[b'x'; 4096]).is_ok() {}
+        log_end.set_nonblocking(false).unwrap();
+        let file =
+            tokio::fs::File::from_std(std::fs::File::from(std::os::fd::OwnedFd::from(log_end)));
+        let writer = std::sync::Arc::new(JournalWriter::from_file(file, Path::new("socket")));
+
+        let pending = {
+            let writer = writer.clone();
+            tokio::spawn(async move {
+                let entry =
+                    JournalEntry::new("none", "serial.write", JournalEntry::DIR_CALL, json!({}));
+                writer.log(&entry).await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !pending.is_finished(),
+            "flush must be blocked on the full socket"
+        );
+
+        writer.fail(std::io::Error::other("failure from another call"));
+        let drain = std::thread::spawn(move || {
+            peer.set_read_timeout(Some(std::time::Duration::from_millis(300)))
+                .unwrap();
+            let mut buf = [0u8; 65536];
+            while matches!(peer.read(&mut buf), Ok(n) if n > 0) {}
+        });
+
+        let result = pending.await.unwrap();
+        drain.join().unwrap();
+        let err = result.expect_err("a row admitted after the failure latched");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other, "{err}");
+        assert_eq!(err.to_string(), failed_error().to_string());
+    }
+
+    /// A bare file name lives in the working directory, which must pass the
+    /// same parent check as any other directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writer_checks_working_directory_for_bare_file_name() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        // `open` resolves "." against the process working directory, so
+        // drive the check directly rather than changing it for every test.
+        let err = check_existing_parent(temp.path()).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     /// A row left without its newline by an earlier failed write is ended at

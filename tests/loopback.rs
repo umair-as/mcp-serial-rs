@@ -374,6 +374,34 @@ fn binary_accepts_bare_audit_log_file_name() {
     assert!(dir.path().join("audit.jsonl").is_file(), "{log}");
 }
 
+/// A bare file name gets the same unsafe-directory check as any other
+/// path: anyone could replace a log in a world-writable directory.
+#[cfg(unix)]
+#[test]
+fn binary_refuses_bare_audit_log_in_world_writable_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shared = dir.path().join("shared");
+    std::fs::create_dir(&shared).expect("shared dir");
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777))
+        .expect("chmod shared dir");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mcp-serial-rs"))
+        .arg("--audit-log")
+        .arg("audit.jsonl")
+        .current_dir(&shared)
+        .env("MCP_SERIAL_DEVICES", dir.path().join("none.toml"))
+        .env("RUST_LOG", "off")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run server");
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{log}");
+    assert!(log.contains("world-writable"), "{log}");
+    assert!(!shared.join("audit.jsonl").exists());
+}
+
 /// `--audit-log` wins over `MCP_SERIAL_JOURNAL`: with the env var pointing
 /// somewhere unwritable, the server still starts and audits to the flag's
 /// file.
