@@ -141,7 +141,12 @@ before any bytes reach the device:
 - `deny` — a read-only session for passive observation. `serial.write` / `serial.exec` are refused
   server-side with `WriteForbidden` (`-32012`) regardless of the request; reads,
   `drain`, and `clear_input` still work. This is model-proof: no bug and no
-  injected device text can cause a write.
+  injected device text can cause a write. It does not make opening the port
+  side-effect free: a USB serial adapter can glitch the line on open or close,
+  and on a Linux console with SysRq enabled a BREAK followed by any byte runs a
+  SysRq command (see #34). On a target where that matters, set
+  `kernel.sysrq` to exclude the dangerous commands; `sysrq_always_enabled` on
+  the kernel command line overrides that mask.
 - `confirm` — each write is approved first, for when the operator wants that.
   On an MCP `2026-07-28` client that
   supports form elicitation (an `elicitation` capability with `form`, or an
