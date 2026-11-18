@@ -80,6 +80,14 @@ pub enum SerialError {
     /// retryable: re-issuing the same call re-asks the same person.
     #[error("session '{session_id}' write was not confirmed by the user (elicitation {action})")]
     ConfirmationDeclined { session_id: String, action: String },
+
+    /// The audit log could not be written, so the server refuses serial
+    /// tools (except `serial.close`) until it is restarted (ADR 0003).
+    #[error(
+        "audit log unavailable: serial tools are disabled until the server restarts; \
+         serial.close still works"
+    )]
+    AuditLogUnavailable,
 }
 
 impl SerialError {
@@ -103,6 +111,7 @@ impl SerialError {
             SerialError::CommandBlocked { .. } => -32014,
             SerialError::RawWriteForbidden { .. } => -32015,
             SerialError::ConfirmationDeclined { .. } => -32016,
+            SerialError::AuditLogUnavailable => -32017,
         }
     }
 
@@ -131,7 +140,7 @@ impl SerialError {
             SerialError::MaxSessionsReached { max } => json!({ "max": max }),
             SerialError::InvalidParam { name, reason } => json!({ "name": name, "reason": reason }),
             SerialError::DeviceNotFound { device } => json!({ "device": device }),
-            SerialError::Cancelled => json!({}),
+            SerialError::Cancelled | SerialError::AuditLogUnavailable => json!({}),
             SerialError::WriteForbidden { session_id } => {
                 json!({ "session_id": session_id, "write_policy": "deny" })
             }
@@ -166,6 +175,7 @@ impl SerialError {
             SerialError::CommandBlocked { .. } => "command_blocked",
             SerialError::RawWriteForbidden { .. } => "raw_write_forbidden",
             SerialError::ConfirmationDeclined { .. } => "confirmation_declined",
+            SerialError::AuditLogUnavailable => "audit_log_unavailable",
         }
     }
 
@@ -259,6 +269,7 @@ mod tests {
                 action: "decline".into(),
             }
             .code(),
+            SerialError::AuditLogUnavailable.code(),
         ];
         let mut sorted = variants.to_vec();
         sorted.sort_unstable();

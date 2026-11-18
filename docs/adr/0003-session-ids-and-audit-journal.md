@@ -41,6 +41,47 @@ deadlines so an unhealthy journal sink cannot indefinitely block tool dispatch.
 The session ID format changed from 16 to 32 hex characters. Clients must treat
 session IDs as opaque strings.
 
-The journal still remains best-effort: if the path is unsafe or cannot be
-opened, the server logs a warning and continues without journaling. Rotation
-and required/disabled policy modes are deferred.
+The journal was best-effort when this was decided: if the path was unsafe or
+could not be opened, the server logged a warning and continued without
+journaling. The amendment below replaces that. Rotation is deferred.
+
+## Amendment: the audit log fails closed
+
+Running the server in a sandbox with a read-only home directory showed the
+cost of best-effort auditing: the journal failed to open, one warning went to
+stderr, and every serial tool call after that ran unaudited.
+
+The audit log is now required:
+
+- The server opens it before serving any request. If that fails, it prints
+  one stderr line with the path, the OS error, and the fix, then exits with
+  status 1.
+- `--audit-log <path>` sets the path and takes precedence over
+  `MCP_SERIAL_JOURNAL`. The default path is unchanged.
+- The first failed write (I/O error, or the lock or write deadline passing)
+  marks the log as failed until the process exits. From then on every tool
+  except `serial.close` returns `AuditLogUnavailable` (`-32017`,
+  `audit_log_unavailable`, not retryable, `command_written=false`,
+  `session_usable=false`) without dispatching. A call whose own `call` row
+  fails is refused the same way. A failed `result` row still returns the real
+  result, because the I/O has already happened.
+- `serial.close` stays available so ports can be released without a restart.
+  It only releases a port, and it runs without an audit row; stderr records
+  each one.
+- The failed state is never cleared by a later successful write. After a
+  failure nothing more is written, so a partly flushed row cannot be completed
+  into a corrupt line.
+- A row over the 16 KiB cap is still written, with its summary replaced by
+  `{"summary_omitted": "too_large", "summary_bytes": N}`. Summary size depends
+  on caller input (JSON escaping can multiply it), so it must neither drop a
+  row nor mark the log as failed.
+- A call is admitted only if its row is written and the log had not failed by
+  then, so a failure recorded while another call's flush is pending refuses
+  that call too.
+- At open, a last line left without its newline by a write that failed partway
+  in an earlier run is ended, so the next row starts on its own line.
+- There is no option to run without the audit log. The row format is
+  unchanged.
+
+A stall over the 250 ms deadline now disables serial tools until restart.
+That is deliberate: a missing row cannot be told apart from a lost one.

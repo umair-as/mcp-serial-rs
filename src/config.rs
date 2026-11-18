@@ -60,9 +60,9 @@ pub const DEVICES_ENV: &str = "MCP_SERIAL_DEVICES";
 pub const LEGACY_DEVICES_FILE: &str = "devices.toml";
 
 /// Env var pointing at the JSONL traffic-journal file. Set to override the
-/// default user-private state path. The journal is always-on (per
-/// CLAUDE.md); if the path is unwritable, the server logs a warning and
-/// runs in degraded mode without auditing rather than failing to start.
+/// default user-private state path; the `--audit-log` flag overrides this.
+/// The journal is always on and fails closed (ADR 0003): if it cannot be
+/// opened the server refuses to start.
 pub const JOURNAL_ENV: &str = "MCP_SERIAL_JOURNAL";
 
 /// JSON array of server-owned deny regexes applied to every newly opened

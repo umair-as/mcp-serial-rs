@@ -314,6 +314,146 @@ fn binary_refuses_to_start_on_unparseable_devices_file() {
     assert!(output.stdout.is_empty(), "stdout is for MCP frames only");
 }
 
+/// Without an audit log the server must not touch a port, so it must not
+/// start. The reason is printed even with `RUST_LOG=off`.
+#[cfg(unix)]
+#[test]
+fn binary_refuses_to_start_without_writable_audit_log() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Root can write into a 0500 directory, so the refusal cannot be staged.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: running as root");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let read_only = dir.path().join("ro");
+    std::fs::create_dir(&read_only).expect("ro dir");
+    std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o500))
+        .expect("chmod ro dir");
+    let journal = read_only.join("audit.jsonl");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mcp-serial-rs"))
+        .env("MCP_SERIAL_DEVICES", dir.path().join("none.toml"))
+        .env("MCP_SERIAL_JOURNAL", &journal)
+        .env("RUST_LOG", "off")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run server");
+    std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o700))
+        .expect("restore dir permissions");
+
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{log}");
+    assert!(log.contains("refusing to start"), "{log}");
+    assert!(
+        log.contains(&journal.display().to_string()),
+        "path missing: {log}"
+    );
+    assert!(log.contains("--audit-log"), "fix hint missing: {log}");
+    assert!(output.stdout.is_empty(), "stdout is for MCP frames only");
+    assert!(!journal.exists());
+}
+
+/// A bare file name means the working directory, whose parent path is
+/// empty; that must not stop the server from starting.
+#[test]
+fn binary_accepts_bare_audit_log_file_name() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = Command::new(env!("CARGO_BIN_EXE_mcp-serial-rs"))
+        .arg("--audit-log")
+        .arg("audit.jsonl")
+        .current_dir(dir.path())
+        .env("MCP_SERIAL_DEVICES", dir.path().join("none.toml"))
+        .env("RUST_LOG", "off")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run server");
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(!log.contains("refusing to start"), "{log}");
+    assert!(dir.path().join("audit.jsonl").is_file(), "{log}");
+}
+
+/// A bare file name gets the same unsafe-directory check as any other
+/// path: anyone could replace a log in a world-writable directory.
+#[cfg(unix)]
+#[test]
+fn binary_refuses_bare_audit_log_in_world_writable_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shared = dir.path().join("shared");
+    std::fs::create_dir(&shared).expect("shared dir");
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777))
+        .expect("chmod shared dir");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mcp-serial-rs"))
+        .arg("--audit-log")
+        .arg("audit.jsonl")
+        .current_dir(&shared)
+        .env("MCP_SERIAL_DEVICES", dir.path().join("none.toml"))
+        .env("RUST_LOG", "off")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run server");
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{log}");
+    assert!(log.contains("world-writable"), "{log}");
+    assert!(!shared.join("audit.jsonl").exists());
+}
+
+/// `--audit-log` wins over `MCP_SERIAL_JOURNAL`: with the env var pointing
+/// somewhere unwritable, the server still starts and audits to the flag's
+/// file.
+#[test]
+fn binary_audit_log_flag_overrides_env() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let flag_path = dir.path().join("flag.jsonl");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mcp-serial-rs"))
+        .arg("--audit-log")
+        .arg(&flag_path)
+        .env("MCP_SERIAL_ALLOWLIST", "/tmp/mcp-no-such-port-*")
+        .env("MCP_SERIAL_DEVICES", dir.path().join("none.toml"))
+        .env("MCP_SERIAL_JOURNAL", "/proc/1/no-such-dir/audit.jsonl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let rx = spawn_response_pump(child.stdout.take().expect("stdout"));
+
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "audit-flag-test", "version": "0.0.1"},
+        }}),
+    );
+    next_response(&rx);
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    );
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "serial.list_ports", "arguments": {},
+        }}),
+    );
+    let response = next_response(&rx);
+    drop(stdin);
+    let _ = child.wait();
+
+    assert!(
+        response["result"]["structuredContent"]["ports"].is_array(),
+        "{response}"
+    );
+    let rows = std::fs::read_to_string(&flag_path).expect("audit log at the flag's path");
+    assert_eq!(rows.lines().count(), 2, "call + result rows: {rows}");
+}
+
 #[test]
 fn loopback_rmcp_open_write_echo_read_until_close() {
     if !socat_available() {
@@ -339,9 +479,8 @@ fn loopback_rmcp_open_write_echo_read_until_close() {
             "MCP_SERIAL_DEVICES",
             format!("/tmp/mcp-loopback-{pid}-no-devices.toml"),
         )
-        // Disable the journal for this test — `try_open_arc` would
-        // otherwise lock-step against the default per-user journal path
-        // and we don't need audit rows for the loopback assertion.
+        // Keep the journal in a per-test path instead of the user's
+        // default; the loopback assertion does not read its rows.
         .env(
             "MCP_SERIAL_JOURNAL",
             format!("/tmp/mcp-loopback-{pid}.jsonl"),

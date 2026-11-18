@@ -49,7 +49,7 @@ src/
 │   ├── manager.rs  ← SessionManager: session map, per-session port mutex, every I/O op, session-id gen
 │   ├── session.rs  ← per-session state machine + Arc<Mutex<Port>> handle; close rollback
 │   ├── parser.rs   ← regex matcher + read_until match buffer, MatchDetails
-│   └── journal.rs  ← JournalWriter: append-only JSONL sink (0600, O_NOFOLLOW, deadline-bounded, degraded mode)
+│   └── journal.rs  ← JournalWriter: append-only JSONL sink (0600, O_NOFOLLOW, deadline-bounded, fails closed)
 ├── config.rs       ← allowlist, limits, defaults, env-var resolution
 └── errors.rs       ← SerialError enum → codes / structured data / rmcp::ErrorData
 tests/              ← mcp_tests.rs (wire), loopback.rs (PTY via socat), parser_tests.rs, session_tests.rs
@@ -202,7 +202,7 @@ MAX_TIMEOUT_MS   = 30_000;      // all caller timeouts clamped to this
 |---|---|---|
 | `MCP_SERIAL_ALLOWLIST` | Comma-separated globs; when set, *replaces* the compiled-in list. Used by tests under `/tmp` and non-standard hosts. | compiled-in list |
 | `MCP_SERIAL_DEVICES` | TOML of device profiles. Missing file is not an error; a present but unreadable or unparseable file stops startup. The working directory is never searched; only a relative value resolves against it. | `$XDG_CONFIG_HOME/mcp-serial-rs/devices.toml`, else `~/.config/...` |
-| `MCP_SERIAL_JOURNAL` | Append-only JSONL **tool-call** journal (call row + result row per `tools/call`; lifecycle traffic not journaled). Summaries are **metadata-only** — byte counts, statuses, error codes, bounded arg keys; never command/output payloads or error messages. Best-effort: unwritable/unsafe paths degrade to a `tracing::warn` and continue. I/O is deadline-bounded; file `0600`, parent `0700`, symlinks/non-regular files rejected on Unix. | `$XDG_STATE_HOME/mcp-serial-rs/audit.jsonl`, else `~/.local/state/...` |
+| `MCP_SERIAL_JOURNAL` | Append-only JSONL **tool-call** journal (call row + result row per `tools/call`; lifecycle traffic not journaled). Summaries are **metadata-only** — byte counts, statuses, error codes, bounded arg keys; never command/output payloads or error messages. Fails closed (ADR 0003 amendment): an open failure stops startup (exit 1); after any write failure every tool except `serial.close` returns `AuditLogUnavailable` (-32017) until restart. `--audit-log <path>` overrides the env var. I/O is deadline-bounded; file `0600`, parent `0700`, symlinks/non-regular files rejected on Unix. | `$XDG_STATE_HOME/mcp-serial-rs/audit.jsonl`, else `~/.local/state/...` |
 | `MCP_SERIAL_DENY_PATTERNS` | JSON array of extra deny regexes applied to every session's `serial.exec` commands. Setting it makes every session guarded. | unset |
 | `RUST_LOG` | `tracing-subscriber` filter. | `mcp_serial_rs=info` |
 

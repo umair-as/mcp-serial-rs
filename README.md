@@ -44,6 +44,11 @@ the structured tool-error shape, duplicate opens for the same configured path
 return `PortBusy`, and the default journal is metadata-only. Regenerate strict client types from
 `tools/list` and branch on `result.isError` for tool execution failures.
 
+The audit log is now required. A server that could not open it used to start
+without auditing; it now exits with status 1. If a sandbox makes the default
+path read-only, pass `--audit-log <path>` or set `MCP_SERIAL_JOURNAL` to a
+writable location. See [Audit log](#audit-log).
+
 ## Quick start
 
 ```sh
@@ -275,7 +280,7 @@ or disambiguate via `/dev/serial/by-path` and hard-code the port path.
 | `MCP_SERIAL_DEVICES` | Path to the device-profile TOML file | `$XDG_CONFIG_HOME/mcp-serial-rs/devices.toml`, else `~/.config/mcp-serial-rs/devices.toml` |
 | `MCP_SERIAL_ALLOWLIST` | Comma-separated glob patterns of openable device paths. When set, replaces the compiled-in list entirely. | unset → `/dev/ttyUSB*,/dev/ttyACM*` |
 | `MCP_SERIAL_DENY_PATTERNS` | JSON array of extra deny regexes applied to every session's `serial.exec` commands. Setting it makes every session guarded (no raw `serial.write`, and `serial.exec` needs a line ending). | unset |
-| `MCP_SERIAL_JOURNAL` | Append-only JSONL audit journal path (see below) | `$XDG_STATE_HOME/mcp-serial-rs/audit.jsonl`, else `~/.local/state/mcp-serial-rs/audit.jsonl` |
+| `MCP_SERIAL_JOURNAL` | Append-only JSONL audit log path; `--audit-log <path>` overrides it (see below) | `$XDG_STATE_HOME/mcp-serial-rs/audit.jsonl`, else `~/.local/state/mcp-serial-rs/audit.jsonl` |
 | `RUST_LOG` | `tracing-subscriber` filter, e.g. `mcp_serial_rs=debug` | `mcp_serial_rs=info` |
 
 The compile-time allowlist is `/dev/ttyUSB*` and `/dev/ttyACM*` — Linux USB
@@ -291,19 +296,40 @@ Other compile-time limits live in `src/config.rs`:
 | `MAX_WRITE_CHUNK` | 4 KiB | Writes above this size are rejected with `InvalidParam` (`-32008`) |
 | `MAX_TIMEOUT_MS` | 30 000 | All caller-supplied timeouts are clamped |
 
-### Audit journal
+### Audit log
 
-The server keeps an always-on, append-only JSONL audit journal at
-`MCP_SERIAL_JOURNAL`. It is a **tool-call journal**: every `tools/call`
-appends a `call` row and, once a result is produced, a `result` row. Lifecycle
-traffic (`initialize`,
-`tools/list`, `notifications/initialized`) is **not** journaled — it stays
-visible through `tracing` logs on stderr. If the journal path cannot be
-opened the server logs a warning and continues in degraded mode (no
-journaling). Journal lock, write, and flush operations have short deadlines so
-auditing cannot indefinitely block tool dispatch. On Unix, the default
-parent directory is created `0700` and the journal file `0600`. Final-component
-symlinks and non-regular journal files are rejected on Unix.
+The server keeps an always-on, append-only JSONL audit log. It is a
+**tool-call log**: every `tools/call` appends a `call` row and, once a result
+is produced, a `result` row. Lifecycle traffic (`initialize`, `tools/list`,
+`notifications/initialized`) is **not** logged; it stays visible through
+`tracing` logs on stderr.
+
+**Path**, first match wins:
+
+1. `--audit-log <path>` on the command line;
+2. `MCP_SERIAL_JOURNAL`;
+3. `$XDG_STATE_HOME/mcp-serial-rs/audit.jsonl`;
+4. `~/.local/state/mcp-serial-rs/audit.jsonl`.
+
+On Unix, a newly created parent directory is `0700` and the file `0600`.
+Final-component symlinks, non-regular files, and a world-writable parent
+without the sticky bit (the working directory, for a bare file name) are
+refused.
+
+**It fails closed.** If the server cannot write the audit log, it does not
+touch a serial port:
+
+- If the log cannot be opened at startup, the server exits with status 1 and
+  one stderr line naming the path, the OS error, and the fix. In a sandbox
+  with a read-only home directory, point `--audit-log` or `MCP_SERIAL_JOURNAL`
+  at a writable directory.
+- If a write fails later (disk full, I/O error, or a lock or write stalling
+  past its 250 ms deadline), every tool except `serial.close` returns
+  `audit_log_unavailable` (`-32017`, not retryable) until the server is
+  restarted. `serial.close` keeps working so ports can be released; those
+  closes are not logged, and stderr says so.
+
+There is no option to run without the audit log.
 
 The journal stores **metadata-only summaries, not payload bodies**. Call rows
 record bounded argument-key lists plus byte counts for large fields such as
@@ -314,7 +340,7 @@ This keeps the audit trail bounded on resource-constrained gateways and avoids
 recording credentials typed into a privileged serial shell. To capture full
 transcripts, drive the server from a client that records them.
 
-Tail the journal in a readable form with:
+Tail the audit log in a readable form with:
 
 ```sh
 tail -F "${MCP_SERIAL_JOURNAL:-${XDG_STATE_HOME:-$HOME/.local/state}/mcp-serial-rs/audit.jsonl}" \
@@ -322,7 +348,7 @@ tail -F "${MCP_SERIAL_JOURNAL:-${XDG_STATE_HOME:-$HOME/.local/state}/mcp-serial-
            (.summary | tostring)'
 ```
 
-Drop the `jq` filter for raw JSONL access when feeding the journal to other
+Drop the `jq` filter for raw JSONL access when feeding the log to other
 tools.
 
 ## Hardware smoke test
@@ -403,7 +429,7 @@ The `serial.*` MVP and the `rmcp` SDK adoption are complete:
   structured tool results.
 - Device profiles and named-device open.
 - Allowlist + timeout clamping + session cap.
-- Tool-call audit journal with degraded-mode fallback.
+- Tool-call audit log that fails closed: no audit log, no serial I/O.
 - In-process rmcp wire tests + PTY-loopback integration test.
 
 Deferred (not implemented):

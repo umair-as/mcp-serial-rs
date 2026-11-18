@@ -4,12 +4,13 @@
 //!
 //! Bootstraps the tokio runtime, configures `tracing` for stderr-only
 //! output (stdout is reserved for MCP messages), loads the optional
-//! device-profile TOML and the always-on JSONL audit journal, then
-//! hands stdio to the rmcp [`McpServer`] which owns dispatch from
-//! that point on.
+//! device-profile TOML, opens the always-on JSONL audit log (refusing to
+//! start without it), then hands stdio to the rmcp [`McpServer`] which
+//! owns dispatch from that point on.
 
 #![deny(clippy::all)]
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmcp::transport;
@@ -61,16 +62,15 @@ fn load_profiles() -> Result<Vec<config::DeviceProfile>, SerialError> {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    if let Some(code) = handle_cli_args(
+    let audit_log = match handle_cli_args(
         std::env::args().skip(1),
         &mut std::io::stdout(),
         &mut std::io::stderr(),
     )? {
-        if code == 0 {
-            return Ok(());
-        }
-        std::process::exit(code);
-    }
+        CliAction::Exit(0) => return Ok(()),
+        CliAction::Exit(code) => std::process::exit(code),
+        CliAction::Serve { audit_log } => audit_log,
+    };
 
     // `rmcp::transport::stdio()` returns the OS stdin/stdout pair and
     // does NOT configure any logging — stderr-only `tracing` setup is
@@ -87,15 +87,30 @@ async fn main() -> std::io::Result<()> {
         std::process::exit(1);
     };
 
-    // Open the audit journal. Failure is non-fatal: the server runs
-    // in degraded mode (no journaling) for missing paths, permissions
-    // problems, or unsafe journal targets. Per-call journal I/O is
-    // deadline-bounded inside `McpServer::call_tool`.
-    let journal_path = config::journal_path();
-    let journal = JournalWriter::try_open_arc(&journal_path).await;
+    // Open the audit log before serving anything. It fails closed (ADR
+    // 0003): without it the server must not touch a serial port, so an
+    // open failure is fatal. `eprintln!` keeps the reason visible whatever
+    // `RUST_LOG` says; stderr never carries MCP frames.
+    let journal_path = audit_log.unwrap_or_else(config::journal_path);
+    let journal = match JournalWriter::open(&journal_path).await {
+        Ok(writer) => {
+            info!(path = %journal_path.display(), "audit log opened");
+            Arc::new(writer)
+        }
+        Err(e) => {
+            eprintln!(
+                "{}: refusing to start: cannot open audit log {}: {e}; pass --audit-log <path> \
+                 or set {} to a file in a writable directory",
+                env!("CARGO_PKG_NAME"),
+                journal_path.display(),
+                config::JOURNAL_ENV,
+            );
+            std::process::exit(1);
+        }
+    };
 
     let sessions = Arc::new(SessionManager::new(TokioSerialBackend));
-    let server = McpServer::new(sessions, Arc::new(profiles), journal);
+    let server = McpServer::new(sessions, Arc::new(profiles), Some(journal));
 
     // Hand stdio to rmcp. `serve()` consumes the server and runs the
     // SDK dispatch loop; `.waiting()` blocks until the peer closes
@@ -109,7 +124,16 @@ async fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-fn handle_cli_args<I, W, E>(args: I, stdout: &mut W, stderr: &mut E) -> std::io::Result<Option<i32>>
+/// What `main` does after parsing the command line.
+#[derive(Debug, PartialEq, Eq)]
+enum CliAction {
+    /// Print-only flags ran, or the arguments were invalid: exit with this code.
+    Exit(i32),
+    /// Start the MCP server, with an audit-log path from `--audit-log` if given.
+    Serve { audit_log: Option<PathBuf> },
+}
+
+fn handle_cli_args<I, W, E>(args: I, stdout: &mut W, stderr: &mut E) -> std::io::Result<CliAction>
 where
     I: IntoIterator,
     I::Item: AsRef<str>,
@@ -118,7 +142,9 @@ where
 {
     let mut saw_info = false;
     let mut saw_unknown = false;
-    for arg in args {
+    let mut audit_log = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
         match arg.as_ref() {
             "--version" | "-V" => {
                 writeln!(
@@ -132,41 +158,58 @@ where
             "--help" | "-h" => {
                 writeln!(
                     stdout,
-                    "{} {}\n\nUsage: {} [--version|--help]\n\nWith no flags, starts the MCP stdio server.\n\nDevice profiles are optional. They are read from MCP_SERIAL_DEVICES, else\n$XDG_CONFIG_HOME/mcp-serial-rs/devices.toml (by default\n~/.config/mcp-serial-rs/devices.toml). The working directory is not searched.",
+                    "{} {}\n\nUsage: {} [--audit-log <path>] [--version|--help]\n\nWith no flags, starts the MCP stdio server.\n\nDevice profiles are optional. They are read from MCP_SERIAL_DEVICES, else\n$XDG_CONFIG_HOME/mcp-serial-rs/devices.toml (by default\n~/.config/mcp-serial-rs/devices.toml). The working directory is not searched.\n\nThe audit log is required. It is written to --audit-log <path>, else\nMCP_SERIAL_JOURNAL, else $XDG_STATE_HOME/mcp-serial-rs/audit.jsonl (by default\n~/.local/state/mcp-serial-rs/audit.jsonl). If it cannot be opened the server\nexits; if a write fails later, serial tools other than serial.close are refused.",
                     env!("CARGO_PKG_NAME"),
                     env!("CARGO_PKG_VERSION"),
                     env!("CARGO_PKG_NAME"),
                 )?;
                 saw_info = true;
             }
-            other => {
-                writeln!(stderr, "unknown argument: {other}")?;
-                saw_unknown = true;
-            }
+            "--audit-log" => match args.next() {
+                Some(path) if !path.as_ref().is_empty() => {
+                    audit_log = Some(PathBuf::from(path.as_ref()));
+                }
+                _ => {
+                    writeln!(stderr, "--audit-log requires a path")?;
+                    saw_unknown = true;
+                }
+            },
+            other => match other.strip_prefix("--audit-log=") {
+                Some(path) if !path.is_empty() => audit_log = Some(PathBuf::from(path)),
+                Some(_) => {
+                    writeln!(stderr, "--audit-log requires a path")?;
+                    saw_unknown = true;
+                }
+                None => {
+                    writeln!(stderr, "unknown argument: {other}")?;
+                    saw_unknown = true;
+                }
+            },
         }
     }
     // An unknown argument is a usage error (exit 2) regardless of position and
-    // must not be cleared by a later --help/--version. Recognized flags alone
-    // exit 0; no flags returns None so the caller starts the MCP server.
+    // must not be cleared by a later --help/--version. Recognized print-only
+    // flags exit 0; otherwise the caller starts the MCP server.
     Ok(if saw_unknown {
-        Some(2)
+        CliAction::Exit(2)
     } else if saw_info {
-        Some(0)
+        CliAction::Exit(0)
     } else {
-        None
+        CliAction::Serve { audit_log }
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::handle_cli_args;
+    use super::{handle_cli_args, CliAction};
+    use std::path::PathBuf;
 
     #[test]
     fn version_flag_prints_and_exits() {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let exit_code = handle_cli_args(["--version"], &mut stdout, &mut stderr).unwrap();
-        assert_eq!(exit_code, Some(0));
+        assert_eq!(exit_code, CliAction::Exit(0));
         assert_eq!(
             String::from_utf8(stdout).unwrap(),
             format!("{} {}\n", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
@@ -180,7 +223,7 @@ mod tests {
         let mut stderr = Vec::new();
         let exit_code =
             handle_cli_args(std::iter::empty::<&str>(), &mut stdout, &mut stderr).unwrap();
-        assert_eq!(exit_code, None);
+        assert_eq!(exit_code, CliAction::Serve { audit_log: None });
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
     }
@@ -191,7 +234,7 @@ mod tests {
         let mut stderr = Vec::new();
         let exit_code =
             handle_cli_args(["--definitely-invalid"], &mut stdout, &mut stderr).unwrap();
-        assert_eq!(exit_code, Some(2));
+        assert_eq!(exit_code, CliAction::Exit(2));
         assert!(stdout.is_empty());
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
@@ -206,7 +249,7 @@ mod tests {
         let exit_code = handle_cli_args(["--bad", "--help"], &mut stdout, &mut stderr).unwrap();
         assert_eq!(
             exit_code,
-            Some(2),
+            CliAction::Exit(2),
             "unknown arg must not be cleared by --help"
         );
     }
@@ -216,7 +259,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let exit_code = handle_cli_args(["--bad", "--version"], &mut stdout, &mut stderr).unwrap();
-        assert_eq!(exit_code, Some(2));
+        assert_eq!(exit_code, CliAction::Exit(2));
     }
 
     #[test]
@@ -224,6 +267,44 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let exit_code = handle_cli_args(["--help", "--bad"], &mut stdout, &mut stderr).unwrap();
-        assert_eq!(exit_code, Some(2), "later unknown arg must force exit 2");
+        assert_eq!(
+            exit_code,
+            CliAction::Exit(2),
+            "later unknown arg must force exit 2"
+        );
+    }
+
+    #[test]
+    fn audit_log_flag_takes_a_path_in_either_form() {
+        for args in [
+            vec!["--audit-log", "/run/audit.jsonl"],
+            vec!["--audit-log=/run/audit.jsonl"],
+        ] {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let action = handle_cli_args(args.clone(), &mut stdout, &mut stderr).unwrap();
+            assert_eq!(
+                action,
+                CliAction::Serve {
+                    audit_log: Some(PathBuf::from("/run/audit.jsonl"))
+                },
+                "{args:?}"
+            );
+            assert!(stdout.is_empty() && stderr.is_empty());
+        }
+    }
+
+    #[test]
+    fn audit_log_flag_without_path_is_usage_error() {
+        for args in [vec!["--audit-log"], vec!["--audit-log="]] {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let action = handle_cli_args(args.clone(), &mut stdout, &mut stderr).unwrap();
+            assert_eq!(action, CliAction::Exit(2), "{args:?}");
+            assert_eq!(
+                String::from_utf8(stderr).unwrap(),
+                "--audit-log requires a path\n"
+            );
+        }
     }
 }

@@ -66,9 +66,9 @@ pub type PortProfileResolver =
 pub struct McpServer<B: SerialBackend> {
     sessions: Arc<SessionManager<B>>,
     profiles: Arc<Vec<DeviceProfile>>,
-    /// Tool-call audit journal. `None` means degraded mode (journal
-    /// open failed at startup); every dispatch then proceeds without
-    /// logging. Wired through `call_tool` (spec §Journal Requirements).
+    /// Tool-call audit journal, wired through `call_tool`. `main` always
+    /// passes one and refuses to start without it; `None` exists for test
+    /// fixtures and means calls run without auditing.
     journal: Option<Arc<JournalWriter>>,
     device_resolver: Arc<DeviceResolver>,
     port_profile_resolver: Arc<PortProfileResolver>,
@@ -1350,6 +1350,20 @@ fn tool_error(
     )
 }
 
+/// The one tool still served after an audit-log failure (ADR 0003).
+const AUDIT_EXEMPT_TOOL: &str = "serial.close";
+
+/// Refusal for any tool call made while the audit log is unavailable. No
+/// session id, so `session_usable` is false; nothing was written or read.
+fn audit_log_unavailable() -> CallToolResponse {
+    CallToolResponse::Complete(tool_error(
+        SerialError::AuditLogUnavailable,
+        None,
+        false,
+        false,
+    ))
+}
+
 fn possible_serial_side_effect(err: &SerialError) -> bool {
     matches!(
         err,
@@ -1622,10 +1636,13 @@ impl<B: SerialBackend> ServerHandler for McpServer<B> {
     /// of hook point, not a name filter.
     ///
     /// One `call` row goes in before dispatch and one `result` row
-    /// after, regardless of outcome. Journal I/O is wrapped in
-    /// `JournalWriter::log` which warns-and-swallows on failure, so
-    /// audit pressure never blocks tool execution. Concurrent calls
-    /// stay non-interleaving via the writer's `tokio::sync::Mutex`.
+    /// after, regardless of outcome. The journal fails closed (ADR 0003):
+    /// once a write has failed, and whenever this call's `call` row cannot
+    /// be written, every tool except `serial.close` returns
+    /// `AuditLogUnavailable` without dispatching. A failed `result` row
+    /// still returns the real result, because the I/O already happened.
+    /// Concurrent calls stay non-interleaving via the writer's
+    /// `tokio::sync::Mutex`.
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -1641,15 +1658,25 @@ impl<B: SerialBackend> ServerHandler for McpServer<B> {
             .map(|m| Value::Object(m.clone()))
             .unwrap_or(Value::Null);
 
-        // call row
+        // call row. `serial.close` only releases a port, so it stays
+        // available after an audit failure; it then runs unaudited.
+        let exempt = tool_name == AUDIT_EXEMPT_TOOL;
         if let Some(j) = &self.journal {
+            if j.has_failed() && !exempt {
+                return Ok(audit_log_unavailable());
+            }
             let entry = JournalEntry::new(
                 journal::call_session_id(&args_value),
                 tool_name.clone(),
                 JournalEntry::DIR_CALL,
                 journal::call_summary(&tool_name, &args_value, mrtr_retry),
             );
-            j.log(&entry).await;
+            if j.log(&entry).await.is_err() {
+                if !exempt {
+                    return Ok(audit_log_unavailable());
+                }
+                tracing::error!(tool = %tool_name, "running serial.close without an audit row");
+            }
         }
 
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
@@ -1687,7 +1714,12 @@ impl<B: SerialBackend> ServerHandler for McpServer<B> {
                     )
                 }
             };
-            j.log(&entry).await;
+            if j.log(&entry).await.is_err() {
+                tracing::error!(
+                    tool = %traced_id(&tool_name),
+                    "tool call completed without a result audit row"
+                );
+            }
         }
 
         result
