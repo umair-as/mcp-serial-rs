@@ -3850,8 +3850,9 @@ async fn close_releases_session_and_subsequent_read_returns_session_not_found() 
 //   * only `tools/call` invocations are journaled — one `call` row and
 //     one `result` row each; `initialize` / `tools/list` / the
 //     `notifications/initialized` notification produce NO rows.
-//   * `JournalWriter` failure during startup leaves the server in
-//     degraded mode (`journal: None`) and dispatch proceeds unchanged.
+//   * the journal fails closed: once a row cannot be written, every tool
+//     except `serial.close` returns `audit_log_unavailable` without
+//     dispatching (startup refusal is covered in `loopback.rs`).
 //
 // The tests open a journal file, drive the rmcp wire, then read the
 // JSONL file back and assert on the row shapes.
@@ -3874,19 +3875,158 @@ async fn stub_server_with_journal(
 ) {
     let backend = StubBackend::new();
     let sessions = Arc::new(SessionManager::new(backend.clone()));
-    let writer = mcp_serial_rs::serial::journal::JournalWriter::try_open_arc(path)
+    let writer = mcp_serial_rs::serial::journal::JournalWriter::open(path)
         .await
         .expect("journal open in test must succeed");
-    let server = McpServer::new(sessions.clone(), Arc::new(Vec::new()), Some(writer))
-        .with_global_deny_patterns(Vec::new());
+    let server = McpServer::new(
+        sessions.clone(),
+        Arc::new(Vec::new()),
+        Some(Arc::new(writer)),
+    )
+    .with_global_deny_patterns(Vec::new());
     (server, sessions, backend)
+}
+
+/// A journal that works and then fails mid-session: the next serial call is
+/// refused and its bytes never reach the device. The journal is one end of a
+/// socket pair; dropping the other end makes the next write fail (EPIPE).
+#[cfg(unix)]
+#[tokio::test]
+async fn journal_failure_mid_session_refuses_next_call() {
+    use mcp_serial_rs::serial::journal::JournalWriter;
+    use tokio::io::AsyncReadExt;
+
+    let (log_end, peer) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    let file = tokio::fs::File::from_std(std::fs::File::from(std::os::fd::OwnedFd::from(log_end)));
+    let writer = Arc::new(JournalWriter::from_file(
+        file,
+        std::path::Path::new("socket"),
+    ));
+
+    let backend = StubBackend::new();
+    let sessions = Arc::new(SessionManager::new(backend.clone()));
+    let server = McpServer::new(sessions.clone(), Arc::new(Vec::new()), Some(writer.clone()))
+        .with_global_deny_patterns(Vec::new());
+    let session_id = sessions
+        .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+        .await
+        .expect("open out-of-band");
+    let mut device = backend.take_device();
+
+    let healthy = handshake_then_call(server.clone(), "serial.list_ports", json!({})).await;
+    assert!(
+        healthy.pointer("/result/structuredContent/ports").is_some(),
+        "{healthy}"
+    );
+    assert!(!writer.has_failed());
+
+    drop(peer);
+    let refused = handshake_then_call(
+        server,
+        "serial.write",
+        json!({"session_id": session_id, "data": "reboot\n"}),
+    )
+    .await;
+    assert_eq!(rpc_error_code(&refused), -32017, "{refused}");
+    assert!(writer.has_failed());
+
+    let mut buf = [0u8; 16];
+    assert!(
+        timeout(Duration::from_millis(200), device.read(&mut buf))
+            .await
+            .is_err(),
+        "refused write reached the device"
+    );
+}
+
+/// A journal on `/dev/full` fails its first write with ENOSPC. From then on
+/// no tool may reach a port, except `serial.close`, which releases one.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn journal_failure_refuses_serial_tools_except_close() {
+    use mcp_serial_rs::serial::journal::JournalWriter;
+    use tokio::io::AsyncReadExt;
+
+    let backend = StubBackend::new();
+    let sessions = Arc::new(SessionManager::new(backend.clone()));
+    let path = std::path::Path::new("/dev/full");
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .await
+        .expect("open /dev/full");
+    let writer = Arc::new(JournalWriter::from_file(file, path));
+    let server = McpServer::new(sessions.clone(), Arc::new(Vec::new()), Some(writer.clone()))
+        .with_global_deny_patterns(Vec::new());
+
+    // Opened out of band, so the refused write below has a real target.
+    let session_id = sessions
+        .open("/dev/ttyUSB0", 115_200, 5_000, WritePolicy::Allow)
+        .await
+        .expect("open out-of-band");
+    let mut device = backend.take_device();
+
+    let call = |id: u64, name: &str, arguments: Value| {
+        json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+               "params": {"name": name, "arguments": arguments}})
+    };
+    let responses = roundtrip(
+        server.clone(),
+        &[
+            init_request(),
+            initialized_notification(),
+            call(
+                2,
+                "serial.write",
+                json!({"session_id": session_id, "data": "reboot\n"}),
+            ),
+            call(3, "serial.open", json!({"port": "/dev/ttyUSB1"})),
+            call(4, "serial.list_ports", json!({})),
+        ],
+    )
+    .await;
+    assert!(writer.has_failed(), "the first row hit ENOSPC");
+    for response in &responses[1..] {
+        assert_eq!(rpc_error_code(response), -32017, "{response}");
+        let error = response
+            .pointer("/result/structuredContent/error")
+            .expect("tool error");
+        assert_eq!(error["type"], "audit_log_unavailable");
+        assert_eq!(error["retryable"], false);
+        assert_eq!(error["command_written"], false);
+        assert_eq!(error["session_usable"], false);
+    }
+    assert!(
+        backend.devices.lock().expect("devices").is_empty(),
+        "refused serial.open must not reach the backend"
+    );
+
+    let close =
+        handshake_then_call(server, "serial.close", json!({"session_id": session_id})).await;
+    assert_eq!(
+        close.pointer("/result/structuredContent/ok"),
+        Some(&Value::Bool(true)),
+        "serial.close must still work: {close}"
+    );
+
+    // The port is closed, so the device side reads EOF. Any byte here would
+    // be the refused write.
+    let mut seen = Vec::new();
+    timeout(Duration::from_secs(2), device.read_to_end(&mut seen))
+        .await
+        .expect("device side reaches EOF after close")
+        .expect("read device side");
+    assert!(
+        seen.is_empty(),
+        "refused write reached the device: {seen:?}"
+    );
 }
 
 #[tokio::test]
 async fn journal_records_tools_call_pairs_and_skips_lifecycle() {
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     let path = tmp.path().to_path_buf();
-    drop(tmp); // try_open_arc opens in append mode; we own the path now.
+    drop(tmp); // JournalWriter::open opens in append mode; we own the path now.
 
     let (server, sessions, _backend) = stub_server_with_journal(&path).await;
     let session_id = sessions

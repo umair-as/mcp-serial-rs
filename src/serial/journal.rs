@@ -3,10 +3,10 @@
 //! Append-only JSONL traffic journal for every MCP tool call.
 //!
 //! One line per [`JournalEntry`]; each tool invocation produces a `call`
-//! entry before dispatch and a `result` entry after. Per CLAUDE.md this
-//! is always-on auditing — not opt-in — but I/O failures degrade gracefully.
-//! Open failure leaves the server with no journal handle; per-row failures are
-//! logged via `tracing::warn` and the writer is retained for later retry.
+//! entry before dispatch and a `result` entry after. Auditing is always on
+//! and fails closed (ADR 0003): `main` refuses to start when the journal
+//! cannot be opened, and the first failed write marks the writer as failed
+//! for the rest of the process, so the server stops touching serial ports.
 //!
 //! Concurrency: the inner `BufWriter` sits behind a `tokio::sync::Mutex`
 //! because dispatch tasks can in principle interleave on the runtime. The
@@ -18,14 +18,14 @@
 //! crate, to avoid a new runtime dependency.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex as TokioMutex;
-use tracing::warn;
+use tracing::{error, warn};
 
 const MAX_IDENTIFIER_CHARS: usize = 128;
 const JOURNAL_IO_TIMEOUT_MS: u64 = 250;
@@ -98,20 +98,24 @@ fn clip_identifier(value: &str) -> String {
 
 /// Wraps an append-mode file. `log` serialises an entry as a single JSONL
 /// line and flushes the underlying writer so a `tail -f` consumer sees rows
-/// promptly. Errors are logged via `tracing::warn` and swallowed — by spec
-/// journaling must never break tool execution.
+/// promptly. Any write, flush, lock or deadline failure marks the writer as
+/// failed for good: later `log` calls return an error without writing, so a
+/// half-flushed buffer can never land as a corrupt line, and `call_tool`
+/// refuses serial tools from then on.
 #[derive(Debug)]
 pub struct JournalWriter {
     inner: TokioMutex<BufWriter<tokio::fs::File>>,
     path: PathBuf,
+    failed: AtomicBool,
 }
 
 impl JournalWriter {
     /// Open `path` in create+append mode. Returns the writer on success or
-    /// the underlying I/O error — callers in `main.rs` log the error and
-    /// fall back to `journal = None` (degraded mode) rather than aborting.
+    /// the underlying I/O error; `main` treats the error as fatal.
     pub async fn open(path: &Path) -> std::io::Result<Self> {
-        if let Some(parent) = path.parent() {
+        // A bare file name has an empty parent: that is the working
+        // directory, which already exists and is not ours to chmod.
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             let parent_existed = tokio::fs::symlink_metadata(parent).await.is_ok();
             tokio::fs::create_dir_all(parent).await?;
             #[cfg(unix)]
@@ -123,7 +127,7 @@ impl JournalWriter {
             }
         }
         let mut options = OpenOptions::new();
-        options.create(true).append(true);
+        options.create(true).append(true).read(true);
         #[cfg(unix)]
         {
             options
@@ -144,29 +148,19 @@ impl JournalWriter {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))
                 .await?;
         }
-        Ok(Self {
-            inner: TokioMutex::new(BufWriter::new(file)),
-            path: path.to_path_buf(),
-        })
+        let mut file = file;
+        terminate_last_line(&mut file, metadata.len()).await?;
+        Ok(Self::from_file(file, path))
     }
 
-    /// Open `path` and wrap in `Arc`; on failure, log a warning and return
-    /// `None` so callers can stay in degraded mode without branching on
-    /// `Result`. Centralises the degraded-mode log message in one place.
-    pub async fn try_open_arc(path: &Path) -> Option<Arc<Self>> {
-        match Self::open(path).await {
-            Ok(w) => {
-                tracing::info!(path = %path.display(), "journal opened");
-                Some(Arc::new(w))
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    path = %path.display(),
-                    "journal open failed — continuing in degraded mode (no auditing)"
-                );
-                None
-            }
+    /// Wrap an already-open file without the path checks in [`Self::open`].
+    /// Tests use it to journal into a device such as `/dev/full`.
+    #[doc(hidden)]
+    pub fn from_file(file: tokio::fs::File, path: &Path) -> Self {
+        Self {
+            inner: TokioMutex::new(BufWriter::new(file)),
+            path: path.to_path_buf(),
+            failed: AtomicBool::new(false),
         }
     }
 
@@ -175,51 +169,89 @@ impl JournalWriter {
         &self.path
     }
 
-    /// Serialise `entry` to JSONL and flush. Any failure is logged at warn
-    /// level and discarded; the caller continues. We deliberately do NOT
-    /// poison `self` on error: subsequent writes will retry, which matters
-    /// when failures are transient (e.g. tmpfs full, then drained).
-    pub async fn log(&self, entry: &JournalEntry) {
-        let mut line = match serde_json::to_vec(entry) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(error = %e, "journal serialise failed");
-                return;
-            }
-        };
+    /// True once a write has failed. It stays true until the process exits.
+    pub fn has_failed(&self) -> bool {
+        self.failed.load(Ordering::SeqCst)
+    }
+
+    /// Serialise `entry` to JSONL, write it and flush.
+    ///
+    /// Every failure marks the writer as failed, including a row that
+    /// cannot be serialised or is over the size cap (summaries are clipped
+    /// well below it, so that is a guard, not an expected path). From then
+    /// on `log` returns an error without writing.
+    pub async fn log(&self, entry: &JournalEntry) -> std::io::Result<()> {
+        let mut line =
+            serde_json::to_vec(entry).map_err(|e| self.fail(std::io::Error::other(e)))?;
         if line.len() > MAX_JOURNAL_ROW_BYTES {
-            warn!(
-                path = %self.path.display(),
-                len = line.len(),
-                max = MAX_JOURNAL_ROW_BYTES,
-                "journal row too large; dropping row"
-            );
-            return;
+            return Err(self.fail(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "journal row of {} bytes is over the {MAX_JOURNAL_ROW_BYTES}-byte cap",
+                    line.len()
+                ),
+            )));
         }
         line.push(b'\n');
-        let Ok(mut guard) = tokio::time::timeout(
-            std::time::Duration::from_millis(JOURNAL_IO_TIMEOUT_MS),
-            self.inner.lock(),
-        )
-        .await
-        else {
-            warn!(path = %self.path.display(), "journal lock timed out");
-            return;
+        let deadline = std::time::Duration::from_millis(JOURNAL_IO_TIMEOUT_MS);
+        let Ok(mut guard) = tokio::time::timeout(deadline, self.inner.lock()).await else {
+            return Err(self.fail(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "journal lock timed out",
+            )));
         };
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(JOURNAL_IO_TIMEOUT_MS),
-            async {
-                guard.write_all(&line).await?;
-                guard.flush().await
-            },
-        )
+        // Checked under the lock: a call queued behind a failing write must
+        // not flush that write's leftover bytes.
+        if self.has_failed() {
+            return Err(failed_error());
+        }
+        let result = tokio::time::timeout(deadline, async {
+            guard.write_all(&line).await?;
+            guard.flush().await
+        })
         .await;
         match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!(error = %e, path = %self.path.display(), "journal write failed"),
-            Err(_) => warn!(path = %self.path.display(), "journal write timed out"),
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(self.fail(e)),
+            Err(_) => Err(self.fail(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "journal write timed out",
+            ))),
         }
     }
+
+    /// Mark the writer failed, logging the first failure only.
+    fn fail(&self, err: std::io::Error) -> std::io::Error {
+        if !self.failed.swap(true, Ordering::SeqCst) {
+            error!(
+                error = %err,
+                path = %self.path.display(),
+                "audit log write failed; serial tools are disabled until restart"
+            );
+        }
+        err
+    }
+}
+
+/// A write that failed partway in an earlier run can leave a last row with
+/// no newline. End it so the first new row starts on its own line.
+async fn terminate_last_line(file: &mut tokio::fs::File, len: u64) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    if len == 0 {
+        return Ok(());
+    }
+    file.seek(std::io::SeekFrom::End(-1)).await?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last).await?;
+    if last[0] != b'\n' {
+        file.write_all(b"\n").await?;
+        file.flush().await?;
+    }
+    Ok(())
+}
+
+fn failed_error() -> std::io::Error {
+    std::io::Error::other("audit log failed earlier; no further rows are written")
 }
 
 /// Format `SystemTime::now()` as `YYYY-MM-DDTHH:MM:SS.sssZ`. Pre-epoch
@@ -311,8 +343,8 @@ mod tests {
             JournalEntry::DIR_RESULT,
             json!({"ok": true, "bytes_written": 5}),
         );
-        writer.log(&a).await;
-        writer.log(&b).await;
+        writer.log(&a).await.unwrap();
+        writer.log(&b).await.unwrap();
 
         let contents = std::fs::read_to_string(tmp.path()).unwrap();
         let lines: Vec<&str> = contents.lines().collect();
@@ -336,7 +368,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writer_drops_oversized_row_and_recovers() {
+    async fn writer_refuses_oversized_row_and_fails() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let writer = JournalWriter::open(tmp.path()).await.unwrap();
 
@@ -346,7 +378,9 @@ mod tests {
             JournalEntry::DIR_CALL,
             json!({"blob": "x".repeat(MAX_JOURNAL_ROW_BYTES + 1)}),
         );
-        writer.log(&oversized).await;
+        let err = writer.log(&oversized).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(writer.has_failed(), "a refused row is a missing row");
 
         let normal = JournalEntry::new(
             "none",
@@ -354,29 +388,77 @@ mod tests {
             JournalEntry::DIR_RESULT,
             json!({"ok": true, "port_count": 1}),
         );
-        writer.log(&normal).await;
+        writer.log(&normal).await.unwrap_err();
+        assert!(std::fs::read_to_string(tmp.path()).unwrap().is_empty());
+    }
+
+    /// A row left without its newline by an earlier failed write is ended at
+    /// open, so the next row is not glued onto it.
+    #[tokio::test]
+    async fn writer_ends_a_partial_last_line_at_open() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"{\"ts\":\"partial").unwrap();
+        let writer = JournalWriter::open(tmp.path()).await.unwrap();
+        let entry = JournalEntry::new(
+            "none",
+            "serial.list_ports",
+            JournalEntry::DIR_CALL,
+            json!({}),
+        );
+        writer.log(&entry).await.unwrap();
 
         let contents = std::fs::read_to_string(tmp.path()).unwrap();
         let lines: Vec<&str> = contents.lines().collect();
-        assert_eq!(lines.len(), 1, "oversized row must be dropped");
-        let parsed: JournalEntry = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(lines.len(), 2, "{contents}");
+        let parsed: JournalEntry = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(parsed.tool, "serial.list_ports");
+
+        // A file that already ends in a newline is left alone.
+        drop(writer);
+        let _writer = JournalWriter::open(tmp.path()).await.unwrap();
+        assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), contents);
     }
 
     #[tokio::test]
     async fn writer_open_on_unwritable_path_errors() {
-        // Opening a journal inside a non-existent directory cannot succeed,
-        // and the error is what feeds the degraded-mode branch in main.rs.
+        // Opening a journal inside a non-existent directory cannot succeed;
+        // `main` turns this error into a refusal to start.
         let _err = JournalWriter::open(Path::new("/proc/1/no-such-journal"))
             .await
             .unwrap_err();
     }
 
+    /// `/dev/full` fails every write with ENOSPC. The first failure must be
+    /// reported and stick: later rows are refused without being written.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn try_open_arc_returns_none_in_degraded_mode() {
-        // Unwritable path → tracing::warn + None, no panic.
-        let result = JournalWriter::try_open_arc(Path::new("/proc/1/no-such-journal")).await;
-        assert!(result.is_none(), "must degrade to None on open failure");
+    async fn writer_failure_is_sticky() {
+        let path = Path::new("/dev/full");
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .await
+            .unwrap();
+        let writer = JournalWriter::from_file(file, path);
+        let entry = JournalEntry::new(
+            "none",
+            "serial.list_ports",
+            JournalEntry::DIR_CALL,
+            json!({}),
+        );
+
+        assert!(!writer.has_failed());
+        let first = writer.log(&entry).await.unwrap_err();
+        assert_eq!(first.raw_os_error(), Some(libc::ENOSPC), "{first}");
+        assert!(writer.has_failed());
+
+        let second = writer.log(&entry).await.unwrap_err();
+        assert_eq!(
+            second.raw_os_error(),
+            None,
+            "no second write attempt: {second}"
+        );
+        assert!(writer.has_failed());
     }
 
     #[cfg(unix)]
