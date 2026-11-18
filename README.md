@@ -6,17 +6,32 @@
 ![Transport](https://img.shields.io/badge/transport-stdio-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)
 
-An MCP server that exposes a curated set of serial-port operations over stdio.
-Built on the [`rmcp`](https://crates.io/crates/rmcp) SDK: it speaks the Model
-Context Protocol — `initialize`, `tools/list`, `tools/call` — with one JSON-RPC
-object per line on stdin, responses on stdout, logs on stderr. Designed for
-agent-driven embedded workflows — opening boards by stable USB serial string,
-writing console commands, scraping output until a regex matches, all from a
-tokio-async backend with per-session isolation and an allowlist that keeps
-stray paths out.
+An MCP server that gives AI agents bounded access to serial consoles: a Linux
+shell, an RTOS shell, a bootloader prompt, an MCU monitor. It speaks MCP over
+stdio, built in Rust on the [`rmcp`](https://crates.io/crates/rmcp) SDK and
+tokio, and supports both the stateless `2026-07-28` lifecycle and the
+`2025-11-25` `initialize` handshake.
 
-The server is hardware-agnostic: any USB-serial device matching the allowlist
-can be exposed as a bounded MCP serial-console session.
+What it gives an agent:
+
+- **Console tools:** list ports, open a session, read, read until a pattern,
+  drain, write, and `serial.exec`, which writes a command and reads until the
+  prompt as one atomic step per session. Raw output is kept verbatim, with an
+  optional cleaned copy.
+- **Write policies per session:** `allow` (the default), `confirm` (the person
+  approves each write in a dialog on clients that support form elicitation),
+  or `deny` (read-only, enforced by the server).
+- **Server-owned command rules:** deny and allow patterns from device profiles
+  or the environment gate every command before it reaches the port.
+- **Device profiles:** open a board by name instead of a `/dev/tty*` number
+  that changes on replug, with its baud rate and console settings.
+- **A port allowlist,** clamped timeouts, and a cap of 4 concurrent sessions.
+- **A fail-closed audit log:** one metadata-only row per call and result. If
+  the log cannot be written, the server stops touching serial ports.
+
+It is hardware-agnostic: any USB serial device on the allowlist can be opened
+as a console session. Device output is treated as untrusted data, never as
+instructions.
 
 ## Build
 
@@ -69,8 +84,8 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"serial.lis
   | ./target/release/mcp-serial-rs
 ```
 
-The `initialize` and `server/discover` results both carry `instructions` —
-the safe-workflow and trust-boundary rules from `AGENTS.md` — so an MCP host
+The `initialize` and `server/discover` results both carry `instructions`
+(the safe-workflow and trust-boundary rules from `AGENTS.md`), so an MCP host
 that only installs the binary still receives them.
 
 Every `serial.*` operation goes through a `tools/call` envelope. Successful
@@ -112,9 +127,9 @@ SDK generates input and output schemas from typed Rust structs.
 
 | Tool | Arguments | `structuredContent` |
 |---|---|---|
-| `serial.list_ports` | — | `{ports: [{port, vid, pid, serial, device, description}]}` |
+| `serial.list_ports` | (none) | `{ports: [{port, vid, pid, serial, device, description}]}` |
 | `serial.open` | `{port, baud?, timeout_ms?, write_policy?, deny_patterns?, line_ending?}` **or** `{device, …same}` | `{session_id}` (32-char random hex) |
-| `serial.sessions` | — | `{sessions: [{session_id, port, baud, state, default_timeout_ms, write_policy, console_settings, command_policy}]}` |
+| `serial.sessions` | (none) | `{sessions: [{session_id, port, baud, state, default_timeout_ms, write_policy, console_settings, command_policy}]}` |
 | `serial.get_session` | `{session_id}` | `{session}` (includes policy and console settings) |
 | `serial.write` | `{session_id, data, confirm?, reason?}` (≤ 4 KiB) | `{bytes_written}` |
 | `serial.read` | `{session_id, max_bytes?, timeout_ms?}` | `{data, status, timed_out, bytes_read, truncated, session_usable, output_is_untrusted}` |
@@ -124,8 +139,8 @@ SDK generates input and output schemas from typed Rust structs.
 | `serial.exec` | `{session_id, command, expect, line_ending?, echo_mode?, semantic_prompt?, timeout_ms?, clear_before_write?, normalize_output?, confirm?, reason?}` | raw output plus optional normalized/command output, semantic status, byte counts, match details, and write state |
 | `serial.close` | `{session_id}` | `{ok}` |
 
-`serial.open` accepts either a literal `port` path or a `device` profile name
-— never both. The profile's `baud` is the default; pass an explicit `baud`
+`serial.open` accepts either a literal `port` path or a `device` profile name,
+never both. The profile's `baud` is the default; pass an explicit `baud`
 to override. Unknown device names return `DeviceNotFound` (`-32009`) before
 any system call. A path already reserved by an Opening, Ready, or Closing
 session returns `PortBusy` (`-32010`); the production backend also requests
@@ -134,11 +149,11 @@ exclusive OS access as defense in depth.
 Each session carries a **write policy** set at `open` (`write_policy`), enforced
 before any bytes reach the device:
 
-- `allow` (default) — writes proceed. This is the right choice for normal
+- `allow` (default): writes proceed. This is the right choice for normal
   console work on a Linux console, an RTOS shell, or a bootloader prompt: whoever
   runs this local server already chose which ports it can reach. It is not
   permission to run destructive commands.
-- `deny` — a read-only session for passive observation. `serial.write` / `serial.exec` are refused
+- `deny`: a read-only session for passive observation. `serial.write` / `serial.exec` are refused
   server-side with `WriteForbidden` (`-32012`) regardless of the request; reads,
   `drain`, and `clear_input` still work. This is model-proof: no bug and no
   injected device text can cause a write. It does not make opening the port
@@ -147,7 +162,7 @@ before any bytes reach the device:
   SysRq command (see #34). On a target where that matters, set
   `kernel.sysrq` to exclude the dangerous commands; `sysrq_always_enabled` on
   the kernel command line overrides that mask.
-- `confirm` — each write is approved first, for when the operator wants that.
+- `confirm`: each write is approved first, for when the operator wants that.
   On an MCP `2026-07-28` client that
   supports form elicitation (an `elicitation` capability with `form`, or an
   empty one), the server answers `tools/call` with an `input_required`
@@ -162,7 +177,7 @@ before any bytes reach the device:
   (`InvalidParam`, `-32008`), because hosts may clip long lines; an empty
   `serial.write` needs no approval. On any other client this is the original
   tripwire: `confirm: true` on the call, else `ConfirmationRequired`
-  (`-32013`) — an audit seam, not a hard gate. Use `deny` when you need a
+  (`-32013`), an audit seam, not a hard gate. Use `deny` when you need a
   guarantee that does not depend on the client. See `docs/adr/0009`.
 
 The effective policy is the most restrictive of the caller's `write_policy` and
@@ -180,9 +195,9 @@ root shell or a bootloader. That suits your own bench. Where it does not, use
 `deny`, `privileged = true`, or a command policy, which hold regardless of the
 host's settings.
 
-Domain validation and serial failures detected inside a tool call — unknown
+Domain validation and serial failures detected inside a tool call (unknown
 session, disallowed port, unknown device, malformed regex, oversized write,
-supplying both `port` and `device` — return a normal JSON-RPC result whose
+supplying both `port` and `device`) return a normal JSON-RPC result whose
 MCP `CallToolResult` has `isError: true`. The structured error is under
 `result.structuredContent.error` with a stable `type`, numeric `code`,
 `data`, `retryable`, `command_written`, `bytes_consumed`, and
@@ -240,9 +255,9 @@ short device name and human-readable description. They may also declare
 console execution defaults (`line_ending`, `echo_mode`, and
 `semantic_prompt`). The primary effects are:
 
-1. **Enriched `serial.list_ports`** — matched ports gain `device` and
+1. **Enriched `serial.list_ports`:** matched ports gain `device` and
    `description` fields (see Quick start output above).
-2. **Named-device `serial.open`** — `{"device": "esp32c6"}` resolves to the
+2. **Named-device `serial.open`:** `{"device": "esp32c6"}` resolves to the
    first connected port matching that profile, using `profile.baud` by default:
 
    ```json
@@ -288,7 +303,7 @@ or disambiguate via `/dev/serial/by-path` and hard-code the port path.
 | `MCP_SERIAL_JOURNAL` | Append-only JSONL audit log path; `--audit-log <path>` overrides it (see below) | `$XDG_STATE_HOME/mcp-serial-rs/audit.jsonl`, else `~/.local/state/mcp-serial-rs/audit.jsonl` |
 | `RUST_LOG` | `tracing-subscriber` filter, e.g. `mcp_serial_rs=debug` | `mcp_serial_rs=info` |
 
-The compile-time allowlist is `/dev/ttyUSB*` and `/dev/ttyACM*` — Linux USB
+The compile-time allowlist is `/dev/ttyUSB*` and `/dev/ttyACM*`: Linux USB
 serial bridges. Override with `MCP_SERIAL_ALLOWLIST="/dev/cuaU*,/dev/cu.usb*"`
 on BSD/macOS, or to widen the path for the PTY-loopback test suite.
 
@@ -381,7 +396,7 @@ the exec call instead. Expect request 3 to return `status`, `ok`, `raw_output`,
 optional `normalized_output` / `command_output` / semantic status,
 `bytes_written`, `bytes_read`, `command_written`, `match_details`, and
 `session_usable`. Drive
-this from any MCP client — `rmcp`
+this from any MCP client. `rmcp`
 dispatches `tools/call` requests concurrently, so calls on independent
 sessions run in parallel; calls on the same session serialise through the
 per-port mutex.
@@ -390,11 +405,11 @@ per-port mutex.
 
 ```sh
 cargo test                          # unit, CLI, MCP wire, and loopback tests
-cargo test --test loopback          # PTY round-trip — needs `socat`
+cargo test --test loopback          # PTY round-trip; needs `socat`
 ```
 
 Integration coverage: `tests/mcp_tests.rs` drives the `rmcp` server in-process
-over a `tokio::io::duplex` pipe — initialize, `tools/list`, every tool, the
+over a `tokio::io::duplex` pipe: initialize, `tools/list`, every tool, the
 narrowed journal, and concurrency (independent sessions, serialised same-session
 writes, close-vs-read races). `tests/loopback.rs` is the end-to-end check: it
 spawns the release binary, stands up a real `socat` PTY pair, and drives
@@ -423,9 +438,9 @@ are recorded under `docs/adr/`.
 
 The `serial.*` MVP and the `rmcp` SDK adoption are complete:
 
-- MCP lifecycle — the legacy `initialize` handshake for `2025-11-25` clients
-  and the stateless `2026-07-28` lifecycle (`server/discover`, per-request
-  `_meta`) — and `tools/call` dispatch handled by the `rmcp` 3.x SDK over
+- MCP lifecycle (the legacy `initialize` handshake for `2025-11-25` clients
+  and the stateless `2026-07-28` lifecycle with `server/discover` and
+  per-request `_meta`) and `tools/call` dispatch handled by the `rmcp` 3.x SDK over
   stdio. `tools/list` carries cache hints for `2026-07-28` clients.
 - Server `instructions` delivering the `AGENTS.md` guidance to every client.
 - Elicitation-backed `write_policy = "confirm"` through MRTR on `2026-07-28`
@@ -439,8 +454,8 @@ The `serial.*` MVP and the `rmcp` SDK adoption are complete:
 
 Deferred (not implemented):
 
-- `serial.reset_esp32` — DTR/RTS toggle for hard reset / bootloader entry.
-- `serial.capture_start` / `serial.capture_stop` — tee session bytes to a log file.
+- `serial.reset_esp32`: DTR/RTS toggle for hard reset / bootloader entry.
+- `serial.capture_start` / `serial.capture_stop`: tee session bytes to a log file.
 - MCP resources/prompts/progress beyond the current tools-only surface.
 
 ## License

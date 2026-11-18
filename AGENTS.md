@@ -28,14 +28,14 @@ installs the binary receives it. The source of that copy is
    same text does different things at a shell and at a bootloader.
 5. On a `confirm` session, a client that supports form elicitation has the
    server ask the *person* directly, and your own `confirm: true` is ignored;
-   a `confirmation_declined` error means they said no — do not retry or
+   a `confirmation_declined` error means they said no; do not retry or
    rephrase. Pass a short `reason` (at most 120 characters) saying why the
    write is needed; it is shown to the person. A write longer than 120
    characters as displayed is refused before the person is asked; send only
    complete operations that fit, and never split one command across writes to
    get around the limit. On other clients pass an explicit `confirm: true`.
 6. Recover or verify session state with `serial.sessions` or
-   `serial.get_session` — the snapshot's `write_policy` and `command_policy` say
+   `serial.get_session`; the snapshot's `write_policy` and `command_policy` say
    what the session may do.
 7. Before command execution, use `serial.drain`, `serial.clear_input`, or
    `serial.exec` with `clear_before_write=true` when stale prompts or boot logs
@@ -83,7 +83,7 @@ A defense that does not depend on the agent behaving is the operator's choice:
 `privileged = true` on a profile, a command policy, or a `deny` session when the
 operator asks for one. A `deny` session refuses `serial.write` / `serial.exec`
 server-side (`WriteForbidden`, -32012) no matter what the model or the device
-text decides — reads still work. It stops writes, not every effect on the line:
+text decides; reads still work. It stops writes, not every effect on the line:
 a USB serial adapter can glitch the line when a port opens or closes, and on a
 Linux console with SysRq enabled a BREAK followed by any byte runs a SysRq
 command (issue #34). `confirm` has two shapes (ADR 0009): on an
@@ -91,7 +91,7 @@ MCP 2026-07-28 client that supports form elicitation, the server asks the person
 through the client before sending anything, bound to the exact bytes shown,
 and a refusal is `ConfirmationDeclined` (-32016); on any other client it is the
 weaker tripwire where the caller satisfies `confirm: true` itself
-(`ConfirmationRequired`, -32013) — an audit and deliberate-second-step aid, not
+(`ConfirmationRequired`, -32013): an audit and deliberate-second-step aid, not
 a hard gate.
 
 ## Output Handling

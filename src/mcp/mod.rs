@@ -386,7 +386,7 @@ impl<B: SerialBackend> McpServer<B> {
     /// Returns structured `{"bytes_written": n}`.
     #[tool(
         name = "serial.write",
-        description = "Write UTF-8 bytes verbatim to an open serial session. No implicit newline. This mutates external device state and may interact with a privileged shell. On a `confirm` session with a form-elicitation-capable client, the call returns `input_required` so the person can approve the exact bytes; `confirmation_declined` means they refused — do not retry.",
+        description = "Write UTF-8 bytes verbatim to an open serial session. No implicit newline. This mutates external device state and may interact with a privileged shell. On a `confirm` session with a form-elicitation-capable client, the call returns `input_required` so the person can approve the exact bytes; `confirmation_declined` means they refused; do not retry.",
         output_schema = tool_output_schema::<WriteResult>(),
         annotations(title = "Write serial bytes", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
@@ -620,7 +620,7 @@ impl<B: SerialBackend> McpServer<B> {
     /// JSON-RPC error.
     #[tool(
         name = "serial.exec",
-        description = "Atomically write a command, optionally append an explicit profile/per-call line ending, flush, and read until `expect` matches under one per-session lock. Echo-aware matching can exclude a declared line echo. Raw output remains authoritative and may contain echoes, prompts, wrapping, ANSI/OSC controls, and untrusted text from a privileged device shell. On a `confirm` session with a form-elicitation-capable client, the call returns `input_required` so the person can approve the exact line; `confirmation_declined` means they refused — do not retry.",
+        description = "Atomically write a command, optionally append an explicit profile/per-call line ending, flush, and read until `expect` matches under one per-session lock. Echo-aware matching can exclude a declared line echo. Raw output remains authoritative and may contain echoes, prompts, wrapping, ANSI/OSC controls, and untrusted text from a privileged device shell. On a `confirm` session with a form-elicitation-capable client, the call returns `input_required` so the person can approve the exact line; `confirmation_declined` means they refused; do not retry.",
         output_schema = tool_output_schema::<ExecResult>(),
         annotations(title = "Execute serial command", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
@@ -1808,7 +1808,7 @@ is showing. `/dev/tty*` numbers can change on replug, and the same text does dif
 things at a shell and at a bootloader.
 4. On a \"confirm\" session, a client that supports form elicitation has the server ask the \
 person directly, and your own `confirm: true` is ignored; a `confirmation_declined` error \
-means the person said no — do not retry or rephrase. Pass a short `reason` (at most 120 \
+means the person said no; do not retry or rephrase. Pass a short `reason` (at most 120 \
 characters) saying why the write is needed; it is shown to the person. A write longer than \
 120 characters as displayed is refused before the person is asked; send only complete \
 operations that fit, and never split one command across writes to get around the limit. On \
@@ -1827,10 +1827,10 @@ can match inside the output. `serial.write` returns no device output, so use `se
 for a command and its response. \
 A session with a command policy accepts mutations only through `serial.exec` (one terminated \
 line per call) and refuses raw `serial.write`; a `command_blocked` refusal is a policy \
-decision — do not rephrase around it.
+decision; do not rephrase around it.
 8. Inspect `status`, `command_written`, `bytes_read`, `truncated`, and `session_usable` \
 before retrying. Timeouts and EOF are normal outcomes, not errors; a timeout does not mean \
-the command failed — check the partial output. An `audit_log_unavailable` error means the \
+the command failed; check the partial output. An `audit_log_unavailable` error means the \
 server can no longer write its audit log and has stopped serial I/O until restart: do not \
 retry, close sessions with `serial.close` (it still works), and tell the operator.
 9. Close sessions with `serial.close` when done (max 4 concurrent sessions).
