@@ -60,7 +60,11 @@ installs the binary receives it. The source of that copy is
    `command_blocked` refusal is a policy decision; do not try to rephrase
    around it.
 9. Inspect `status`, `command_written`, `bytes_read`, `truncated`, and
-   `session_usable` before deciding whether to retry.
+   `session_usable` before deciding whether to retry. An
+   `audit_log_unavailable` error (-32017) means the server can no longer write
+   its audit log and has stopped all serial I/O until it is restarted: do not
+   retry, close open sessions with `serial.close` (it still works), and tell
+   the operator.
 10. Close sessions with `serial.close` when finished.
 
 ## Trust Boundary
@@ -79,7 +83,10 @@ A defense that does not depend on the agent behaving is the operator's choice:
 `privileged = true` on a profile, a command policy, or a `deny` session when the
 operator asks for one. A `deny` session refuses `serial.write` / `serial.exec`
 server-side (`WriteForbidden`, -32012) no matter what the model or the device
-text decides — reads still work. `confirm` has two shapes (ADR 0009): on an
+text decides — reads still work. It stops writes, not every effect on the line:
+a USB serial adapter can glitch the line when a port opens or closes, and on a
+Linux console with SysRq enabled a BREAK followed by any byte runs a SysRq
+command (issue #34). `confirm` has two shapes (ADR 0009): on an
 MCP 2026-07-28 client that supports form elicitation, the server asks the person
 through the client before sending anything, bound to the exact bytes shown,
 and a refusal is `ConfirmationDeclined` (-32016); on any other client it is the
